@@ -1,20 +1,22 @@
 import { pool } from "../db.js";
-import { analyzeListingPhotos, analyzeTextQuality } from "./aiService.js";
+import { analyzeListingWithPython, analyzeVideoWithPython } from "./aiService.js";
 
 export const performFullAnalysis = async (listingId) => {
   const report = {
     listingId,
     score: 100,
     flags: [],
-    textCheck: "pending",
-    imageCheck: "pending",
-    locationCheck: "pending",
-    agentConsistency: "pending",
+    details: {
+        text_check: "passed",
+        image_check: "pending",
+        video_check: "skipped",
+        location_consistency: "passed"
+    },
     verdict: "Manual Review",
   };
 
   try {
-    // 1. Fetch Data (INCLUDING ROLE)
+    // 1. Fetch Listing & Agent Profile
     const res = await pool.query(`
       SELECT l.*, p.country as profile_country, p.role as user_role
       FROM listings l
@@ -25,67 +27,83 @@ export const performFullAnalysis = async (listingId) => {
     const data = res.rows[0];
     if (!data) throw new Error("Listing not found");
 
-    // ... (Text Check & Location Check remain the same) ...
-    // [Insert your existing Text/Location check code here]
-
-    // =========================================================
-    // 📸 STEP 3: IMAGE ANALYSIS 
-    // =========================================================
+    // 2. PREPARE PHOTOS
     let photoUrls = [];
     try {
         photoUrls = typeof data.photos === 'string' 
-            ? JSON.parse(data.photos).map(p => p.url || p) 
-            : (data.photos || []).map(p => p.url || p);
+            ? JSON.parse(data.photos) 
+            : (data.photos || []);
     } catch { photoUrls = []; }
 
     if (photoUrls.length === 0) {
-        report.imageCheck = "failed";
         report.score = 0;
         report.flags.push("No photos provided.");
-        report.verdict = "Rejected"; // Immediate Reject
-        return report;
-    }
-
-    const imageResult = await analyzeListingPhotos(photoUrls, data.property_type || "House");
-
-    if (!imageResult.valid) {
-        report.imageCheck = "failed";
-        report.score -= 40; // Reduced penalty slightly
-        report.flags.push(imageResult.reason);
-    } else {
-        report.imageCheck = "passed";
+        report.verdict = "Rejected"; 
+        return await saveReport(report, listingId);
     }
 
     // =========================================================
-    // 👤 STEP 4: CONSISTENCY CHECK (Smart Role Logic)
+    // 🧠 STEP 3: CALL PYTHON AI (IMAGES + TEXT)
+    // =========================================================
+    const aiResult = await analyzeListingWithPython(
+        photoUrls,
+        data.title,
+        data.description,
+        data.property_type 
+    );
+
+    // Merge AI Results
+    report.score = aiResult.score; 
+    report.flags = [...report.flags, ...aiResult.flags];
+    
+    // ✅ Logic Fix: If score is 0, force fail image check
+    if (report.score === 0) {
+        report.details.image_check = "failed";
+    } else {
+        report.details.image_check = aiResult.verdict === "Rejected" ? "failed" : "passed";
+    }
+
+    // =========================================================
+    // 🎥 STEP 4: CALL PYTHON AI (VIDEO)
+    // =========================================================
+    if (data.video_url) {
+        const videoResult = await analyzeVideoWithPython(data.video_url);
+        
+        if (videoResult) {
+            if (videoResult.valid) {
+                report.details.video_check = "passed";
+                if (report.score > 0 && report.score < 100) report.score += 5; 
+            } else {
+                report.details.video_check = "failed";
+                report.score -= 20;
+                report.flags.push(`Video Flag: ${videoResult.reason}`);
+            }
+        }
+    }
+
+    // =========================================================
+    // 🌍 STEP 5: LOCATION CONSISTENCY
     // =========================================================
     const userRole = data.user_role ? data.user_role.toLowerCase() : 'agent';
     
-    if (data.country && data.profile_country) {
+    if (userRole === 'agent' && data.country && data.profile_country) {
         const listingC = data.country.toLowerCase().trim();
         const profileC = data.profile_country.toLowerCase().trim();
 
         if (listingC !== profileC) {
-            // 🚨 IF AGENT: Mismatch is suspicious (Agent usually in same country)
-            if (userRole === 'agent') {
-                report.agentConsistency = "warning";
-                report.score -= 15;
-                report.flags.push(`Agent Location (${data.profile_country}) differs from Property Country.`);
-            } 
-            // 🟢 IF OWNER: Mismatch is NORMAL (Diaspora selling property back home)
-            else {
-                report.agentConsistency = "passed";
-                // No penalty for owners living abroad
-            }
-        } else {
-            report.agentConsistency = "passed";
+            report.details.location_consistency = "warning";
+            report.score -= 15;
+            report.flags.push(`Agent Location (${data.profile_country}) does not match Property Country.`);
         }
     }
 
     // =========================================================
     // 🏁 FINAL VERDICT
     // =========================================================
-    if (report.score >= 80) { // Slightly lower threshold for auto-approve
+    if (report.score < 0) report.score = 0;
+    if (report.score > 100) report.score = 100;
+
+    if (report.score >= 80) {
         report.verdict = "Safe to Approve";
     } else if (report.score <= 40) {
         report.verdict = "Rejected";
@@ -93,12 +111,30 @@ export const performFullAnalysis = async (listingId) => {
         report.verdict = "Manual Review Needed";
     }
 
+    await saveReport(report, listingId);
     return report;
 
   } catch (err) {
-    console.error("Analysis Logic Error:", err);
+    console.error("Full Analysis Error:", err);
     report.verdict = "Error";
-    report.flags.push("Internal Analysis Error");
+    report.flags.push("Internal Server Error during analysis");
     return report;
   }
 };
+
+// Helper to update DB
+async function saveReport(report, listingId) {
+    let status = 'pending';
+    if (report.verdict === "Safe to Approve") status = 'approved';
+    if (report.verdict === "Rejected") status = 'rejected'; 
+
+    const notes = `AI Score: ${report.score}/100. Flags: ${report.flags.join(". ")}`;
+
+    await pool.query(
+        `UPDATE listings 
+         SET admin_notes = $1, status = $2 
+         WHERE product_id = $3`,
+        [notes, status, listingId]
+    );
+    return report;
+}

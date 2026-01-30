@@ -640,7 +640,7 @@ export const deleteListing = async (req, res) => {
 
 /* -------------------------------------------------------
    1. GET LISTINGS (Public - /buy, /rent, Homepage)
-   UPDATED: With DEEP LOGGING for Debugging
+   UPDATED: Fix for Polygon Search
 ------------------------------------------------------- */
 export const getListings = async (req, res) => {
   try {
@@ -674,9 +674,7 @@ export const getListings = async (req, res) => {
         p.username as agent_username,
         p.role as agent_role, 
         p.phone as agent_phone,
-        CASE WHEN f.product_id IS NOT NULL THEN true ELSE false END as is_favorited,
-        -- DEBUG: Return the location as text to verify it exists
-        ST_AsText(l.location) as debug_location
+        CASE WHEN f.product_id IS NOT NULL THEN true ELSE false END as is_favorited
       FROM listings l
       JOIN profiles p ON l.agent_unique_id = p.unique_id
       LEFT JOIN favorites f ON l.product_id = f.product_id AND f.user_id = $1
@@ -687,31 +685,35 @@ export const getListings = async (req, res) => {
     const queryParams = [currentUserId];
     let paramCounter = 2; 
 
-    // --- 1. POLYGON SEARCH ---
+    // --- 1. POLYGON SEARCH (THE FIX) ---
     if (polygon) {
         try {
             console.log("🔹 Parsing Polygon JSON...");
             const geoJson = JSON.parse(polygon);
             
-            // Log the coordinates to ensure they look right (Lat/Lng vs Lng/Lat)
-            // GeoJSON expects [Longitude, Latitude]
-            if (geoJson.coordinates && geoJson.coordinates.length > 0) {
-                console.log("📍 First Point in Polygon:", geoJson.coordinates[0][0]);
+            // Validate JSON structure
+            if (!geoJson.type || !geoJson.coordinates) {
+                throw new Error("Invalid GeoJSON structure");
             }
 
+            // ✅ FIX: Construct Point from Lat/Lng columns on the fly
+            // This bypasses any issues with the 'location' column being null or stale.
+            // ST_MakePoint takes (Longitude, Latitude) -> (X, Y)
             queryText += ` 
-                AND l.location IS NOT NULL 
+                AND l.longitude IS NOT NULL 
+                AND l.latitude IS NOT NULL
                 AND ST_Intersects(
                     ST_SetSRID(ST_GeomFromGeoJSON($${paramCounter}), 4326), 
-                    l.location
+                    ST_SetSRID(ST_MakePoint(l.longitude::float, l.latitude::float), 4326)
                 )`;
             
             queryParams.push(JSON.stringify(geoJson));
             paramCounter++;
-            console.log("✅ Polygon Filter Added to SQL");
+            console.log("✅ Polygon Filter Added (Using Dynamic ST_MakePoint)");
 
         } catch (e) {
             console.error("❌ Invalid Polygon JSON received:", e.message);
+            // Don't crash, just ignore the polygon filter if it's bad
         }
     }
 
@@ -758,7 +760,7 @@ export const getListings = async (req, res) => {
       paramCounter++;
     }
 
-    // Viewport Search (Fallback)
+    // Viewport Search (Fallback - only if NO polygon)
     if (!polygon && minLat && maxLat && minLng && maxLng && !isNaN(Number(minLat))) {
       console.log("🔹 Using Viewport (Bounds) Search");
       queryText += ` 
@@ -773,18 +775,11 @@ export const getListings = async (req, res) => {
 
     queryText += " ORDER BY l.activated_at DESC NULLS LAST LIMIT 500";
 
-    // --- 3. EXECUTE & LOG ---
-    console.log("📝 Executing SQL:", queryText);
-    console.log("📦 With Params:", JSON.stringify(queryParams));
-
+    // --- 3. EXECUTE ---
+    // console.log("📝 SQL:", queryText); 
     const result = await pool.query(queryText, queryParams);
 
     console.log(`✅ Database returned ${result.rows.length} rows`);
-    if (result.rows.length > 0) {
-        console.log("🔎 First Match Location:", result.rows[0].debug_location);
-    } else {
-        console.log("⚠️ No matches found. Check if your Polygon covers the Listing Location.");
-    }
 
     // --- 4. FORMAT RESPONSE ---
     const listings = result.rows.map(l => {
@@ -1183,115 +1178,130 @@ export const getPublicAgentProfile = async (req, res) => {
 };
 
 /* -------------------------------------------------------
-   SINGLE AI ANALYSIS
-   
+   SINGLE AI ANALYSIS (Admin triggers manually)
 ------------------------------------------------------- */
 export const analyzeListing = async (req, res) => {
   try {
     const { product_id } = req.params;
-    console.log(`🤖 AI Analyzing Listing: ${product_id}...`);
+    console.log(`🤖 Admin requested AI Analysis for: ${product_id}...`);
     
-    // Call the service logic (Now returns strict verdict & reason)
+    // 1. Run the Python-Powered Analysis
     const report = await performFullAnalysis(product_id);
     
-    // Optional: Save the analysis result to the DB immediately
-    // We store the reason in 'admin_notes' so the agent can see it later
-    const reason = report.flags.join(". ");
-    await pool.query(
-        `UPDATE listings SET admin_notes = $1 WHERE product_id = $2`,
-        [reason, product_id]
-    );
-
+    // 2. Respond immediately with the report
     res.json(report);
+
   } catch (err) {
+    console.error("Single Analysis Error:", err);
     res.status(500).json({ message: "AI Analysis failed", error: err.message });
   }
 };
 
 /* -------------------------------------------------------
-   ✅ BATCH AI ANALYSIS (Async Fire & Forget)
-   Returns immediately, processes in background to prevent timeouts.
+   ✅ BATCH AI ANALYSIS (Process All Pending)
+   - Fetches all 'pending' listings
+   - Sends them to Python AI one by one (chunked)
+   - Updates status automatically
 ------------------------------------------------------- */
 export const batchAnalyzeListings = async (req, res) => {
   try {
     console.log("🚀 Starting Batch Analysis...");
+
     // 1. Fetch Pending Listings
     const pendingListings = await pool.query(
       `SELECT product_id, agent_unique_id, title FROM listings WHERE status = 'pending'`
     );
 
     const total = pendingListings.rows.length;
-    if (total === 0) return res.json({ message: "No pending listings.", stats: { approved: 0, rejected: 0, failed: 0 } });
+    if (total === 0) {
+        return res.json({ 
+            success: true, 
+            message: "No pending listings to analyze.", 
+            stats: { approved: 0, rejected: 0, failed: 0 } 
+        });
+    }
 
-    // 2. ⚡ RESPOND IMMEDIATELY
+    // 2. ⚡ RESPOND IMMEDIATELY (Don't make Admin wait)
     res.json({
       success: true,
-      message: `Batch analysis started for ${total} listings. Check admin logs for progress.`
+      message: `Batch analysis started for ${total} listings. Check admin logs/dashboard for progress.`
     });
 
-    // 3. ⚙️ BACKGROUND PROCESSING
-    // Run this asynchronously without awaiting it in the response path
+    // 3. ⚙️ BACKGROUND PROCESSING (Fire & Forget)
     (async () => {
-        console.log(`🚀 Starting Background Analysis for ${total} listings...`);
+        console.log(`🚀 Processing ${total} listings in background...`);
         const allPending = pendingListings.rows;
-        const CHUNK_SIZE = 5; 
+        const CHUNK_SIZE = 3; // Process 3 at a time (Python is heavy)
         
         for (let i = 0; i < allPending.length; i += CHUNK_SIZE) {
             const chunk = allPending.slice(i, i + CHUNK_SIZE);
             
             await Promise.all(chunk.map(async (listing) => {
                 try {
+                    // CALL THE NEW SERVICE
                     const report = await performFullAnalysis(listing.product_id);
                     
                     let newStatus = 'pending';
                     let notificationTitle = "";
                     let notificationMsg = "";
-                    let adminNote = report.flags.join(". ");
+                    // Join flags into a readable string
+                    let adminNote = report.flags && report.flags.length > 0 
+                        ? report.flags.join(". ") 
+                        : "Verified by AI.";
 
+                    // LOGIC: Auto-Approve or Auto-Reject based on Python Score
                     if (report.verdict === 'Safe to Approve') {
                         newStatus = 'approved';
                         notificationTitle = "Listing Approved";
                         notificationMsg = `Your listing "${listing.title}" passed AI verification.`;
-                        adminNote = "Verified by AI.";
+                    
                     } else if (report.verdict === 'Rejected') {
                         newStatus = 'rejected';
                         notificationTitle = "Listing Rejected";
                         notificationMsg = `Your listing "${listing.title}" was rejected. Issues: ${adminNote}`;
+                    
                     } else {
-                        // Manual Review Needed
+                        // "Manual Review Needed" -> Stay Pending, but save notes
                         await pool.query(
                             `UPDATE listings SET admin_notes = $1 WHERE product_id = $2`,
                             [`AI Flag: ${adminNote}`, listing.product_id]
                         );
-                        return; 
+                        return; // Stop here, don't change status or notify yet
                     }
 
-                    // Update Status
+                    // UPDATE DB STATUS
                     await pool.query(
                         `UPDATE listings SET status = $1, admin_notes = $2, updated_at = NOW() WHERE product_id = $3`,
                         [newStatus, adminNote, listing.product_id]
                     );
 
-                    // Notify Agent
+                    // NOTIFY AGENT
                     await pool.query(
                         `INSERT INTO notifications (receiver_id, product_id, type, title, message) VALUES ($1, $2, 'listing_status', $3, $4)`,
                         [listing.agent_unique_id, listing.product_id, notificationTitle, notificationMsg]
                     );
 
+                    // REAL-TIME SOCKET
                     if (req.io) {
                         req.io.to(listing.agent_unique_id).emit("notification", {
                             title: notificationTitle,
                             message: notificationMsg
                         });
+                        req.io.to(listing.agent_unique_id).emit("listingStatusUpdated", {
+                            product_id: listing.product_id,
+                            status: newStatus
+                        });
                     }
 
+                    console.log(`✅ Analyzed ${listing.product_id}: ${newStatus}`);
+
                 } catch (e) {
-                    console.error(`Error processing ${listing.product_id}`, e);
+                    console.error(`❌ Error processing ${listing.product_id}`, e);
                 }
             }));
             
-            // Optional: Small delay between chunks to be nice to the CPU/DB
-            await new Promise(r => setTimeout(r, 1000));
+            // Wait 2 seconds between chunks to let Python breathe
+            await new Promise(r => setTimeout(r, 2000));
         }
         console.log("✅ Batch Analysis Complete.");
     })();

@@ -1,17 +1,17 @@
 import axios from "axios";
 import { pool } from "../db.js";
 import crypto from "crypto";
-import { convertFromUSD, convertToUSD } from "../utils/exchangeRates.js"; // ✅ Ensure this file exists
+import { convertFromUSD, convertToUSD } from "../utils/exchangeRates.js"; 
 
 const FLW_SECRET_KEY = process.env.FLW_SECRET_KEY;
 const FLW_BASE = "https://api.flutterwave.com/v3";
 
-// --- PRICING CONFIG ---
-const DISCOUNTED_COST = 15; // Cost to activate listing using Wallet (USD)
-const DEFAULT_FUNDING_AMOUNT = 20; // Default suggested funding (USD)
+// --- KEYVIA ECONOMY CONFIG ---
+const LISTING_COST_KEY = 8; // Activation Cost in KEY
+const COIN_RATE = 1;        // 1 KEY = $1 USD (Base Rate)
 
 // =========================================================
-// 1. GET WALLET BALANCE
+// 1. GET WALLET BALANCE (Returns KEY)
 // =========================================================
 export const getWalletBalance = async (req, res) => {
   try {
@@ -19,9 +19,11 @@ export const getWalletBalance = async (req, res) => {
     let resDb = await pool.query("SELECT balance FROM wallets WHERE agent_id = $1", [userId]);
     
     if (resDb.rows.length === 0) {
+      // Create wallet if it doesn't exist
       await pool.query("INSERT INTO wallets (agent_id, balance) VALUES ($1, 0)", [userId]);
       return res.json({ balance: 0 });
     }
+    // The balance in DB is now treated as KEY coins
     return res.json({ balance: Number(resDb.rows[0].balance) });
   } catch (err) {
     console.error(err);
@@ -30,26 +32,31 @@ export const getWalletBalance = async (req, res) => {
 };
 
 // =========================================================
-// 2. INITIALIZE FUNDING (Multi-Currency Support)
+// 2. INITIALIZE FUNDING (Real Money -> KEY)
 // =========================================================
 export const fundWalletInit = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
     
-    // Frontend sends amount in USD, and preferred currency (e.g., 'NGN', 'GBP')
-    const { amount = DEFAULT_FUNDING_AMOUNT, currency = 'USD' } = req.body; 
-    const usdAmount = Number(amount); // Ensure it's a number
+    // Frontend sends amount in KEY (e.g., 10) and currency (e.g., NGN)
+    const { amount, currency = 'USD' } = req.body; 
+    
+    const keyCoinsRequested = Number(amount); 
+    
+    // 1. Calculate Base USD Value (Since 1 KEY = $1)
+    const usdValue = keyCoinsRequested * COIN_RATE;
 
-    // ✅ Convert USD amount to User's Local Currency for the Payment Gateway
-    const chargeAmount = convertFromUSD(usdAmount, currency);
+    // 2. Convert USD value to User's Local Currency for payment
+    // (e.g. $10 USD -> ~16,000 NGN)
+    const chargeAmount = convertFromUSD(usdValue, currency);
 
     const tx_ref = `FUND-${userId}-${crypto.randomBytes(4).toString("hex")}`;
 
     res.json({
       public_key: process.env.FLW_PUBLIC_KEY,
       tx_ref,
-      amount: chargeAmount, // e.g., 30000 if NGN
-      currency: currency,   // e.g., 'NGN'
+      amount: chargeAmount, 
+      currency: currency,
       customer: {
         email: req.user?.email,
         name: req.user?.full_name,
@@ -57,48 +64,50 @@ export const fundWalletInit = async (req, res) => {
       meta: { 
         type: "wallet_fund", 
         agentId: userId,
-        baseUsdAmount: usdAmount 
+        coinsRequested: keyCoinsRequested 
       }
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Init failed" });
+    res.status(500).json({ message: "Funding initialization failed" });
   }
 };
 
 // =========================================================
-// 3. VERIFY FUNDING & CREDIT WALLET (Normalize to USD)
+// 3. VERIFY & CREDIT (Credits Wallet with KEY)
 // =========================================================
 export const verifyWalletFunding = async (req, res) => {
   try {
     const { transaction_id } = req.body;
     const userId = req.user?.unique_id;
 
-    // Verify with Flutterwave
+    // 1. Verify with Flutterwave
     const flwRes = await axios.get(`${FLW_BASE}/transactions/${transaction_id}/verify`, {
       headers: { Authorization: `Bearer ${FLW_SECRET_KEY}` },
     });
 
     const { status, amount, currency, tx_ref } = flwRes.data.data;
 
-    // Idempotency Check (Prevent double crediting)
+    // 2. Idempotency Check
     const checkRef = await pool.query("SELECT id FROM payments WHERE tx_ref = $1", [tx_ref]);
     if (checkRef.rows.length > 0) {
         return res.json({ success: true, message: "Already credited" });
     }
 
     if (status === "successful") {
-      // ✅ Convert whatever they paid (e.g. NGN) back to USD for the internal wallet
+      // 3. Convert Paid Amount (e.g. NGN) back to USD
       const amountInUSD = parseFloat(convertToUSD(amount, currency));
+      
+      // 4. Convert USD to KEY (1:1 Rate)
+      const coinsToCredit = amountInUSD / COIN_RATE; 
 
-      // 1. Credit Wallet (in USD)
+      // 5. Credit Wallet (in KEY)
       await pool.query(
         "UPDATE wallets SET balance = balance + $1 WHERE agent_id = $2",
-        [amountInUSD, userId]
+        [coinsToCredit, userId]
       );
 
-      // 2. Log Transaction
-      // We explicitly set listing_product_id to NULL because this is a wallet top-up
+      // 6. Log Transaction
       await pool.query(
         `INSERT INTO payments (
             agent_unique_id, 
@@ -109,22 +118,22 @@ export const verifyWalletFunding = async (req, res) => {
             currency, 
             status, 
             purpose
-         ) VALUES ($1, NULL, $2, $3, $4, 'USD', 'successful', 'wallet_funding')`,
-        [userId, tx_ref, transaction_id, amountInUSD]
+         ) VALUES ($1, NULL, $2, $3, $4, 'KEY', 'successful', 'wallet_funding')`,
+        [userId, tx_ref, transaction_id, coinsToCredit] // Storing amount as KEY count
       );
       
-      return res.json({ success: true, message: `Wallet funded with $${amountInUSD}` });
+      return res.json({ success: true, message: `Wallet funded with ${coinsToCredit} KEY` });
     } else {
-      return res.status(400).json({ success: false, message: "Payment failed" });
+      return res.status(400).json({ success: false, message: "Payment verification failed" });
     }
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Server Error" });
+    res.status(500).json({ message: "Verification Server Error" });
   }
 };
 
 // =========================================================
-// 4. ACTIVATE LISTING VIA WALLET ($15 Deduction)
+// 4. ACTIVATE LISTING (Spends KEY)
 // =========================================================
 export const activateViaWallet = async (req, res) => {
   try {
@@ -135,19 +144,22 @@ export const activateViaWallet = async (req, res) => {
     try {
       await client.query("BEGIN");
 
-      // Check Balance
+      // 1. Check Coin Balance
       const walletRes = await client.query("SELECT balance FROM wallets WHERE agent_id = $1", [userId]);
       const balance = Number(walletRes.rows[0]?.balance || 0);
 
-      if (balance < DISCOUNTED_COST) {
+      if (balance < LISTING_COST_KEY) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ success: false, message: `Insufficient wallet balance. You need $${DISCOUNTED_COST}.` });
+        return res.status(400).json({ 
+            success: false, 
+            message: `Insufficient Keyvia Coins. Balance: ${balance} KEY. Needed: ${LISTING_COST_KEY} KEY.` 
+        });
       }
 
-      // Deduct $15 (USD)
-      await client.query("UPDATE wallets SET balance = balance - $1 WHERE agent_id = $2", [DISCOUNTED_COST, userId]);
+      // 2. Deduct Coins (8 KEY)
+      await client.query("UPDATE wallets SET balance = balance - $1 WHERE agent_id = $2", [LISTING_COST_KEY, userId]);
 
-      // Activate Listing
+      // 3. Activate Listing
       await client.query(
         `UPDATE listings 
          SET is_active=true, payment_status='paid', activated_at=NOW(), status='approved' 
@@ -155,8 +167,8 @@ export const activateViaWallet = async (req, res) => {
         [listingId, userId]
       );
 
-      // Log Usage
-      const ref = `W-ACTV-${listingId}-${crypto.randomBytes(2).toString("hex")}`;
+      // 4. Log Usage (as 'KEY' currency)
+      const ref = `ACTV-${listingId}-${crypto.randomBytes(2).toString("hex")}`;
       await client.query(
         `INSERT INTO payments (
             agent_unique_id, 
@@ -166,12 +178,12 @@ export const activateViaWallet = async (req, res) => {
             currency, 
             status, 
             purpose
-         ) VALUES ($1, $2, $3, $4, 'USD', 'successful', 'listing_activation')`,
-        [userId, listingId, ref, DISCOUNTED_COST]
+         ) VALUES ($1, $2, $3, $4, 'KEY', 'successful', 'listing_activation')`,
+        [userId, listingId, ref, LISTING_COST_KEY]
       );
 
       await client.query("COMMIT");
-      res.json({ success: true, message: "Listing activated via wallet!" });
+      res.json({ success: true, message: "Listing activated with Keyvia Coins!" });
     } catch (e) {
       await client.query("ROLLBACK");
       throw e;
@@ -182,4 +194,4 @@ export const activateViaWallet = async (req, res) => {
     console.error(err);
     res.status(500).json({ message: "Activation failed" });
   }
-};
+}; 

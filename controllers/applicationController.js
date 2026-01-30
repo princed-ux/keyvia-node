@@ -2,12 +2,24 @@ import { pool } from "../db.js";
 import { sendEmailNotification } from "../utils/emailService.js";
 
 /* -------------------------------------------------------
-   ✅ GET RECEIVED APPLICATIONS
+   ENUM ALLOWED STATUSES (SINGLE SOURCE OF TRUTH)
+------------------------------------------------------- */
+const APPLICATION_STATUSES = [
+  "APPLIED",
+  "REVIEWED",
+  "VIEWING_SCHEDULED",
+  "IN_DISCUSSION",
+  "ACCEPTED",
+  "DECLINED"
+];
+
+/* -------------------------------------------------------
+   ✅ GET RECEIVED APPLICATIONS (Agent / Owner)
 ------------------------------------------------------- */
 export const getReceivedApplications = async (req, res) => {
   try {
-    if (!req.user || !req.user.unique_id) {
-        return res.status(401).json({ message: "User not authenticated" });
+    if (!req.user?.unique_id) {
+      return res.status(401).json({ message: "Unauthorized" });
     }
 
     const listerId = req.user.unique_id;
@@ -15,211 +27,211 @@ export const getReceivedApplications = async (req, res) => {
     const query = `
       SELECT 
         a.*,
-        l.title as listing_title, 
-        l.address as listing_address, 
-        l.photos as listing_photos, 
-        l.price as listing_price, 
+        l.title AS listing_title,
+        l.address AS listing_address,
+        l.photos AS listing_photos,
+        l.price AS listing_price,
         l.price_currency,
-        p.full_name as buyer_name, 
-        p.avatar_url as buyer_avatar, 
-        p.email as buyer_email, 
-        p.phone as buyer_phone
+        p.full_name AS buyer_name,
+        p.avatar_url AS buyer_avatar,
+        p.email AS buyer_email,
+        p.phone AS buyer_phone
       FROM applications a
       JOIN listings l ON a.listing_id = l.product_id
       JOIN profiles p ON a.buyer_id = p.unique_id
       WHERE l.agent_unique_id = $1
       ORDER BY a.created_at DESC
     `;
-    
+
     const result = await pool.query(query, [listerId]);
 
     const rows = result.rows.map(row => {
       let photos = [];
-      try { 
-        photos = typeof row.listing_photos === 'string' 
-          ? JSON.parse(row.listing_photos) 
-          : row.listing_photos || []; 
-      } catch (e) { photos = []; }
-      
-      return { 
-          ...row, 
-          listing_image: photos.length > 0 ? (photos[0].url || photos[0]) : null 
+      try {
+        photos = typeof row.listing_photos === "string"
+          ? JSON.parse(row.listing_photos)
+          : row.listing_photos || [];
+      } catch {}
+
+      return {
+        ...row,
+        listing_image: photos.length ? (photos[0].url || photos[0]) : null
       };
     });
 
     res.json(rows);
-
   } catch (err) {
-    console.error("❌ ERROR in getReceivedApplications:", err);
-    res.status(500).json({ message: "Server error", details: err.message });
+    console.error("getReceivedApplications:", err);
+    res.status(500).json({ message: "Server error" });
   }
 };
 
 /* -------------------------------------------------------
-   ✅ UPDATE APPLICATION STATUS
-   👉 Matches 'receiver_id' schema
+   ✅ UPDATE APPLICATION STATUS (Agent / Owner ONLY)
 ------------------------------------------------------- */
 export const updateApplicationStatus = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body; 
+    const { status } = req.body;
 
-    if (!['approved', 'rejected', 'pending'].includes(status)) {
-        return res.status(400).json({ message: "Invalid status value" });
+    if (!APPLICATION_STATUSES.includes(status)) {
+      return res.status(400).json({ message: "Invalid application status" });
     }
 
-    // 1. Perform Update
+    const userId = req.user.unique_id;
+
+    // 🔒 Authorization: ensure this user owns the listing
+    const authCheck = await pool.query(
+      `
+      SELECT a.*
+      FROM applications a
+      JOIN listings l ON a.listing_id = l.product_id
+      WHERE a.id = $1 AND l.agent_unique_id = $2
+      `,
+      [id, userId]
+    );
+
+    if (authCheck.rows.length === 0) {
+      return res.status(403).json({ message: "Not authorized" });
+    }
+
     const result = await pool.query(
-      `UPDATE applications SET status = $1 WHERE id = $2 RETURNING *`,
+      `
+      UPDATE applications
+      SET status = $1, updated_at = NOW()
+      WHERE id = $2
+      RETURNING *
+      `,
       [status, id]
     );
 
-    if (result.rows.length === 0) {
-        return res.status(404).json({ message: "Application not found" });
-    }
-
     const updatedApp = result.rows[0];
-    console.log(`✅ App #${id} updated to ${status}`);
 
-    // ... inside updateApplicationStatus ...
+    // 🔔 Notify Buyer
+    const buyerRes = await pool.query(
+      `SELECT email, full_name FROM profiles WHERE unique_id = $1`,
+      [updatedApp.buyer_id]
+    );
 
-    // =======================================================
-    // 🔔 NOTIFICATION SYSTEM (Notify Buyer)
-    // =======================================================
-    
-    const buyerRes = await pool.query(`SELECT email, full_name FROM profiles WHERE unique_id = $1`, [updatedApp.buyer_id]);
-    const listingRes = await pool.query(`SELECT title FROM listings WHERE product_id = $1`, [updatedApp.listing_id]);
-    
-    const buyer = buyerRes.rows[0];
-    const listingTitle = listingRes.rows[0]?.title || "Property";
+    const listingRes = await pool.query(
+      `SELECT title FROM listings WHERE product_id = $1`,
+      [updatedApp.listing_id]
+    );
 
-    if (buyer) {
-        const title = "Application Update";
-        const message = `Your application for "${listingTitle}" has been ${status.toUpperCase()}.`;
-        
-        // ✅ FIX: Buyers always go to the Buyer Dashboard
-        const link = `/buyer/applications`; 
+    if (buyerRes.rows.length) {
+      const buyer = buyerRes.rows[0];
+      const listingTitle = listingRes.rows[0]?.title || "Property";
 
-        // 1. Insert into DB
-        await pool.query(
-            `INSERT INTO notifications 
-            (receiver_id, type, title, message, link, is_read) 
-            VALUES ($1, $2, $3, $4, $5, FALSE)`,
-            [updatedApp.buyer_id, 'application_status', title, message, link]
-        );
+      const title = "Application Status Updated";
+      const message = `Your application for "${listingTitle}" is now ${status.replace("_", " ")}.`;
+      const link = "/buyer/applications";
 
-        // 2. Real-Time Socket Event
-        if (req.io) {
-            req.io.to(updatedApp.buyer_id).emit("notification", {
-                type: 'application_status',
-                title: title,
-                message: message,
-                link: link,
-                created_at: new Date()
-            });
-        }
+      await pool.query(
+        `
+        INSERT INTO notifications (receiver_id, type, title, message, link)
+        VALUES ($1, 'application_status', $2, $3, $4)
+        `,
+        [updatedApp.buyer_id, title, message, link]
+      );
 
-        // 3. Send Email
-        await sendEmailNotification(buyer.email, `${title}: ${status.toUpperCase()}`, message);
+      req.io?.to(updatedApp.buyer_id).emit("notification", {
+        type: "application_status",
+        title,
+        message,
+        link,
+        created_at: new Date()
+      });
+
+      await sendEmailNotification(buyer.email, title, message);
     }
 
     res.json(updatedApp);
-
   } catch (err) {
-    console.error("❌ FATAL SQL ERROR inside updateApplicationStatus:", err);
-    res.status(500).json({ message: "Update failed", details: err.message });
+    console.error("updateApplicationStatus:", err);
+    res.status(500).json({ message: "Update failed" });
   }
 };
 
 /* -------------------------------------------------------
-   ✅ CREATE NEW APPLICATION
-   👉 Matches 'receiver_id' schema
+   ✅ CREATE APPLICATION (Buyer)
 ------------------------------------------------------- */
 export const createApplication = async (req, res) => {
   try {
-    const buyer_id = req.user.unique_id;
-    const { 
-      listing_id, annual_income, credit_score, 
-      move_in_date, occupants_count, message 
+    const buyerId = req.user.unique_id;
+    const {
+      listing_id,
+      annual_income,
+      credit_score,
+      move_in_date,
+      occupants_count,
+      message
     } = req.body;
 
-    // 1. Check Duplicate
-    const existing = await pool.query(
-      "SELECT id FROM applications WHERE listing_id = $1 AND buyer_id = $2",
-      [listing_id, buyer_id]
+    const exists = await pool.query(
+      `SELECT 1 FROM applications WHERE listing_id = $1 AND buyer_id = $2`,
+      [listing_id, buyerId]
     );
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ message: "You have already applied to this listing." });
+
+    if (exists.rows.length) {
+      return res.status(400).json({ message: "Already applied" });
     }
 
-    // 2. Insert Application
     const result = await pool.query(
-      `INSERT INTO applications 
-       (listing_id, buyer_id, annual_income, credit_score, move_in_date, occupants_count, message, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-       RETURNING *`,
-      [listing_id, buyer_id, annual_income, credit_score, move_in_date, occupants_count, message]
+      `
+      INSERT INTO applications
+      (listing_id, buyer_id, annual_income, credit_score, move_in_date, occupants_count, message, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'APPLIED')
+      RETURNING *
+      `,
+      [listing_id, buyerId, annual_income, credit_score, move_in_date, occupants_count, message]
     );
+
     const newApp = result.rows[0];
 
-    // ... inside createApplication ...
-
-    // =======================================================
-    // 🔔 NOTIFICATION SYSTEM (Notify Agent/Owner)
-    // =======================================================
-
-    // ✅ FIX: Fetch 'role' so we know which dashboard link to send
+    // 🔔 Notify Agent / Owner
     const listingRes = await pool.query(
-        `SELECT l.title, l.agent_unique_id, p.email, p.full_name, p.role 
-         FROM listings l
-         JOIN profiles p ON l.agent_unique_id = p.unique_id
-         WHERE l.product_id = $1`,
-        [listing_id]
+      `
+      SELECT l.title, l.agent_unique_id, p.email, p.role
+      FROM listings l
+      JOIN profiles p ON l.agent_unique_id = p.unique_id
+      WHERE l.product_id = $1
+      `,
+      [listing_id]
     );
-    
-    const agent = listingRes.rows[0];
-    const buyerRes = await pool.query(`SELECT full_name FROM profiles WHERE unique_id = $1`, [buyer_id]);
-    const buyerName = buyerRes.rows[0]?.full_name || "A potential tenant";
 
-    if (agent) {
-        const title = "New Application Received";
-        const notifMsg = `${buyerName} applied for "${agent.title}".`;
-        
-        // ✅ FIX: Determine correct link based on Role
-        // Owners go to /owner/applications, Agents go to /dashboard/applications
-        let link = "/dashboard/applications"; 
-        if (agent.role === 'owner') {
-            link = "/owner/applications";
-        }
+    if (listingRes.rows.length) {
+      const agent = listingRes.rows[0];
+      const title = "New Application Received";
+      const notifMsg = `A new application was submitted for "${agent.title}".`;
 
-        // 1. Insert into DB
-        await pool.query(
-            `INSERT INTO notifications 
-            (receiver_id, type, title, message, link, is_read) 
-            VALUES ($1, $2, $3, $4, $5, FALSE)`,
-            [agent.agent_unique_id, 'new_application', title, notifMsg, link]
-        );
+      const link =
+        agent.role === "owner"
+          ? "/owner/applications"
+          : "/dashboard/applications";
 
-        // 2. Real-Time Socket Event
-        if (req.io) {
-            req.io.to(agent.agent_unique_id).emit("notification", {
-                type: 'new_application',
-                title: title,
-                message: notifMsg,
-                link: link,
-                created_at: new Date()
-            });
-        }
+      await pool.query(
+        `
+        INSERT INTO notifications (receiver_id, type, title, message, link)
+        VALUES ($1, 'new_application', $2, $3, $4)
+        `,
+        [agent.agent_unique_id, title, notifMsg, link]
+      );
 
-        // 3. Send Email
-        await sendEmailNotification(agent.email, title, notifMsg);
+      req.io?.to(agent.agent_unique_id).emit("notification", {
+        type: "new_application",
+        title,
+        message: notifMsg,
+        link,
+        created_at: new Date()
+      });
+
+      await sendEmailNotification(agent.email, title, notifMsg);
     }
 
     res.status(201).json(newApp);
-
   } catch (err) {
-    console.error("CreateApp Error:", err);
-    res.status(500).json({ message: "Failed to submit application", error: err.message });
+    console.error("createApplication:", err);
+    res.status(500).json({ message: "Failed to submit application" });
   }
 };
 
@@ -232,12 +244,12 @@ export const getBuyerApplications = async (req, res) => {
 
     const query = `
       SELECT 
-        a.*, 
-        l.title as property, 
-        l.address, 
+        a.*,
+        l.title AS property,
+        l.address,
         l.city,
         l.photos,
-        p.full_name as agent_name,
+        p.full_name AS agent_name,
         p.agency_name
       FROM applications a
       JOIN listings l ON a.listing_id = l.product_id
@@ -249,7 +261,7 @@ export const getBuyerApplications = async (req, res) => {
     const result = await pool.query(query, [buyerId]);
     res.json(result.rows);
   } catch (err) {
-    console.error("Error fetching buyer applications:", err);
+    console.error("getBuyerApplications:", err);
     res.status(500).json({ message: "Server error" });
   }
 };
