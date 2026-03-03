@@ -13,8 +13,7 @@ export const getProfile = async (req, res) => {
   try {
     const { unique_id, source, role } = req.user;
 
-    // ✅ KEY FIX: Use COALESCE to fallback to the 'users' table 
-    // if 'profiles' table data (like country/phone) is missing/null.
+    // Use COALESCE to fallback to 'users' table data if 'profiles' is empty
     const columns = `
       p.unique_id, 
       COALESCE(p.full_name, u.name) as full_name, 
@@ -33,7 +32,6 @@ export const getProfile = async (req, res) => {
       p.preferred_location, p.budget_min, p.budget_max, p.property_type, p.move_in_date
     `;
 
-    // LEFT JOIN ensures we get data even if the profile row is partial
     let result = await pool.query(
       `SELECT ${columns} 
        FROM profiles p
@@ -42,11 +40,11 @@ export const getProfile = async (req, res) => {
       [unique_id]
     );
 
-    // ✅ SELF-HEALING: If profile row is totally missing, create it now
-    // using the country/phone data we already have in 'users'
+    // ✅ SELF-HEALING: If profile row is missing, create it now
     if (!result.rows.length && source === "users") {
       const needsVerification = ['agent', 'owner'].includes(role);
-      const initialStatus = needsVerification ? 'new' : 'approved';
+      // FIX: Use 'verified' instead of 'approved' to match your Admin system
+      const initialStatus = needsVerification ? 'new' : 'verified'; 
       
       await pool.query(
         `INSERT INTO profiles (unique_id, full_name, email, role, verification_status, country, phone)
@@ -55,7 +53,7 @@ export const getProfile = async (req, res) => {
         [unique_id, req.user.name, req.user.email, role, initialStatus, req.user.country, req.user.phone]
       );
       
-      // Fetch again to ensure we return the fresh row
+      // Fetch again to return the new row
       result = await pool.query(
         `SELECT ${columns} 
          FROM profiles p
@@ -75,14 +73,14 @@ export const getProfile = async (req, res) => {
   }
 };
 
-// ------------------ 2. UPDATE PRIVATE PROFILE ------------------
+// ------------------ 2. UPDATE PRIVATE PROFILE (Smart Logic) ------------------
 export const updateProfile = async (req, res) => {
   try {
     const { unique_id, role } = req.user;
     const {
       full_name, username, phone, gender, country, city, bio,
       social_tiktok, social_instagram, social_facebook, social_linkedin, social_twitter,
-      // Agent/Owner Fields
+      // Critical Fields
       agency_name, license_number, experience,
       // Buyer Fields
       preferred_location, budget_min, budget_max, property_type, move_in_date
@@ -91,12 +89,35 @@ export const updateProfile = async (req, res) => {
     const errors = validateProfile({ full_name, username });
     if (Object.keys(errors).length) return res.status(400).json({ errors });
 
-    // ✅ LOGIC: If Agent/Owner updates details, reset status to 'pending' for Admin review
-    const needsVerification = ['agent', 'owner'].includes(role);
-    
+    // 1️⃣ FETCH CURRENT DATA FIRST (To compare)
+    const currentRes = await pool.query(
+        `SELECT full_name, agency_name, license_number, verification_status FROM profiles WHERE unique_id = $1`,
+        [unique_id]
+    );
+    const currentProfile = currentRes.rows[0] || {};
+
+    // 2️⃣ CHECK FOR CRITICAL CHANGES
+    // We ONLY reset verification if they are an Agent/Owner AND they changed sensitive info.
+    // Changing Avatar, Bio, or Socials is SAFE.
+    let shouldResetVerification = false;
+
+    if (['agent', 'owner'].includes(role)) {
+        // Helper to normalize strings (treat null, undefined, and "" as the same)
+        const normalize = (str) => (str || "").trim();
+
+        const nameChanged = normalize(full_name) !== normalize(currentProfile.full_name);
+        const licenseChanged = normalize(license_number) !== normalize(currentProfile.license_number);
+        const agencyChanged = normalize(agency_name) !== normalize(currentProfile.agency_name);
+
+        if (nameChanged || licenseChanged || agencyChanged) {
+            shouldResetVerification = true;
+        }
+    }
+
+    // 3️⃣ BUILD DYNAMIC SQL
     let statusUpdateSQL = "";
-    if (needsVerification) {
-        statusUpdateSQL = `, verification_status = 'pending', rejection_reason = NULL, ai_score = NULL`;
+    if (shouldResetVerification) {
+        statusUpdateSQL = `, verification_status = 'pending', rejection_reason = NULL`;
     }
 
     const result = await pool.query(
@@ -126,16 +147,20 @@ export const updateProfile = async (req, res) => {
       ]
     );
 
-    // Sync Users Table Name & Phone (Important for the Fallback logic in getProfile)
+    // Sync Users Table (Important for Auth consistency)
     await pool.query(
         `UPDATE users SET name = $1, phone = $2, country = $3 WHERE unique_id = $4`, 
         [full_name, phone, country, unique_id]
     );
 
     res.json({
-      message: needsVerification ? "Profile submitted for review." : "Profile updated successfully.",
+      message: shouldResetVerification 
+        ? "Critical details changed. Profile is under review." 
+        : "Profile updated successfully.",
       profile: result.rows[0],
+      verification_status: result.rows[0].verification_status 
     });
+
   } catch (err) {
     console.error("❌ PUT /profile error:", err);
     if (err.code === "23505")

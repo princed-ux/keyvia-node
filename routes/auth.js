@@ -3,71 +3,85 @@ import {
   register,
   verifySignupOtp,
   resendSignupOtp,
+  socialAuth, // ✅ NEW: Unified Social Login/Signup
   setRole,
-  login, // Ensure you have this standard login if needed, otherwise remove
-  loginStart,
-  loginVerifyOtp,
+  login,
   forgotPassword,
   resetPassword,
   logout,
   refresh,
-  verifyFirebasePhone, // ✅ NEW: Import the Firebase controller
+  verifyFirebasePhone,
   finishOnboarding,
+  requestVerification,
 } from "../controllers/authController.js";
 
 // ✅ IMPORT THE MIDDLEWARE
 import { protect } from "../middleware/authMiddleware.js"; 
+import { upload } from "../middleware/upload.js"
 
 const router = express.Router();
 
 /* =========================
-   NEW SIGNUP FLOW
+   1. STANDARD SIGNUP FLOW
 ========================= */
-// 1️⃣ Initial Signup (Name, Email, Password -> Sends OTP)
+// Initial Signup (Name, Email, Password -> Sends OTP)
 router.post("/signup", register);
 
-// 2️⃣ Verify OTP (Activates Account)
+// Verify OTP (Activates Account)
 router.post("/signup/verify", verifySignupOtp);
 
-// 2b️⃣ Resend OTP (For the timer logic)
+// Resend OTP (For the timer logic)
 router.post("/signup/resend", resendSignupOtp);
 
-// 3️⃣ Set Role (Final Step)
-router.post("/signup/role", setRole);
-
 
 /* =========================
-   LOGIN FLOW
+   2. AUTHENTICATION (Login & Social)
 ========================= */
-router.post("/login", login); // Standard Email/Password login (if used)
-router.post("/login/start", loginStart); // OTP Login Step 1
-router.post("/login/verify", loginVerifyOtp); // OTP Login Step 2
+// Standard Email/Password login
+router.post("/login", login); 
+
+// ✅ NEW: Google / Apple / Facebook Unified Auth
+// Handles both Signup (if new) and Login (if exists)
+router.post("/social", socialAuth);
 
 
 /* =========================
-   PASSWORD RECOVERY
+   3. ROLE & ONBOARDING
+========================= */
+// Set Role (For new users who just verified email or social signed up)
+router.post("/role", setRole); // NOTE: Removed /signup/ prefix to make it generic
+
+// Complete Profile (Agents/Owners)
+router.put("/onboarding/complete", protect, finishOnboarding);
+
+
+/* =========================
+   4. PASSWORD RECOVERY
 ========================= */
 router.post("/forgot-password", forgotPassword);
 router.post("/reset-password/:token", resetPassword);
 
 
 /* =========================
-   SESSION MANAGEMENT
+   5. SESSION MANAGEMENT
 ========================= */
 router.post("/logout", logout);
-router.post("/refresh", refresh); // Changed from router.get to router.post if that matches your frontend, or keep as is. Usually GET or POST is fine depending on client.
+router.post("/refresh", refresh);
 
 
 /* =========================
-   ✅ PHONE VERIFICATION (FIREBASE)
+   6. PHONE VERIFICATION (FIREBASE)
 ========================= */
-// This replaces the old /send-otp and /verify-otp routes
 router.post("/phone/verify-firebase", protect, verifyFirebasePhone);
 
 
-/* =========================
-   ONBOARDING
-========================= */
-router.put("/onboarding/complete", protect, finishOnboarding);
+// ✅ NEW ROUTE: Submit Legal Verification
+// POST /api/auth/verify-role
+router.post(
+    '/verify-role', 
+    protect, 
+    upload.single('document'), // Handles the image upload
+    requestVerification
+);
 
 export default router;

@@ -59,13 +59,13 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
-// Debug Logger
-app.use((req, res, next) => {
-  console.log(`📢 ${req.method} ${req.url}`);
-  // 👇 ADD THIS LINE to see exactly what token is arriving
-  console.log(`   🔑 Header: ${req.headers.authorization || "NONE"}`);
-  next();
-});
+// // Debug Logger
+// app.use((req, res, next) => {
+//   console.log(`📢 ${req.method} ${req.url}`);
+//   // 👇 ADD THIS LINE to see exactly what token is arriving
+//   console.log(`   🔑 Header: ${req.headers.authorization || "NONE"}`);
+//   next();
+// });
 
 // Attach Socket.IO to Request
 app.use((req, res, next) => {
