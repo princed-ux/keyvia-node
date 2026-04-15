@@ -8,6 +8,9 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1030.0",
+    "@aws-sdk/client-ses": "^3.1030.0",
+    "@aws-sdk/s3-request-presigner": "^3.1030.0",
     "@cloudflare/kv-asset-handler": "^0.4.1",
     "@supabase/supabase-js": "^2.85.0",
     "@tensorflow-models/blazeface": "^0.1.0",
@@ -31,6 +34,7 @@
     "jpeg-js": "^0.4.4",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
+    "multer-s3": "^3.0.1",
     "multer-storage-cloudinary": "^2.2.1",
     "nodemailer": "^7.0.6",
     "path": "^0.12.7",

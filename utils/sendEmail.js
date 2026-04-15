@@ -1,53 +1,47 @@
-import nodemailer from "nodemailer";
+// utils/sendEmail.js
+import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 import dotenv from "dotenv";
-
 dotenv.config();
 
-const {
-  EMAIL_USER,
-  EMAIL_PASS,
-  CLIENT_URL,
-} = process.env;
+const { CLIENT_URL, SES_FROM_EMAIL } = process.env;
 
 /* ======================================================
-   📨 SMTP TRANSPORTER
+   📨 SES CLIENT
 ====================================================== */
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587, 
-  secure: false, 
-  auth: {
-    user: EMAIL_USER,
-    pass: EMAIL_PASS, 
+const ses = new SESClient({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
-  family: 4, // Keep this to prevent timeouts
-  pool: true, 
-  maxConnections: 2,
-  
-  // ❌ Disable Debug Logging
-  logger: false, 
-  debug: false, 
-
-  tls: {
-    rejectUnauthorized: false, 
-  }
-});
-
-// Verify SMTP on startup (Quiet Mode)
-transporter.verify((error) => {
-  if (error) {
-    console.error("❌ SMTP connection failed:", error.message);
-  } else {
-    console.log("✅ SMTP server ready");
-  }
 });
 
 /* ======================================================
-   🎨 PROFESSIONAL EMAIL TEMPLATE
+   📦 SAFE MAIL SENDER (drop-in replacement for sendSafeMail)
 ====================================================== */
-// ... (The rest of your file remains exactly the same) ...
-const LOGO_URL = "https://res.cloudinary.com/dcwpytcpc/image/upload/v1767102929/mainLogo_zfcxjf.png"; 
-const BRAND_COLOR = "#09707D"; 
+const sendSafeMail = async ({ to, subject, html }) => {
+  try {
+    const command = new SendEmailCommand({
+      Source: `Keyvia Security <${SES_FROM_EMAIL}>`,
+      Destination: { ToAddresses: [to] },
+      Message: {
+        Subject: { Data: subject, Charset: "UTF-8" },
+        Body: { Html: { Data: html, Charset: "UTF-8" } },
+      },
+    });
+    await ses.send(command);
+    console.log(`📨 Email sent via SES → ${to} | ${subject}`);
+  } catch (err) {
+    console.error("❌ SES send failed:", err.message);
+    throw err; // Re-throw so authController.js catch blocks still work
+  }
+};
+
+/* ======================================================
+   🎨 EMAIL TEMPLATE  (unchanged from your original)
+====================================================== */
+const LOGO_URL = "https://res.cloudinary.com/dcwpytcpc/image/upload/v1767102929/mainLogo_zfcxjf.png";
+const BRAND_COLOR = "#09707D";
 
 const emailWrapper = (title, content, footerText = "") => `
 <!DOCTYPE html>
@@ -93,24 +87,7 @@ const emailWrapper = (title, content, footerText = "") => `
 `;
 
 /* ======================================================
-   📦 SAFE MAIL SENDER
-====================================================== */
-const sendSafeMail = async ({ to, subject, html }) => {
-  try {
-    await transporter.sendMail({
-      from: `"Keyvia Security" <${EMAIL_USER}>`,
-      to,
-      subject,
-      html,
-    });
-    console.log(`📨 Email sent → ${to} | ${subject}`);
-  } catch (err) {
-    console.error("❌ Email send failed:", err.message);
-  }
-};
-
-/* ======================================================
-   ✉️ 1. SIGNUP OTP EMAIL
+   ✉️ 1. SIGNUP OTP EMAIL  (unchanged)
 ====================================================== */
 export const sendSignupOtpEmail = async (email, code) => {
   const html = emailWrapper(
@@ -129,7 +106,7 @@ export const sendSignupOtpEmail = async (email, code) => {
 };
 
 /* ======================================================
-   ✉️ 2. LOGIN OTP EMAIL
+   ✉️ 2. LOGIN OTP EMAIL  (unchanged)
 ====================================================== */
 export const sendLoginOtpEmail = async (email, code) => {
   const html = emailWrapper(
@@ -148,13 +125,13 @@ export const sendLoginOtpEmail = async (email, code) => {
 };
 
 /* ======================================================
-   ✉️ 3. PASSWORD RESET EMAIL
+   ✉️ 3. PASSWORD RESET EMAIL  (unchanged)
 ====================================================== */
 export const sendPasswordResetEmail = async (email, name, token) => {
   if (!token && name) { token = name; }
   const resetLink = `${CLIENT_URL}/reset-password/${token}`;
   const html = emailWrapper(
-    "Reset Password Request",   
+    "Reset Password Request",
     `
       <p class="text">We received a request to reset the password for your Keyvia account.</p>
       <a href="${resetLink}" class="btn">Reset Password</a>
@@ -170,7 +147,7 @@ export const sendPasswordResetEmail = async (email, name, token) => {
 };
 
 /* ======================================================
-   ✉️ 4. WELCOME EMAIL
+   ✉️ 4. WELCOME EMAIL  (unchanged)
 ====================================================== */
 export const sendWelcomeEmail = async (email, name) => {
   const loginLink = `${CLIENT_URL}/login`;

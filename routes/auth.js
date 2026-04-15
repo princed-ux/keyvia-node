@@ -3,16 +3,17 @@ import {
   register,
   verifySignupOtp,
   resendSignupOtp,
-  socialAuth, // ✅ NEW: Unified Social Login/Signup
+  socialAuth, 
   setRole,
   login,
   forgotPassword,
   resetPassword,
   logout,
   refresh,
-  verifyFirebasePhone,
+  sendPhoneOtp,      // ✅ NEW: SendChamp OTP
+  verifyPhoneOtp,    // ✅ NEW: SendChamp OTP
   finishOnboarding,
-  requestVerification,
+  deleteTestUser,
 } from "../controllers/authController.js";
 
 // ✅ IMPORT THE MIDDLEWARE
@@ -24,7 +25,7 @@ const router = express.Router();
 /* =========================
    1. STANDARD SIGNUP FLOW
 ========================= */
-// Initial Signup (Name, Email, Password -> Sends OTP)
+// Initial Signup (Name, Email, Password, Role -> Sends OTP)
 router.post("/signup", register);
 
 // Verify OTP (Activates Account)
@@ -40,20 +41,26 @@ router.post("/signup/resend", resendSignupOtp);
 // Standard Email/Password login
 router.post("/login", login); 
 
-// ✅ NEW: Google / Apple / Facebook Unified Auth
-// Handles both Signup (if new) and Login (if exists)
+// Unified Social Auth
 router.post("/social", socialAuth);
 
 
 /* =========================
    3. ROLE & ONBOARDING
 ========================= */
-// Set Role (For new users who just verified email or social signed up)
-router.post("/role", setRole); // NOTE: Removed /signup/ prefix to make it generic
+// Set Role (Kept for Social Auth fallback)
+router.post("/role", setRole); 
 
-// Complete Profile (Agents/Owners)
-router.put("/onboarding/complete", protect, finishOnboarding);
-
+// Complete Profile (Data + Avatar + Legal Doc) ✅ UPDATED FOR FILES
+router.put(
+  "/onboarding/complete", 
+  protect, 
+  upload.fields([
+    { name: 'avatar', maxCount: 1 }, 
+    { name: 'document', maxCount: 1 }
+  ]), 
+  finishOnboarding
+);
 
 /* =========================
    4. PASSWORD RECOVERY
@@ -70,18 +77,15 @@ router.post("/refresh", refresh);
 
 
 /* =========================
-   6. PHONE VERIFICATION (FIREBASE)
+   6. PHONE VERIFICATION (SENDCHAMP) ✅ NEW
 ========================= */
-router.post("/phone/verify-firebase", protect, verifyFirebasePhone);
+router.post("/phone/send-otp", protect, sendPhoneOtp);
+router.post("/phone/verify-otp", protect, verifyPhoneOtp);
 
 
-// ✅ NEW ROUTE: Submit Legal Verification
-// POST /api/auth/verify-role
-router.post(
-    '/verify-role', 
-    protect, 
-    upload.single('document'), // Handles the image upload
-    requestVerification
-);
+
+
+
+router.post("/dev/delete-user", deleteTestUser);
 
 export default router;
