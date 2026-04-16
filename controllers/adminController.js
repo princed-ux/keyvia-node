@@ -6,7 +6,7 @@ import { analyzeProfile } from "../services/aiProfileService.js";
 // =========================================================
 export const getPendingProfiles = async (req, res) => {
   try {
-    // ✅ FIX: Removed 'new'. Only fetch profiles explicitly waiting for review ('pending').
+    // We MUST JOIN with the users table to grab the document URLs!
     const result = await pool.query(`
       SELECT 
         p.unique_id, 
@@ -25,16 +25,18 @@ export const getPendingProfiles = async (req, res) => {
         p.bio, 
         p.created_at, 
         p.verification_status,
-        -- Fallback for review count if table doesn't exist yet
-        0 as review_count
+        COALESCE(u.license_document_url, u.identity_document_url) AS document_url
       FROM profiles p
+      JOIN users u ON p.unique_id = u.unique_id
       WHERE p.verification_status = 'pending' 
       ORDER BY p.created_at DESC
     `);
-    res.json(result.rows);
+    
+    // Explicit return to close the request and stop the frontend spinner
+    return res.status(200).json(result.rows);
   } catch (err) {
     console.error("[GetPending] Error:", err);
-    res.status(500).json({ message: "Server Error" });
+    return res.status(500).json({ message: "Server Error" });
   }
 };
 

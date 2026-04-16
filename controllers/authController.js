@@ -4,11 +4,15 @@ import { pool } from "../db.js";
 import { generateSpecialId } from "../utils/generateId.js";
 import {
   sendSignupOtpEmail,
-  sendPasswordResetEmail, 
+  sendPasswordResetEmail,
 } from "../utils/sendEmail.js";
 import { uploadToS3 } from "../middleware/upload.js";
 // ✅ NEW: Import your SendChamp utility
 import { sendSmsOtp } from "../utils/sendSms.js";
+import {
+  RekognitionClient,
+  DetectFacesCommand,
+} from "@aws-sdk/client-rekognition";
 
 // ================= ENV =================
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
@@ -25,9 +29,18 @@ const signAccessToken = (user) => {
       email: user.email,
     },
     ACCESS_TOKEN_SECRET,
-    { expiresIn: "7d" }
+    { expiresIn: "7d" },
   );
 };
+
+// Initialize the Rekognition Client
+const rekognition = new RekognitionClient({
+  region: "eu-west-1", // Rekognition works here
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
 
 // ===================================================
 // 1. REGISTER (Email/Password)
@@ -53,38 +66,44 @@ export const register = async (req, res) => {
     await pool.query(
       `INSERT INTO users (name, email, password, role, is_verified, verification_status) 
        VALUES ($1, $2, $3, 'pending', false, 'unverified')`,
-      [name, cleanEmail, hashedPassword]
+      [name, cleanEmail, hashedPassword],
     );
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const codeHash = await bcrypt.hash(code, 10);
-    
+
     // ✅ TWEAK 2: Changed expiry to 10 minutes (10 * 60 * 1000)
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); 
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await pool.query(
       "UPDATE email_otps SET used=true WHERE email=$1 AND purpose='signup'",
-      [cleanEmail]
+      [cleanEmail],
     );
     await pool.query(
       `INSERT INTO email_otps (email, code_hash, expires_at, purpose) VALUES ($1, $2, $3, 'signup')`,
-      [cleanEmail, codeHash, expiresAt]
+      [cleanEmail, codeHash, expiresAt],
     );
 
     await sendSignupOtpEmail(cleanEmail, code);
     res.json({ success: true, message: "Account created. OTP sent to email." });
   } catch (err) {
     console.error("[Register] Error:", err);
-    
+
     // ✅ TWEAK 3: Updated to catch AWS SES specific errors alongside standard timeouts
     if (
-      err.code === 'ETIMEDOUT' || 
+      err.code === "ETIMEDOUT" ||
       err.message.includes("Greeting never received") ||
-      err.name === "MessageRejected" || 
+      err.name === "MessageRejected" ||
       err.name === "MailFromDomainNotVerifiedException"
     ) {
-        await pool.query("DELETE FROM users WHERE email=$1", [email.toLowerCase().trim()]);
-        return res.status(500).json({ message: "Could not send verification email. Please try again." });
+      await pool.query("DELETE FROM users WHERE email=$1", [
+        email.toLowerCase().trim(),
+      ]);
+      return res
+        .status(500)
+        .json({
+          message: "Could not send verification email. Please try again.",
+        });
     }
 
     res.status(500).json({ message: "Server error." });
@@ -104,7 +123,7 @@ export const verifySignupOtp = async (req, res) => {
 
     const otpRes = await pool.query(
       `SELECT * FROM email_otps WHERE email=$1 AND used=false AND purpose='signup' ORDER BY created_at DESC LIMIT 1`,
-      [cleanEmail]
+      [cleanEmail],
     );
 
     if (!otpRes.rows.length)
@@ -113,7 +132,7 @@ export const verifySignupOtp = async (req, res) => {
 
     if (new Date() > otp.expires_at)
       return res.status(400).json({ message: "Code expired." });
-    
+
     const valid = await bcrypt.compare(code, otp.code_hash);
     if (!valid) return res.status(400).json({ message: "Invalid code." });
 
@@ -122,7 +141,7 @@ export const verifySignupOtp = async (req, res) => {
     // We only need the unique_id to create the temp token
     const userRes = await pool.query(
       `UPDATE users SET is_verified=true WHERE email=$1 RETURNING unique_id`,
-      [cleanEmail]
+      [cleanEmail],
     );
 
     if (!userRes.rows.length)
@@ -132,20 +151,19 @@ export const verifySignupOtp = async (req, res) => {
     const tempToken = jwt.sign(
       { unique_id: userRes.rows[0].unique_id },
       process.env.ACCESS_TOKEN_SECRET,
-      { expiresIn: "1h" }
+      { expiresIn: "1h" },
     );
 
     res.json({
       success: true,
       message: "Email verified. Proceed to role selection.",
-      token: tempToken // Frontend saves this as 'signupTempToken'
+      token: tempToken, // Frontend saves this as 'signupTempToken'
     });
   } catch (err) {
     console.error("[VerifySignupOtp]", err);
     res.status(500).json({ message: "Server error." });
   }
 };
-
 
 // ===================================================
 // 3. RESEND EMAIL OTP
@@ -156,31 +174,35 @@ export const resendSignupOtp = async (req, res) => {
     const cleanEmail = email.toLowerCase().trim();
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const codeHash = await bcrypt.hash(code, 10);
-    
+
     // ✅ TWEAK: Matched the 10-minute expiry time!
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await pool.query(
       "UPDATE email_otps SET used=true WHERE email=$1 AND purpose='signup'",
-      [cleanEmail]
+      [cleanEmail],
     );
     await pool.query(
       `INSERT INTO email_otps (email, code_hash, expires_at, purpose) VALUES ($1, $2, $3, 'signup')`,
-      [cleanEmail, codeHash, expiresAt]
+      [cleanEmail, codeHash, expiresAt],
     );
 
     await sendSignupOtpEmail(cleanEmail, code);
     res.json({ success: true, message: "New code sent." });
   } catch (err) {
     console.error("[ResendOTP]", err);
-    
+
     // ✅ TWEAK: Added AWS error catching just like in register
     if (
-      err.code === 'ETIMEDOUT' || 
-      err.name === "MessageRejected" || 
+      err.code === "ETIMEDOUT" ||
+      err.name === "MessageRejected" ||
       err.name === "MailFromDomainNotVerifiedException"
     ) {
-        return res.status(500).json({ message: "Could not send verification email. Please try again later." });
+      return res
+        .status(500)
+        .json({
+          message: "Could not send verification email. Please try again later.",
+        });
     }
 
     res.status(500).json({ message: "Server error." });
@@ -191,7 +213,7 @@ export const resendSignupOtp = async (req, res) => {
 // 13. UNIFIED SOCIAL AUTH (Google, Facebook)
 // ===================================================
 export const socialAuth = async (req, res) => {
-  const { token } = req.body; 
+  const { token } = req.body;
 
   if (!token) return res.status(400).json({ message: "No token provided." });
 
@@ -201,31 +223,37 @@ export const socialAuth = async (req, res) => {
     const { email, name, picture, uid } = decodedToken;
 
     if (!email) {
-      return res.status(400).json({ message: "Social account must have an email." });
+      return res
+        .status(400)
+        .json({ message: "Social account must have an email." });
     }
 
     const cleanEmail = email.toLowerCase().trim();
 
     // 2. Check if user exists in PostgreSQL
-    const userRes = await pool.query("SELECT * FROM users WHERE email=$1", [cleanEmail]);
+    const userRes = await pool.query("SELECT * FROM users WHERE email=$1", [
+      cleanEmail,
+    ]);
 
     let user;
 
     if (userRes.rows.length > 0) {
       user = userRes.rows[0];
     } else {
-      const randomPassword = Math.random().toString(36).slice(-8) + Math.random().toString(36).slice(-8);
+      const randomPassword =
+        Math.random().toString(36).slice(-8) +
+        Math.random().toString(36).slice(-8);
       const hashedPassword = await bcrypt.hash(randomPassword, 10);
-      const { v4: uuidv4 } = await import('uuid'); 
-      const newUniqueId = uuidv4(); 
+      const { v4: uuidv4 } = await import("uuid");
+      const newUniqueId = uuidv4();
 
       const newUser = await pool.query(
         `INSERT INTO users (name, email, password, role, is_verified, verification_status, avatar_url, unique_id, auth_provider) 
          VALUES ($1, $2, $3, 'pending', true, 'new', $4, $5, 'social') 
          RETURNING *`,
-        [name || "User", cleanEmail, hashedPassword, picture, newUniqueId]
+        [name || "User", cleanEmail, hashedPassword, picture, newUniqueId],
       );
-      
+
       user = newUser.rows[0];
     }
 
@@ -234,13 +262,15 @@ export const socialAuth = async (req, res) => {
     const refreshToken = jwt.sign(
       { unique_id: user.unique_id },
       process.env.REFRESH_TOKEN_SECRET,
-      { expiresIn: "45d" }
+      { expiresIn: "45d" },
     );
 
-    await pool.query("DELETE FROM refresh_tokens WHERE user_id=$1", [user.unique_id]);
+    await pool.query("DELETE FROM refresh_tokens WHERE user_id=$1", [
+      user.unique_id,
+    ]);
     await pool.query(
       "INSERT INTO refresh_tokens (user_id, token) VALUES ($1,$2)",
-      [user.unique_id, refreshToken]
+      [user.unique_id, refreshToken],
     );
 
     res.cookie("refreshToken", refreshToken, {
@@ -263,14 +293,15 @@ export const socialAuth = async (req, res) => {
         is_super_admin: user.is_super_admin,
         phone_verified: user.phone_verified,
         special_id: user.special_id,
-        verification_status: user.verification_status || 'new', 
-        is_new_user: userRes.rows.length === 0 
+        verification_status: user.verification_status || "new",
+        is_new_user: userRes.rows.length === 0,
       },
     });
-
   } catch (err) {
     console.error("[SocialAuth] Error:", err);
-    res.status(401).json({ message: "Invalid social token.", details: err.message });
+    res
+      .status(401)
+      .json({ message: "Invalid social token.", details: err.message });
   }
 };
 
@@ -279,10 +310,26 @@ export const socialAuth = async (req, res) => {
 // ===================================================
 export const setRole = async (req, res) => {
   const authHeader = req.headers.authorization;
-  const { role } = req.body;
+  const { role, agent_type, team_code } = req.body;
 
   if (!authHeader) return res.status(401).json({ message: "No token." });
   if (!role) return res.status(400).json({ message: "Role required." });
+
+  // Validate agent_type and team_code for agents
+  if (role === "agent") {
+    if (!agent_type || !["solo", "brokerage"].includes(agent_type)) {
+      return res
+        .status(400)
+        .json({
+          message: "Invalid agent type. Must be 'solo' or 'brokerage'.",
+        });
+    }
+    if (agent_type === "brokerage" && !team_code) {
+      return res
+        .status(400)
+        .json({ message: "Team code required for brokerage agents." });
+    }
+  }
 
   let unique_id;
 
@@ -298,79 +345,156 @@ export const setRole = async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const validRoles = ["buyer", "agent", "owner"]; 
+    // ✅ 1. Validate role
+    const validRoles = ["buyer", "agent", "owner", "brokerage"];
     if (!validRoles.includes(role))
       return res.status(400).json({ message: "Invalid role selected." });
 
     const userRes = await client.query(
-        `SELECT email, name FROM users WHERE unique_id = $1`, 
-        [unique_id]
+      `SELECT email, name FROM users WHERE unique_id = $1`,
+      [unique_id],
     );
-    
+
     if (userRes.rows.length === 0) {
-        return res.status(404).json({ message: "User not found." });
+      return res.status(404).json({ message: "User not found." });
     }
 
     const { email, name } = userRes.rows[0];
 
-    await client.query('BEGIN');
+    // ✅ 2. GENERATE TEAM CODE IF THEY ARE A BROKERAGE OWNER
+    let teamCode = null;
+    let brokerageId = null;
+    let isSoloAgent = null;
 
-    if (role === 'buyer') {
-        const specialId = generateSpecialId('buyer');
-        
-        await client.query(
-            `UPDATE users 
-             SET role=$1, special_id=$2, is_buyer=true, phone_verified=true, verification_status='verified' 
-             WHERE unique_id=$3`,
-            [role, specialId, unique_id]
+    if (role === "brokerage") {
+      // Generate longer UUID-based team code
+      teamCode = `BRKR-${Math.random().toString(36).substring(2, 12).toUpperCase()}`;
+    } else if (role === "agent") {
+      isSoloAgent = agent_type === "solo";
+
+      // If brokerage agent, try to find and link the brokerage
+      if (agent_type === "brokerage" && team_code) {
+        const brokerageCheck = await client.query(
+          `SELECT id FROM brokerages WHERE team_code = $1`,
+          [team_code.trim().toUpperCase()],
         );
-        
-        await client.query(
-            `INSERT INTO profiles (unique_id, email, full_name, role, special_id, verification_status)
+
+        if (brokerageCheck.rows.length > 0) {
+          brokerageId = brokerageCheck.rows[0].id;
+        } else {
+          // If team code not found, they can add it later
+          console.log(
+            `[SetRole] Team code ${team_code} not found. Agent can add later.`,
+          );
+        }
+      }
+    }
+
+    await client.query("BEGIN");
+
+    if (role === "buyer") {
+      const specialId = generateSpecialId("buyer");
+
+      await client.query(
+        `UPDATE users 
+             SET role=$1, special_id=$2, phone_verified=true, verification_status='verified' 
+             WHERE unique_id=$3`,
+        [role, specialId, unique_id],
+      );
+
+      await client.query(
+        `INSERT INTO profiles (unique_id, email, full_name, role, special_id, verification_status)
              VALUES ($1, $2, $3, $4, $5, 'verified')
              ON CONFLICT (unique_id) 
              DO UPDATE SET role = $4, verification_status = 'verified'`,
-            [unique_id, email, name, role, specialId]
-        );
+        [unique_id, email, name, role, specialId],
+      );
 
-    } else if (role === 'agent' || role === 'owner') {
-        await client.query(
-            `UPDATE users SET role=$1, verification_status='unverified' WHERE unique_id=$2`,
-            [role, unique_id]
-        );
+      // Create wallet for buyer
+      await client.query(
+        `INSERT INTO user_wallets (user_id, balance, currency, is_active)
+           VALUES ((SELECT id FROM users WHERE unique_id = $1), 0, 'KVC', true)
+           ON CONFLICT DO NOTHING`,
+        [unique_id],
+      );
+    } else if (role === "agent" || role === "owner" || role === "brokerage") {
+      const specialId = generateSpecialId(role === "agent" ? "agent" : role);
 
-        await client.query(
-            `INSERT INTO profiles (unique_id, email, full_name, role, verification_status)
-             VALUES ($1, $2, $3, $4, 'unverified')
+      // Update users table with new fields
+      await client.query(
+        `UPDATE users 
+             SET role=$1, 
+                 special_id=$2,
+                 team_code=$3, 
+                 brokerage_id=$4,
+                 is_solo_agent=$5,
+                 verification_status='unverified' 
+             WHERE unique_id=$6`,
+        [
+          role,
+          specialId,
+          teamCode || null,
+          brokerageId || null,
+          isSoloAgent,
+          unique_id,
+        ],
+      );
+
+      // Insert/update profiles table
+      await client.query(
+        `INSERT INTO profiles (unique_id, email, full_name, role, special_id, verification_status, team_code)
+             VALUES ($1, $2, $3, $4, $5, 'unverified', $6)
              ON CONFLICT (unique_id) 
-             DO UPDATE SET role = $4, verification_status = 'unverified'`,
-            [unique_id, email, name, role]
-        );
+             DO UPDATE SET role = $4, special_id = $5, verification_status = 'unverified', team_code = $6`,
+        [unique_id, email, name, role, specialId, teamCode || null],
+      );
+
+      // Create onboarding status record to track progress
+      await client.query(
+        `INSERT INTO onboarding_status (user_id, current_step, agent_type, team_id, status)
+           VALUES ((SELECT id FROM users WHERE unique_id = $1), 1, $2, $3, 'in_progress')
+           ON CONFLICT (user_id) DO UPDATE SET 
+             agent_type = EXCLUDED.agent_type,
+             team_id = EXCLUDED.team_id,
+             status = 'in_progress'`,
+        [unique_id, agent_type || null, brokerageId || null],
+      );
+
+      // Create wallet for agent/owner/brokerage
+      await client.query(
+        `INSERT INTO user_wallets (user_id, balance, currency, is_active)
+           VALUES ((SELECT id FROM users WHERE unique_id = $1), 0, 'KVC', true)
+           ON CONFLICT DO NOTHING`,
+        [unique_id],
+      );
     }
 
-    await client.query('COMMIT');
+    await client.query("COMMIT");
 
-    // ✅ THE FINAL LOGIN LOGIC: 
-    // Fetch the fully updated user so the frontend gets the correct role and status
-    const updatedUserRes = await client.query(`SELECT * FROM users WHERE unique_id = $1`, [unique_id]);
+    // ✅ GET UPDATED USER DATA
+    const updatedUserRes = await client.query(
+      `SELECT id, unique_id, email, name, role, avatar_url, is_super_admin, phone_verified, 
+              special_id, verification_status, team_code, brokerage_id, is_solo_agent
+       FROM users WHERE unique_id = $1`,
+      [unique_id],
+    );
     const updatedUser = updatedUserRes.rows[0];
 
-    // Issue the FINAL Login Tokens
     const accessToken = signAccessToken(updatedUser);
     const refreshToken = jwt.sign(
       { unique_id: updatedUser.unique_id },
       process.env.REFRESH_TOKEN_SECRET,
-      { expiresIn: "45d" }
+      { expiresIn: "45d" },
     );
 
-    // Save refresh token to DB
-    await client.query("DELETE FROM refresh_tokens WHERE user_id=$1", [updatedUser.unique_id]);
+    await client.query("DELETE FROM refresh_tokens WHERE user_id=$1", [
+      updatedUser.unique_id,
+    ]);
     await client.query(
       "INSERT INTO refresh_tokens (user_id, token) VALUES ($1,$2)",
-      [updatedUser.unique_id, refreshToken]
+      [updatedUser.unique_id, refreshToken],
     );
 
-    // Set secure cookie
     res.cookie("refreshToken", refreshToken, {
       httpOnly: true,
       sameSite: "Lax",
@@ -378,10 +502,12 @@ export const setRole = async (req, res) => {
       maxAge: 45 * 24 * 60 * 60 * 1000,
     });
 
-    // Return the full user object so AuthProvider can log them in
-    res.json({ 
-      success: true, 
-      message: role === 'buyer' ? "Setup complete." : "Role set. Welcome to your dashboard.",
+    res.json({
+      success: true,
+      message:
+        role === "buyer"
+          ? "Setup complete."
+          : "Role set. Welcome to your onboarding.",
       accessToken,
       user: {
         id: updatedUser.id,
@@ -393,14 +519,19 @@ export const setRole = async (req, res) => {
         is_super_admin: updatedUser.is_super_admin,
         phone_verified: updatedUser.phone_verified,
         special_id: updatedUser.special_id,
-        verification_status: updatedUser.verification_status 
-      }
+        verification_status: updatedUser.verification_status,
+        team_code: updatedUser.team_code,
+        brokerage_id: updatedUser.brokerage_id,
+        is_solo_agent: updatedUser.is_solo_agent,
+        agent_type: role === "agent" ? agent_type : null,
+      },
     });
-
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query("ROLLBACK");
     console.error("[SetRole] Database Error:", err);
-    res.status(500).json({ message: "Database update failed." });
+    res
+      .status(500)
+      .json({ message: "Database update failed.", details: err.message });
   } finally {
     client.release();
   }
@@ -433,11 +564,16 @@ export const login = async (req, res) => {
     const refreshToken = jwt.sign(
       { unique_id: user.unique_id },
       process.env.REFRESH_TOKEN_SECRET,
-      { expiresIn: "45d" }
+      { expiresIn: "45d" },
     );
 
-    await pool.query("DELETE FROM refresh_tokens WHERE user_id=$1", [user.unique_id]);
-    await pool.query("INSERT INTO refresh_tokens (user_id, token) VALUES ($1,$2)", [user.unique_id, refreshToken]);
+    await pool.query("DELETE FROM refresh_tokens WHERE user_id=$1", [
+      user.unique_id,
+    ]);
+    await pool.query(
+      "INSERT INTO refresh_tokens (user_id, token) VALUES ($1,$2)",
+      [user.unique_id, refreshToken],
+    );
 
     res.cookie("refreshToken", refreshToken, {
       httpOnly: true,
@@ -459,7 +595,7 @@ export const login = async (req, res) => {
         is_super_admin: user.is_super_admin,
         phone_verified: user.phone_verified,
         special_id: user.special_id,
-        verification_status: user.verification_status || 'new'
+        verification_status: user.verification_status || "new",
       },
     });
   } catch (err) {
@@ -489,7 +625,7 @@ export const refresh = async (req, res) => {
   try {
     const foundToken = await pool.query(
       "SELECT * FROM refresh_tokens WHERE token=$1",
-      [cookies.refreshToken]
+      [cookies.refreshToken],
     );
     if (!foundToken.rows.length)
       return res.status(403).json({ message: "Forbidden" });
@@ -505,7 +641,6 @@ export const refresh = async (req, res) => {
 
     const accessToken = signAccessToken(user);
     res.json({ accessToken });
-
   } catch (err) {
     return res.status(403).json({ message: "Forbidden" });
   }
@@ -534,13 +669,13 @@ export const forgotPassword = async (req, res) => {
     const resetToken = jwt.sign(
       { email: cleanEmail },
       process.env.RESET_PASSWORD_SECRET,
-      { expiresIn: "1h" }
+      { expiresIn: "1h" },
     );
 
     await sendPasswordResetEmail(
       cleanEmail,
       result.rows[0].name || "User",
-      resetToken
+      resetToken,
     );
 
     res.json({ success: true, message: "Password reset email sent." });
@@ -560,7 +695,7 @@ export const resetPassword = async (req, res) => {
     const hashed = await bcrypt.hash(newPassword, 10);
     const updated = await pool.query(
       "UPDATE users SET password=$1 WHERE email=$2",
-      [hashed, payload.email]
+      [hashed, payload.email],
     );
     if (!updated.rowCount)
       return res.status(400).json({ message: "User not found." });
@@ -575,18 +710,19 @@ export const resetPassword = async (req, res) => {
 // ===================================================
 export const sendPhoneOtp = async (req, res) => {
   const { phone } = req.body;
-  if (!phone) return res.status(400).json({ message: "Phone number is required." });
+  if (!phone)
+    return res.status(400).json({ message: "Phone number is required." });
 
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const codeHash = await bcrypt.hash(code, 10);
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); 
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
     await pool.query("UPDATE phone_otps SET used=true WHERE phone=$1", [phone]);
 
     await pool.query(
       `INSERT INTO phone_otps (phone, code_hash, expires_at) VALUES ($1, $2, $3)`,
-      [phone, codeHash, expiresAt]
+      [phone, codeHash, expiresAt],
     );
 
     await sendSmsOtp(phone, code);
@@ -594,19 +730,21 @@ export const sendPhoneOtp = async (req, res) => {
     res.json({ success: true, message: "Verification code sent." });
   } catch (err) {
     console.error("[SendPhoneOtp] Error:", err);
-    res.status(500).json({ message: "Could not send SMS. Please check number." });
+    res
+      .status(500)
+      .json({ message: "Could not send SMS. Please check number." });
   }
 };
 
-
 // ===================================================
-// 11. VERIFY PHONE OTP (SendChamp) 
+// 11. VERIFY PHONE OTP (SendChamp)
 // ===================================================
 export const verifyPhoneOtp = async (req, res) => {
   const { phone, code, country } = req.body;
-  const userId = req.user.unique_id; 
+  const userId = req.user.unique_id;
 
-  if (!phone || !code) return res.status(400).json({ message: "Phone and code required." });
+  if (!phone || !code)
+    return res.status(400).json({ message: "Phone and code required." });
 
   const client = await pool.connect();
 
@@ -614,27 +752,30 @@ export const verifyPhoneOtp = async (req, res) => {
     // 1. Check the OTP table
     const otpRes = await client.query(
       `SELECT * FROM phone_otps WHERE phone=$1 AND used=false ORDER BY created_at DESC LIMIT 1`,
-      [phone]
+      [phone],
     );
 
-    if (!otpRes.rows.length) return res.status(400).json({ message: "Invalid or expired code." });
+    if (!otpRes.rows.length)
+      return res.status(400).json({ message: "Invalid or expired code." });
     const otp = otpRes.rows[0];
 
-    if (new Date() > otp.expires_at) return res.status(400).json({ message: "Code expired." });
+    if (new Date() > otp.expires_at)
+      return res.status(400).json({ message: "Code expired." });
 
     const valid = await bcrypt.compare(code, otp.code_hash);
     if (!valid) return res.status(400).json({ message: "Invalid code." });
 
     // 2. Fetch User Email/Name to satisfy the Profile Table's NOT NULL constraints
     const userRes = await client.query(
-        "SELECT email, name FROM users WHERE unique_id = $1",
-        [userId]
+      "SELECT email, name FROM users WHERE unique_id = $1",
+      [userId],
     );
-    
-    if (userRes.rows.length === 0) return res.status(404).json({ message: "User not found." });
+
+    if (userRes.rows.length === 0)
+      return res.status(404).json({ message: "User not found." });
     const { email, name } = userRes.rows[0];
 
-    await client.query('BEGIN');
+    await client.query("BEGIN");
 
     // 3. Mark OTP as used
     await client.query("UPDATE phone_otps SET used=true WHERE id=$1", [otp.id]);
@@ -642,7 +783,7 @@ export const verifyPhoneOtp = async (req, res) => {
     // 4. Update the main User record
     await client.query(
       "UPDATE users SET phone_verified=true WHERE unique_id=$1",
-      [userId]
+      [userId],
     );
 
     // 5. UPSERT Profile (Including the mandatory email and name)
@@ -651,14 +792,13 @@ export const verifyPhoneOtp = async (req, res) => {
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (unique_id) 
        DO UPDATE SET phone=$4, country=$5, email=$2, full_name=$3`,
-      [userId, email, name, phone, country || 'Nigeria']
+      [userId, email, name, phone, country || "Nigeria"],
     );
 
-    await client.query('COMMIT');
+    await client.query("COMMIT");
     res.json({ success: true, message: "Phone verified successfully!" });
-
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query("ROLLBACK");
     console.error("[VerifyPhoneOtp] Error:", err);
     res.status(500).json({ message: "Verification failed." });
   } finally {
@@ -666,148 +806,208 @@ export const verifyPhoneOtp = async (req, res) => {
   }
 };
 
-
 // ===================================================
 // 12. FINISH ONBOARDING (Data + Avatar + Legal Doc)
 // ===================================================
 export const finishOnboarding = async (req, res) => {
-  // 1. Extract text fields from req.body
-
-  console.log("--- ONBOARDING DEBUG ---");
-  console.log("Body Data:", req.body);
-  console.log("Files Received:", req.files);
-
-  
   const {
-      country, phone, username, gender, 
-      license_number, experience, role, 
-      agency_name, brokerage_address
+    country,
+    phone,
+    username,
+    gender,
+    license_number,
+    experience,
+    role,
+    agency_name,
+    brokerage_address,
+    team_code, // ✅ NEW: Extract the team code from the frontend
   } = req.body;
-  
+
   const userId = req.user.unique_id;
   const userEmail = req.user.email;
   const userName = req.user.name;
 
-  // 2. Extract files from req.files (Multer)
   const avatarFile = req.files?.avatar ? req.files.avatar[0] : null;
   const documentFile = req.files?.document ? req.files.document[0] : null;
 
-  if (!documentFile) {
-      return res.status(400).json({ message: "Legal document is required." });
+  if (!documentFile)
+    return res.status(400).json({ message: "Legal document is required." });
+
+  // 🚀 AWS REKOGNITION: CHECK FOR HUMAN FACE
+  if (avatarFile) {
+    try {
+      const command = new DetectFacesCommand({
+        Image: { Bytes: avatarFile.buffer },
+        Attributes: ["DEFAULT"],
+      });
+
+      const faceData = await rekognition.send(command);
+
+      if (!faceData.FaceDetails || faceData.FaceDetails.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Verification Failed: No clear human face detected in the profile picture. Please upload a real photo.",
+        });
+      }
+    } catch (rekError) {
+      console.error("AWS Rekognition Error:", rekError);
+      return res
+        .status(500)
+        .json({ message: "Image analysis failed. Try again." });
+    }
   }
 
-  const client = await pool.connect(); 
+  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
+    await client.query("BEGIN");
 
-    // 3. Duplicate Checks (Phone, License, Username)
+    // ✅ 1. VERIFY TEAM CODE (Link Agent to Brokerage)
+    let linkedAgencyId = null;
+    let isSoloAgent = true; // Default to true
+    let finalAgencyName = agency_name; // Default to what they typed
+
+    if (role === "agent" && team_code) {
+      const agencyCheck = await client.query(
+        `SELECT unique_id, name FROM users WHERE team_code = $1 AND role = 'brokerage'`,
+        [team_code.trim().toUpperCase()],
+      );
+
+      if (agencyCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: "Invalid Team Code. Brokerage not found.",
+          });
+      }
+
+      // Link them!
+      linkedAgencyId = agencyCheck.rows[0].unique_id;
+      isSoloAgent = false;
+      finalAgencyName = agencyCheck.rows[0].name; // Override whatever they typed with the official company name
+    }
+
+    // 2. Duplicate Checks (Phone, License, Username)
     const duplicateCheck = await client.query(
-        `SELECT unique_id, email, username FROM profiles 
+      `SELECT unique_id, email, username FROM profiles 
          WHERE (phone = $1 AND unique_id != $4) 
          OR ($2::text != '' AND license_number = $2::text AND unique_id != $4)
          OR ($3::text != '' AND username = $3::text AND unique_id != $4)`,
-        [phone, license_number || '', username || '', userId]
+      [phone, license_number || "", username || "", userId],
     );
 
     if (duplicateCheck.rows.length > 0) {
-        await client.query('ROLLBACK');
-        const conflict = duplicateCheck.rows[0];
-        let errMsg = "Identity Conflict: Phone or License already in use.";
-        if (conflict.username === username) errMsg = "Username is already taken.";
-        return res.status(409).json({ success: false, message: errMsg });
+      await client.query("ROLLBACK");
+      const conflict = duplicateCheck.rows[0];
+      let errMsg = "Identity Conflict: Phone or License already in use.";
+      if (conflict.username === username) errMsg = "Username is already taken.";
+      return res.status(409).json({ success: false, message: errMsg });
     }
 
-    // 4. Generate/Retrieve Special ID
+    // 3. Generate/Retrieve Special ID
     let specialId;
-    const checkUser = await client.query("SELECT special_id FROM users WHERE unique_id = $1", [userId]);
+    const checkUser = await client.query(
+      "SELECT special_id FROM users WHERE unique_id = $1",
+      [userId],
+    );
     if (checkUser.rows[0] && checkUser.rows[0].special_id) {
-        specialId = checkUser.rows[0].special_id;
+      specialId = checkUser.rows[0].special_id;
     } else {
-        specialId = generateSpecialId(role); // Assuming you have this helper
+      specialId = generateSpecialId(role);
     }
 
-    // 5. Upload Files to AWS S3
+    // 4. Upload Files to AWS S3
     let avatarUrl = null;
     let documentUrl = null;
 
-    if (avatarFile) {
-        avatarUrl = await uploadToS3(avatarFile, "avatars"); // Your S3 helper
-    }
-    
-    const docFolder = role === "agent" ? "documents/agents" : "documents/owners";
-    documentUrl = await uploadToS3(documentFile, docFolder); // Your S3 helper
+    if (avatarFile) avatarUrl = await uploadToS3(avatarFile, "avatars");
 
-    // 6. Update USERS Table
-    const docColumn = role === "agent" ? "license_document_url" : "identity_document_url";
-    
+    const docFolder =
+      role === "agent"
+        ? "documents/agents"
+        : role === "brokerage"
+          ? "documents/brokerages"
+          : "documents/owners";
+    documentUrl = await uploadToS3(documentFile, docFolder);
+
+    // 5. Update USERS Table (Now includes linked_agency_id and is_solo_agent)
+    const docColumn =
+      role === "agent" || role === "brokerage"
+        ? "license_document_url"
+        : "identity_document_url";
+
     await client.query(
       `UPDATE users 
        SET 
-         phone_verified = true,
-         role = $2::text, 
-         special_id = $3::text,
-         license_number = $4::text,
-         brokerage_name = $5::text,
-         brokerage_address = $6::text,
-         verification_status = 'pending', 
-         is_agent = ($2::text = 'agent'),
-         is_owner = ($2::text = 'owner'),
-         avatar_url = COALESCE($7, avatar_url),
-         ${docColumn} = $8
+         phone_verified = true, role = $2::text, special_id = $3::text,
+         license_number = $4::text, brokerage_name = $5::text, brokerage_address = $6::text,
+         verification_status = 'pending', is_agent = ($2::text = 'agent'),
+         is_owner = ($2::text = 'owner'), avatar_url = COALESCE($7, avatar_url),
+         ${docColumn} = $8, linked_agency_id = $9, is_solo_agent = $10
        WHERE unique_id = $1`,
       [
-          userId, role, specialId, license_number || null, 
-          agency_name || null, brokerage_address || null, 
-          avatarUrl, documentUrl
-      ]
+        userId,
+        role,
+        specialId,
+        license_number || null,
+        finalAgencyName || null,
+        brokerage_address || null,
+        avatarUrl,
+        documentUrl,
+        linkedAgencyId,
+        isSoloAgent,
+      ],
     );
-    
-    // 7. UPSERT PROFILES Table
+
+    // 6. UPSERT PROFILES Table (Now includes linked_agency_id and is_solo_agent)
     await client.query(
       `INSERT INTO profiles (
           unique_id, email, full_name, username, gender, country, phone, 
           license_number, experience, agency_name, role, special_id, 
-          verification_status, avatar_url
-        )
-        VALUES (
-          $1, $2, $3, $4, $5, $6, $7, 
-          $8, $9, $10, $11, $12, 'pending', $13
-        ) 
+          verification_status, avatar_url, linked_agency_id, is_solo_agent
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14, $15) 
         ON CONFLICT (unique_id) 
         DO UPDATE SET 
-          username = EXCLUDED.username,
-          gender = EXCLUDED.gender,
-          country = EXCLUDED.country,
-          phone = EXCLUDED.phone,
-          license_number = EXCLUDED.license_number,
-          experience = EXCLUDED.experience,
-          agency_name = EXCLUDED.agency_name,
-          role = EXCLUDED.role,              
-          special_id = EXCLUDED.special_id,   
-          full_name = EXCLUDED.full_name,
-          avatar_url = COALESCE(EXCLUDED.avatar_url, profiles.avatar_url),
-          verification_status = 'pending';`, 
+          username = EXCLUDED.username, gender = EXCLUDED.gender, country = EXCLUDED.country,
+          phone = EXCLUDED.phone, license_number = EXCLUDED.license_number, experience = EXCLUDED.experience,
+          agency_name = EXCLUDED.agency_name, role = EXCLUDED.role, special_id = EXCLUDED.special_id,   
+          full_name = EXCLUDED.full_name, avatar_url = COALESCE(EXCLUDED.avatar_url, profiles.avatar_url),
+          linked_agency_id = EXCLUDED.linked_agency_id, is_solo_agent = EXCLUDED.is_solo_agent,
+          verification_status = 'pending';`,
       [
-        userId, userEmail, userName, username, gender, country, phone, 
-        license_number || null, experience || null, agency_name || null, 
-        role, specialId, avatarUrl
-      ]
+        userId,
+        userEmail,
+        userName,
+        username,
+        gender,
+        country,
+        phone,
+        license_number || null,
+        experience || null,
+        finalAgencyName || null,
+        role,
+        specialId,
+        avatarUrl,
+        linkedAgencyId,
+        isSoloAgent,
+      ],
     );
 
-    await client.query('COMMIT');
+    await client.query("COMMIT");
 
-    res.json({ 
-        success: true, 
-        message: "Profile and documents submitted for review.", 
-        special_id: specialId,
-        role: role,
-        verification_status: 'pending',
-        avatar_url: avatarUrl
+    res.json({
+      success: true,
+      message: "Profile and documents submitted for review.",
+      special_id: specialId,
+      role: role,
+      verification_status: "pending",
+      avatar_url: avatarUrl,
     });
-
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query("ROLLBACK");
     console.error("[FinishOnboarding] Error:", err);
     res.status(500).json({ message: "Server error during onboarding." });
   } finally {
@@ -815,51 +1015,51 @@ export const finishOnboarding = async (req, res) => {
   }
 };
 
-
-
-
-
-
 // ===================================================
 // 14. DELETE TEST USER (DEV ONLY)
 // ===================================================
 export const deleteTestUser = async (req, res) => {
   const { email } = req.body;
-  
+
   if (!email) return res.status(400).json({ message: "Email required." });
 
   const client = await pool.connect();
 
   try {
     const cleanEmail = email.toLowerCase().trim();
-    
+
     // Find the user
-    const userRes = await client.query("SELECT unique_id FROM users WHERE email=$1", [cleanEmail]);
-    
+    const userRes = await client.query(
+      "SELECT unique_id FROM users WHERE email=$1",
+      [cleanEmail],
+    );
+
     if (userRes.rows.length === 0) {
-        return res.status(404).json({ message: "User not found." });
+      return res.status(404).json({ message: "User not found." });
     }
 
     const userId = userRes.rows[0].unique_id;
 
-    await client.query('BEGIN');
+    await client.query("BEGIN");
 
     // Safely delete all relational data first
     await client.query("DELETE FROM refresh_tokens WHERE user_id=$1", [userId]);
     await client.query("DELETE FROM profiles WHERE unique_id=$1", [userId]);
     await client.query("DELETE FROM email_otps WHERE email=$1", [cleanEmail]);
-    
+
     // Finally, delete the user
     await client.query("DELETE FROM users WHERE unique_id=$1", [userId]);
 
-    await client.query('COMMIT');
-    res.json({ success: true, message: `User ${cleanEmail} completely wiped from AWS.` });
-
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      message: `User ${cleanEmail} completely wiped from AWS.`,
+    });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query("ROLLBACK");
     console.error("[DeleteUser] Error:", err);
     res.status(500).json({ message: "Failed to delete user." });
-  } finally { 
+  } finally {
     client.release();
   }
 };
