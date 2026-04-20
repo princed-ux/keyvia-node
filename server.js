@@ -5,7 +5,16 @@ import dotenv from "dotenv";
 import http from "http";
 import path from "path";
 import { Server } from "socket.io";
+import morgan from "morgan";
 import { pool } from "./db.js";
+import { globalErrorHandler } from "./middleware/globalErrorHandler.js";
+import { rateLimiters } from "./middleware/rateLimiter.js";
+import {
+  metricsMiddleware,
+  metricsEndpoint,
+} from "./services/metricsService.js";
+import apmService from "./services/apmService.js";
+import logger from "./utils/logger.js";
 
 // 1. Load Environment Variables
 dotenv.config();
@@ -29,6 +38,13 @@ import applicationRoutes from "./routes/applicationRoutes.js"; // ✅ Correct Im
 import brokerageRoutes from "./routes/brokerageRoutes.js"; // ✅ Brokerage Routes
 import badgeRoutes from "./routes/badgeRoutes.js"; // ✅ Badge Routes
 import onboardingRoutes from "./routes/onboardingRoutes.js"; // ✅ Onboarding Routes
+import rekognitionRoutes from "./routes/rekognitionRoutes.js"; // ✅ AWS Rekognition (Face Detection)
+import brokerageManagementRoutes from "./routes/brokerageManagement.js"; // ✅ Brokerage Team Code Management
+import followersRoutes from "./routes/followersRoutes.js"; // ✅ Followers System
+import s3UploadRoutes from "./routes/s3Upload.js"; // ✅ S3 Presigned URLs
+import ivsRoutes from "./routes/ivsRoutes.js"; // ✅ AWS IVS Live Tours
+import teamRoutes from "./routes/teamRoutes.js"; // ✅ Brokerage Team Management
+import monitoringRoutes from "./routes/monitoringRoutes.js"; // ✅ Admin Monitoring & Metrics
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -61,6 +77,13 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+
+// ✅ PRODUCTION MONITORING MIDDLEWARE
+app.use(
+  morgan("combined", { stream: { write: (msg) => logger.info(msg.trim()) } }),
+); // HTTP request logging
+app.use(metricsMiddleware); // Prometheus metrics tracking
+app.use(rateLimiters.dynamic); // Dynamic rate limiting based on user tier
 
 // // Debug Logger
 // app.use((req, res, next) => {
@@ -105,6 +128,30 @@ app.use("/api/badges", badgeRoutes);
 
 // ✅ Onboarding Routes (Track user onboarding progress)
 app.use("/api/onboarding", onboardingRoutes);
+
+// ✅ AWS Rekognition Routes (Face detection for KYC)
+app.use("/api/rekognition", rekognitionRoutes);
+
+// ✅ Brokerage Management Routes (Team codes, agent management)
+app.use("/api/brokerage", brokerageManagementRoutes);
+
+// ✅ Followers Routes (Follow/unfollow system)
+app.use("/api/followers", followersRoutes);
+
+// ✅ S3 Upload Routes (Presigned URLs for direct uploads)
+app.use("/api/s3", s3UploadRoutes);
+
+// ✅ AWS IVS Live Tours (Go live, viewer access, paywall)
+app.use("/api/ivs", ivsRoutes);
+
+// ✅ Brokerage Team Management (Team chat, remove agent)
+app.use("/api/team", teamRoutes);
+
+// ✅ ADMIN MONITORING ROUTES (Real-time system metrics & God Mode Dashboard)
+app.use("/api/monitoring", monitoringRoutes);
+
+// ✅ PROMETHEUS METRICS ENDPOINT (For external monitoring tools)
+app.get("/metrics", metricsEndpoint);
 
 // Root Route
 app.get("/", (req, res) => {
@@ -428,18 +475,53 @@ io.on("connection", (socket) => {
 // =======================================================================
 // 7. ERROR HANDLER & START
 // =======================================================================
-app.use((err, req, res, next) => {
-  console.error("❌ Error:", err.message);
-  res.status(500).json({ error: "Server error" });
-});
+// ✅ GLOBAL ERROR HANDLER - Catches ALL unhandled errors from async/sync routes
+app.use(globalErrorHandler);
+
+// ✅ INITIALIZE MONITORING SERVICE
+import monitoringService from "./services/monitoringService.js";
+
+// Initialize monitoring and set up periodic APM tracking
+const initializeMonitoring = async () => {
+  try {
+    await monitoringService.initializeMonitoring();
+
+    // ⚠️ DISABLED FOR DEVELOPMENT: Record APM metrics every 60 seconds
+    // Uncomment below to enable automatic APM tracking in production
+    /*
+    setInterval(async () => {
+      const metrics = apmService.getMetrics();
+      await monitoringService.recordMetrics({
+        request_count: metrics.requestCount,
+        error_count: metrics.errorCount,
+        error_rate: metrics.errorRate || 0,
+        avg_response_time: metrics.avgResponseTime || 0,
+        memory_used: process.memoryUsage().heapUsed / 1024 / 1024,
+        memory_total: process.memoryUsage().heapTotal / 1024 / 1024,
+        active_requests: metrics.activeRequests || 0,
+      });
+    }, 60000); // Every 60 seconds
+    */
+
+    logger.info(
+      "✅ Monitoring service initialized (automatic APM tracking disabled for development)",
+    );
+  } catch (error) {
+    logger.error("Error initializing monitoring:", error);
+  }
+};
 
 export { io };
 
 pool
   .connect()
-  .then((client) => {
+  .then(async (client) => {
     console.log("✅ Connected to PostgreSQL");
     client.release();
+
+    // Initialize monitoring service
+    await initializeMonitoring();
+
     server.listen(PORT, () => {
       console.log(`🚀 Server + Socket.IO running on http://localhost:${PORT}`);
     });

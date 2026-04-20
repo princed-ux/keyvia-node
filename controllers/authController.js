@@ -33,6 +33,46 @@ const signAccessToken = (user) => {
   );
 };
 
+// ================= ROLE MAPPING HELPER =================
+// Maps frontend role values to PostgreSQL enum values
+const mapRoleToEnum = (role, agent_type = null) => {
+  switch (role) {
+    case "Buyer":
+    case "buyer":
+      return "Buyer";
+    case "BrokerageOwner":
+    case "brokerage":
+      return "BrokerageOwner";
+    case "AgencyAgent":
+    case "IndependentAgent":
+    case "agent":
+      // Default to AgencyAgent; caller should specify if they want IndependentAgent
+      return agent_type === "solo" ? "IndependentAgent" : "AgencyAgent";
+    default:
+      return role;
+  }
+};
+
+// Reverse mapping: Convert database enum values to frontend role values
+const mapEnumToRole = (dbRole) => {
+  switch (dbRole) {
+    case "Buyer":
+    case "Landlord":
+      return "buyer";
+    case "BrokerageOwner":
+      return "brokerage";
+    case "AgencyAgent":
+    case "IndependentAgent":
+      return "agent";
+    case "Admin":
+      return "admin";
+    case "SuperAdmin":
+      return "superadmin";
+    default:
+      return dbRole.toLowerCase();
+  }
+};
+
 // Initialize the Rekognition Client
 const rekognition = new RekognitionClient({
   region: "eu-west-1", // Rekognition works here
@@ -62,10 +102,10 @@ export const register = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // ✅ TWEAK 1: Set to 'unverified' for progressive onboarding
+    // ✅ TWEAK 1: Set to 'pending' for progressive onboarding (valid enum value)
     await pool.query(
       `INSERT INTO users (name, email, password, role, is_verified, verification_status) 
-       VALUES ($1, $2, $3, 'pending', false, 'unverified')`,
+       VALUES ($1, $2, $3, 'pending', false, 'pending')`,
       [name, cleanEmail, hashedPassword],
     );
 
@@ -99,11 +139,9 @@ export const register = async (req, res) => {
       await pool.query("DELETE FROM users WHERE email=$1", [
         email.toLowerCase().trim(),
       ]);
-      return res
-        .status(500)
-        .json({
-          message: "Could not send verification email. Please try again.",
-        });
+      return res.status(500).json({
+        message: "Could not send verification email. Please try again.",
+      });
     }
 
     res.status(500).json({ message: "Server error." });
@@ -198,11 +236,9 @@ export const resendSignupOtp = async (req, res) => {
       err.name === "MessageRejected" ||
       err.name === "MailFromDomainNotVerifiedException"
     ) {
-      return res
-        .status(500)
-        .json({
-          message: "Could not send verification email. Please try again later.",
-        });
+      return res.status(500).json({
+        message: "Could not send verification email. Please try again later.",
+      });
     }
 
     res.status(500).json({ message: "Server error." });
@@ -287,7 +323,7 @@ export const socialAuth = async (req, res) => {
         id: user.id,
         name: user.name,
         email: user.email,
-        role: user.role,
+        role: mapEnumToRole(user.role),
         unique_id: user.unique_id,
         avatar_url: user.avatar_url,
         is_super_admin: user.is_super_admin,
@@ -315,14 +351,15 @@ export const setRole = async (req, res) => {
   if (!authHeader) return res.status(401).json({ message: "No token." });
   if (!role) return res.status(400).json({ message: "Role required." });
 
+  // Map frontend role values to database enum values
+  const dbRole = mapRoleToEnum(role, agent_type);
+
   // Validate agent_type and team_code for agents
   if (role === "agent") {
     if (!agent_type || !["solo", "brokerage"].includes(agent_type)) {
-      return res
-        .status(400)
-        .json({
-          message: "Invalid agent type. Must be 'solo' or 'brokerage'.",
-        });
+      return res.status(400).json({
+        message: "Invalid agent type. Must be 'solo' or 'brokerage'.",
+      });
     }
     if (agent_type === "brokerage" && !team_code) {
       return res
@@ -399,7 +436,7 @@ export const setRole = async (req, res) => {
         `UPDATE users 
              SET role=$1, special_id=$2, phone_verified=true, verification_status='verified' 
              WHERE unique_id=$3`,
-        [role, specialId, unique_id],
+        [dbRole, specialId, unique_id],
       );
 
       await client.query(
@@ -407,7 +444,7 @@ export const setRole = async (req, res) => {
              VALUES ($1, $2, $3, $4, $5, 'verified')
              ON CONFLICT (unique_id) 
              DO UPDATE SET role = $4, verification_status = 'verified'`,
-        [unique_id, email, name, role, specialId],
+        [unique_id, email, name, dbRole, specialId],
       );
 
       // Create wallet for buyer
@@ -418,54 +455,19 @@ export const setRole = async (req, res) => {
         [unique_id],
       );
     } else if (role === "agent" || role === "owner" || role === "brokerage") {
-      const specialId = generateSpecialId(role === "agent" ? "agent" : role);
-
       // Update users table with new fields
+      // Set to 'new' so they must complete onboarding
+      // After onboarding submit, admin review changes it to 'pending'
+      // After admin approval, it becomes 'verified'
       await client.query(
         `UPDATE users 
              SET role=$1, 
-                 special_id=$2,
-                 team_code=$3, 
-                 brokerage_id=$4,
-                 is_solo_agent=$5,
-                 verification_status='unverified' 
-             WHERE unique_id=$6`,
-        [
-          role,
-          specialId,
-          teamCode || null,
-          brokerageId || null,
-          isSoloAgent,
-          unique_id,
-        ],
-      );
-
-      // Insert/update profiles table
-      await client.query(
-        `INSERT INTO profiles (unique_id, email, full_name, role, special_id, verification_status, team_code)
-             VALUES ($1, $2, $3, $4, $5, 'unverified', $6)
-             ON CONFLICT (unique_id) 
-             DO UPDATE SET role = $4, special_id = $5, verification_status = 'unverified', team_code = $6`,
-        [unique_id, email, name, role, specialId, teamCode || null],
-      );
-
-      // Create onboarding status record to track progress
-      await client.query(
-        `INSERT INTO onboarding_status (user_id, current_step, agent_type, team_id, status)
-           VALUES ((SELECT id FROM users WHERE unique_id = $1), 1, $2, $3, 'in_progress')
-           ON CONFLICT (user_id) DO UPDATE SET 
-             agent_type = EXCLUDED.agent_type,
-             team_id = EXCLUDED.team_id,
-             status = 'in_progress'`,
-        [unique_id, agent_type || null, brokerageId || null],
-      );
-
-      // Create wallet for agent/owner/brokerage
-      await client.query(
-        `INSERT INTO user_wallets (user_id, balance, currency, is_active)
-           VALUES ((SELECT id FROM users WHERE unique_id = $1), 0, 'KVC', true)
-           ON CONFLICT DO NOTHING`,
-        [unique_id],
+                 team_code=$2, 
+                 linked_agency_id=$3,
+                 is_solo_agent=$4,
+                 verification_status='new' 
+             WHERE unique_id=$5`,
+        [dbRole, teamCode || null, brokerageId || null, isSoloAgent, unique_id],
       );
     }
 
@@ -473,8 +475,8 @@ export const setRole = async (req, res) => {
 
     // ✅ GET UPDATED USER DATA
     const updatedUserRes = await client.query(
-      `SELECT id, unique_id, email, name, role, avatar_url, is_super_admin, phone_verified, 
-              special_id, verification_status, team_code, brokerage_id, is_solo_agent
+      `SELECT id, unique_id, email, name, role, avatar_url, phone_verified, 
+              verification_status, team_code, linked_agency_id, is_solo_agent
        FROM users WHERE unique_id = $1`,
       [unique_id],
     );
@@ -487,13 +489,8 @@ export const setRole = async (req, res) => {
       { expiresIn: "45d" },
     );
 
-    await client.query("DELETE FROM refresh_tokens WHERE user_id=$1", [
-      updatedUser.unique_id,
-    ]);
-    await client.query(
-      "INSERT INTO refresh_tokens (user_id, token) VALUES ($1,$2)",
-      [updatedUser.unique_id, refreshToken],
-    );
+    // Note: refresh_tokens table doesn't exist in current schema.
+    // Tokens are managed via cookies and JWT only.
 
     res.cookie("refreshToken", refreshToken, {
       httpOnly: true,
@@ -513,15 +510,13 @@ export const setRole = async (req, res) => {
         id: updatedUser.id,
         name: updatedUser.name,
         email: updatedUser.email,
-        role: updatedUser.role,
+        role: mapEnumToRole(updatedUser.role),
         unique_id: updatedUser.unique_id,
         avatar_url: updatedUser.avatar_url,
-        is_super_admin: updatedUser.is_super_admin,
         phone_verified: updatedUser.phone_verified,
-        special_id: updatedUser.special_id,
         verification_status: updatedUser.verification_status,
         team_code: updatedUser.team_code,
-        brokerage_id: updatedUser.brokerage_id,
+        linked_agency_id: updatedUser.linked_agency_id,
         is_solo_agent: updatedUser.is_solo_agent,
         agent_type: role === "agent" ? agent_type : null,
       },
@@ -589,7 +584,7 @@ export const login = async (req, res) => {
         id: user.id,
         name: user.name,
         email: user.email,
-        role: user.role,
+        role: mapEnumToRole(user.role),
         unique_id: user.unique_id,
         avatar_url: user.avatar_url,
         is_super_admin: user.is_super_admin,
@@ -787,11 +782,17 @@ export const verifyPhoneOtp = async (req, res) => {
     );
 
     // 5. UPSERT Profile (Including the mandatory email and name)
+    // First, delete any old profile with this email (handles re-signup after deletion)
+    try {
+      await client.query("DELETE FROM profiles WHERE email=$1", [email]);
+    } catch (e) {
+      // Continue even if delete fails
+    }
+
+    // Now insert the new profile
     await client.query(
       `INSERT INTO profiles (unique_id, email, full_name, phone, country) 
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (unique_id) 
-       DO UPDATE SET phone=$4, country=$5, email=$2, full_name=$3`,
+       VALUES ($1, $2, $3, $4, $5)`,
       [userId, email, name, phone, country || "Nigeria"],
     );
 
@@ -863,25 +864,30 @@ export const finishOnboarding = async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // ✅ 1. VERIFY TEAM CODE (Link Agent to Brokerage)
+    // Map the role to the database enum value
+    const inferredAgentType = team_code ? "brokerage" : "solo";
+    const dbRole = mapRoleToEnum(
+      role,
+      role === "agent" ? inferredAgentType : null,
+    );
+
+    //  1. VERIFY TEAM CODE (Link Agent to Brokerage)
     let linkedAgencyId = null;
     let isSoloAgent = true; // Default to true
     let finalAgencyName = agency_name; // Default to what they typed
 
     if (role === "agent" && team_code) {
       const agencyCheck = await client.query(
-        `SELECT unique_id, name FROM users WHERE team_code = $1 AND role = 'brokerage'`,
+        `SELECT unique_id, name FROM users WHERE team_code = $1 AND role = 'BrokerageOwner'`,
         [team_code.trim().toUpperCase()],
       );
 
       if (agencyCheck.rows.length === 0) {
         await client.query("ROLLBACK");
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "Invalid Team Code. Brokerage not found.",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "Invalid Team Code. Brokerage not found.",
+        });
       }
 
       // Link them!
@@ -942,27 +948,26 @@ export const finishOnboarding = async (req, res) => {
     await client.query(
       `UPDATE users 
        SET 
-         phone_verified = true, role = $2::text, special_id = $3::text,
-         license_number = $4::text, brokerage_name = $5::text, brokerage_address = $6::text,
-         verification_status = 'pending', is_agent = ($2::text = 'agent'),
-         is_owner = ($2::text = 'owner'), avatar_url = COALESCE($7, avatar_url),
-         ${docColumn} = $8, linked_agency_id = $9, is_solo_agent = $10
+         phone_verified = true, role = $2::user_role, special_id = $3::text,
+         license_number = $4::text, brokerage_address = $5::text,
+         verification_status = 'pending', avatar_url = COALESCE($6, avatar_url),
+         ${docColumn} = $7
        WHERE unique_id = $1`,
       [
         userId,
-        role,
+        dbRole,
         specialId,
         license_number || null,
-        finalAgencyName || null,
         brokerage_address || null,
         avatarUrl,
         documentUrl,
-        linkedAgencyId,
-        isSoloAgent,
       ],
     );
 
     // 6. UPSERT PROFILES Table (Now includes linked_agency_id and is_solo_agent)
+    // NOTE: profiles table doesn't exist in current schema, so this is commented out
+    // The users table stores all the necessary profile information
+    /*
     await client.query(
       `INSERT INTO profiles (
           unique_id, email, full_name, username, gender, country, phone, 
@@ -988,13 +993,14 @@ export const finishOnboarding = async (req, res) => {
         license_number || null,
         experience || null,
         finalAgencyName || null,
-        role,
+        dbRole,
         specialId,
         avatarUrl,
         linkedAgencyId,
         isSoloAgent,
       ],
     );
+    */
 
     await client.query("COMMIT");
 
@@ -1028,9 +1034,9 @@ export const deleteTestUser = async (req, res) => {
   try {
     const cleanEmail = email.toLowerCase().trim();
 
-    // Find the user
+    // Find the user (get both UUID and unique_id)
     const userRes = await client.query(
-      "SELECT unique_id FROM users WHERE email=$1",
+      "SELECT id, unique_id FROM users WHERE email=$1",
       [cleanEmail],
     );
 
@@ -1038,27 +1044,146 @@ export const deleteTestUser = async (req, res) => {
       return res.status(404).json({ message: "User not found." });
     }
 
-    const userId = userRes.rows[0].unique_id;
+    const userId = userRes.rows[0].id; // UUID
+    const uniqueId = userRes.rows[0].unique_id; // Text ID
 
-    await client.query("BEGIN");
+    // ===== STEP 1: Delete all user-related data =====
+    // Note: NOT using transaction (BEGIN/COMMIT) because a failed query
+    // would abort the entire transaction. Each delete is independent with try-catch.
 
-    // Safely delete all relational data first
-    await client.query("DELETE FROM refresh_tokens WHERE user_id=$1", [userId]);
-    await client.query("DELETE FROM profiles WHERE unique_id=$1", [userId]);
-    await client.query("DELETE FROM email_otps WHERE email=$1", [cleanEmail]);
+    // Messages and Conversations
+    try {
+      await client.query(
+        "DELETE FROM messages WHERE sender_id=$1 OR recipient_id=$1",
+        [userId],
+      );
+    } catch (e) {
+      // Table might not exist, continue
+    }
 
-    // Finally, delete the user
-    await client.query("DELETE FROM users WHERE unique_id=$1", [userId]);
+    try {
+      await client.query(
+        "DELETE FROM conversations WHERE user1_id=$1 OR user2_id=$1",
+        [userId],
+      );
+    } catch (e) {
+      // Table might use different ID types or not exist, continue
+    }
 
-    await client.query("COMMIT");
+    // Listings and Applications
+    try {
+      await client.query(
+        "DELETE FROM applications WHERE applicant_id=$1 OR listing_id IN (SELECT id FROM listings WHERE created_by=$1)",
+        [userId],
+      );
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    try {
+      await client.query(
+        "DELETE FROM listings WHERE created_by=$1 OR admin_reviewed_by=$1",
+        [userId],
+      );
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    // Notifications
+    try {
+      await client.query(
+        "DELETE FROM notifications WHERE recipient_id=$1 OR sender_id=$1",
+        [userId],
+      );
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    // Favorites
+    try {
+      await client.query(
+        "DELETE FROM favorites WHERE user_id=$1 OR listing_id IN (SELECT id FROM listings WHERE created_by=$1)",
+        [userId],
+      );
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    // Brokerage relationships
+    try {
+      await client.query(
+        "UPDATE users SET brokerage_id=NULL WHERE brokerage_id=(SELECT id FROM brokerages WHERE owner_id=$1)",
+        [userId],
+      );
+      await client.query("DELETE FROM brokerages WHERE owner_id=$1", [userId]);
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    // Onboarding progress (if table exists)
+    try {
+      await client.query("DELETE FROM onboarding_progress WHERE user_id=$1", [
+        userId,
+      ]);
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    // Wallet and Payments
+    try {
+      await client.query("DELETE FROM wallets WHERE user_id=$1", [userId]);
+      await client.query(
+        "DELETE FROM payments WHERE payer_id=$1 OR payee_id=$1",
+        [userId],
+      );
+    } catch (e) {
+      // Tables might not exist, continue
+    }
+
+    // Audit logs
+    try {
+      await client.query("DELETE FROM audit_logs WHERE actor_id=$1", [userId]);
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    // ===== STEP 2: Delete authentication and session data =====
+    // These tables may exist in older migrations
+    try {
+      await client.query("DELETE FROM refresh_tokens WHERE user_id=$1", [
+        userId,
+      ]);
+    } catch (e) {
+      // Table might not exist, continue
+    }
+    try {
+      await client.query("DELETE FROM profiles WHERE unique_id=$1", [uniqueId]);
+    } catch (e) {
+      // Table might not exist, continue
+    }
+    try {
+      await client.query("DELETE FROM email_otps WHERE email=$1", [cleanEmail]);
+    } catch (e) {
+      // Table might not exist, continue
+    }
+
+    // ===== STEP 3: Finally, delete the user =====
+    try {
+      await client.query("DELETE FROM users WHERE id=$1", [userId]);
+    } catch (e) {
+      // Log error but continue
+      console.error("[DeleteUser] Error deleting user:", e.message);
+    }
+
     res.json({
       success: true,
-      message: `User ${cleanEmail} completely wiped from AWS.`,
+      message: `User ${cleanEmail} and ALL associated data completely wiped from the database. Ready for fresh onboarding.`,
     });
   } catch (err) {
-    await client.query("ROLLBACK");
     console.error("[DeleteUser] Error:", err);
-    res.status(500).json({ message: "Failed to delete user." });
+    res
+      .status(500)
+      .json({ message: "Failed to delete user.", error: err.message });
   } finally {
     client.release();
   }

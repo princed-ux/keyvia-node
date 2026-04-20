@@ -10,7 +10,7 @@ const APPLICATION_STATUSES = [
   "VIEWING_SCHEDULED",
   "IN_DISCUSSION",
   "ACCEPTED",
-  "DECLINED"
+  "DECLINED",
 ];
 
 /* -------------------------------------------------------
@@ -45,17 +45,18 @@ export const getReceivedApplications = async (req, res) => {
 
     const result = await pool.query(query, [listerId]);
 
-    const rows = result.rows.map(row => {
+    const rows = result.rows.map((row) => {
       let photos = [];
       try {
-        photos = typeof row.listing_photos === "string"
-          ? JSON.parse(row.listing_photos)
-          : row.listing_photos || [];
+        photos =
+          typeof row.listing_photos === "string"
+            ? JSON.parse(row.listing_photos)
+            : row.listing_photos || [];
       } catch {}
 
       return {
         ...row,
-        listing_image: photos.length ? (photos[0].url || photos[0]) : null
+        listing_image: photos.length ? photos[0].url || photos[0] : null,
       };
     });
 
@@ -88,7 +89,7 @@ export const updateApplicationStatus = async (req, res) => {
       JOIN listings l ON a.listing_id = l.product_id
       WHERE a.id = $1 AND l.agent_unique_id = $2
       `,
-      [id, userId]
+      [id, userId],
     );
 
     if (authCheck.rows.length === 0) {
@@ -102,7 +103,7 @@ export const updateApplicationStatus = async (req, res) => {
       WHERE id = $2
       RETURNING *
       `,
-      [status, id]
+      [status, id],
     );
 
     const updatedApp = result.rows[0];
@@ -110,12 +111,12 @@ export const updateApplicationStatus = async (req, res) => {
     // 🔔 Notify Buyer
     const buyerRes = await pool.query(
       `SELECT email, full_name FROM profiles WHERE unique_id = $1`,
-      [updatedApp.buyer_id]
+      [updatedApp.buyer_id],
     );
 
     const listingRes = await pool.query(
       `SELECT title FROM listings WHERE product_id = $1`,
-      [updatedApp.listing_id]
+      [updatedApp.listing_id],
     );
 
     if (buyerRes.rows.length) {
@@ -131,7 +132,7 @@ export const updateApplicationStatus = async (req, res) => {
         INSERT INTO notifications (receiver_id, type, title, message, link)
         VALUES ($1, 'application_status', $2, $3, $4)
         `,
-        [updatedApp.buyer_id, title, message, link]
+        [updatedApp.buyer_id, title, message, link],
       );
 
       req.io?.to(updatedApp.buyer_id).emit("notification", {
@@ -139,7 +140,7 @@ export const updateApplicationStatus = async (req, res) => {
         title,
         message,
         link,
-        created_at: new Date()
+        created_at: new Date(),
       });
 
       await sendEmailNotification(buyer.email, title, message);
@@ -164,12 +165,12 @@ export const createApplication = async (req, res) => {
       credit_score,
       move_in_date,
       occupants_count,
-      message
+      message,
     } = req.body;
 
     const exists = await pool.query(
       `SELECT 1 FROM applications WHERE listing_id = $1 AND buyer_id = $2`,
-      [listing_id, buyerId]
+      [listing_id, buyerId],
     );
 
     if (exists.rows.length) {
@@ -183,7 +184,15 @@ export const createApplication = async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7, 'APPLIED')
       RETURNING *
       `,
-      [listing_id, buyerId, annual_income, credit_score, move_in_date, occupants_count, message]
+      [
+        listing_id,
+        buyerId,
+        annual_income,
+        credit_score,
+        move_in_date,
+        occupants_count,
+        message,
+      ],
     );
 
     const newApp = result.rows[0];
@@ -196,7 +205,7 @@ export const createApplication = async (req, res) => {
       JOIN profiles p ON l.agent_unique_id = p.unique_id
       WHERE l.product_id = $1
       `,
-      [listing_id]
+      [listing_id],
     );
 
     if (listingRes.rows.length) {
@@ -205,7 +214,7 @@ export const createApplication = async (req, res) => {
       const notifMsg = `A new application was submitted for "${agent.title}".`;
 
       const link =
-        agent.role === "owner"
+        agent.role === "BrokerageOwner" || agent.role === "Landlord"
           ? "/owner/applications"
           : "/dashboard/applications";
 
@@ -214,7 +223,7 @@ export const createApplication = async (req, res) => {
         INSERT INTO notifications (receiver_id, type, title, message, link)
         VALUES ($1, 'new_application', $2, $3, $4)
         `,
-        [agent.agent_unique_id, title, notifMsg, link]
+        [agent.agent_unique_id, title, notifMsg, link],
       );
 
       req.io?.to(agent.agent_unique_id).emit("notification", {
@@ -222,7 +231,7 @@ export const createApplication = async (req, res) => {
         title,
         message: notifMsg,
         link,
-        created_at: new Date()
+        created_at: new Date(),
       });
 
       await sendEmailNotification(agent.email, title, notifMsg);
