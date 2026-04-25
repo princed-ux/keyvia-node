@@ -1,38 +1,50 @@
 import { pool } from "../db.js";
-import { analyzeProfile } from "../services/aiProfileService.js";
+import {
+  analyzeVerification,
+  analyzeVerificationBulk,
+} from "../services/aiVerificationService.js";
+import { emitUserNotification } from "../services/socketEmitter.js";
 
 // =========================================================
-// 1. GET PENDING VERIFICATIONS (The Queue)
+// 1. GET PENDING IDENTITY VERIFICATIONS
 // =========================================================
 export const getPendingProfiles = async (req, res) => {
   try {
-    // We MUST JOIN with the users table to grab the document URLs!
     const result = await pool.query(`
-      SELECT 
-        p.unique_id, 
-        p.full_name, 
-        p.username, 
-        p.email, 
-        p.avatar_url, 
-        p.country, 
-        p.city, 
-        p.phone, 
-        p.role, 
-        p.license_number, 
-        p.agency_name, 
-        p.experience,
-        p.special_id,
-        p.bio, 
-        p.created_at, 
-        p.verification_status,
+      SELECT
+        u.unique_id,
+        COALESCE(p.full_name, u.name) AS full_name,
+        p.username,
+        u.email,
+        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
+        p.country,
+        p.city,
+        COALESCE(p.phone, u.phone) AS phone,
+        LOWER(u.role::TEXT) AS role,
+        u.license_number,
+        bp.company_name,
+        bp.brokerage_address,
+        bp.registration_number,
+        ap.experience_years AS experience,
+        u.special_id,
+        p.bio,
+        u.created_at,
+        u.updated_at,
+        u.verification_status,
+        u.is_verified,
+        u.rejection_reason,
         COALESCE(u.license_document_url, u.identity_document_url) AS document_url
-      FROM profiles p
-      JOIN users u ON p.unique_id = u.unique_id
-      WHERE p.verification_status = 'pending' 
-      ORDER BY p.created_at DESC
+      FROM users u
+      LEFT JOIN profiles p
+        ON p.unique_id::uuid = u.unique_id
+      LEFT JOIN brokerage_profiles bp
+        ON bp.unique_id = u.unique_id
+      LEFT JOIN agent_profiles ap
+        ON ap.unique_id = u.unique_id
+      WHERE u.verification_status = 'pending'
+      ORDER BY u.created_at DESC
     `);
 
-    // Explicit return to close the request and stop the frontend spinner
     return res.status(200).json(result.rows);
   } catch (err) {
     console.error("[GetPending] Error:", err);
@@ -41,204 +53,291 @@ export const getPendingProfiles = async (req, res) => {
 };
 
 // =========================================================
-// 2. ANALYZE SINGLE PROFILE (AI Scan)
+// 2. ANALYZE SINGLE VERIFICATION (ANALYSIS ONLY)
 // =========================================================
 export const analyzeAgentProfile = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Fetch profile data
     const result = await pool.query(
-      `SELECT * FROM profiles WHERE unique_id = $1`,
-      [id],
+      `
+      SELECT
+        u.unique_id,
+        COALESCE(p.full_name, u.name) AS full_name,
+        p.username,
+        u.email,
+        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
+        p.country,
+        p.city,
+        COALESCE(p.phone, u.phone) AS phone,
+        LOWER(u.role::TEXT) AS role,
+        u.license_number,
+        bp.company_name,
+        bp.brokerage_address,
+        bp.registration_number,
+        ap.experience_years AS experience,
+        u.special_id,
+        p.bio,
+        u.created_at,
+        u.updated_at,
+        u.verification_status,
+        u.is_verified,
+        u.rejection_reason,
+        COALESCE(u.license_document_url, u.identity_document_url) AS document_url
+      FROM users u
+      LEFT JOIN profiles p
+        ON p.unique_id::uuid = u.unique_id
+      LEFT JOIN brokerage_profiles bp
+        ON bp.unique_id = u.unique_id
+      LEFT JOIN agent_profiles ap
+        ON ap.unique_id = u.unique_id
+      WHERE u.unique_id = $1
+      LIMIT 1
+      `,
+      [id]
     );
-    if (result.rows.length === 0)
+
+    if (!result.rows.length) {
       return res.status(404).json({ message: "Profile not found" });
+    }
 
-    const profile = result.rows[0];
+    const verification = result.rows[0];
+    const report = await analyzeVerification(verification);
 
-    // 🧠 Run AI Service
-    const report = await analyzeProfile(profile);
-
-    res.json(report);
+    // IMPORTANT: no status write here
+    return res.json(report);
   } catch (err) {
     console.error("[AI Analyze] Error:", err);
-    res.status(500).json({ message: "Analysis Failed" });
+    return res.status(500).json({ message: "Analysis Failed" });
   }
 };
 
 // =========================================================
-// 3. 🚀 BULK AI SCAN (Auto-Pilot)
+// 3. BULK AI SCAN (ONLY THIS MAY AUTO-PROCESS)
 // =========================================================
 export const analyzeAllPendingProfiles = async (req, res) => {
   try {
-    // ✅ FIX: Only scan 'pending'. Do not scan empty/new profiles to save AI costs.
-    const pendingRes = await pool.query(
-      "SELECT * FROM profiles WHERE verification_status = 'pending'",
-    );
+    const pendingRes = await pool.query(`
+      SELECT
+        u.unique_id,
+        COALESCE(p.full_name, u.name) AS full_name,
+        p.username,
+        u.email,
+        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
+        p.country,
+        p.city,
+        COALESCE(p.phone, u.phone) AS phone,
+        LOWER(u.role::TEXT) AS role,
+        u.license_number,
+        bp.company_name,
+        bp.brokerage_address,
+        bp.registration_number,
+        ap.experience_years AS experience,
+        u.special_id,
+        p.bio,
+        u.created_at,
+        u.updated_at,
+        u.verification_status,
+        u.is_verified,
+        u.rejection_reason,
+        COALESCE(u.license_document_url, u.identity_document_url) AS document_url
+      FROM users u
+      LEFT JOIN profiles p
+        ON p.unique_id::uuid = u.unique_id
+      LEFT JOIN brokerage_profiles bp
+        ON bp.unique_id = u.unique_id
+      LEFT JOIN agent_profiles ap
+        ON ap.unique_id = u.unique_id
+      WHERE u.verification_status = 'pending'
+    `);
+
     const profiles = pendingRes.rows;
+    const reports = await analyzeVerificationBulk(profiles);
 
-    let approved = 0;
+    let verified = 0;
     let rejected = 0;
-    let manual = 0;
+    let remaining = 0;
 
-    // 2. Loop and Analyze
-    for (const profile of profiles) {
-      const aiReport = await analyzeProfile(profile);
+    for (const report of reports) {
+      const { unique_id, score, verdict, flags } = report;
 
       let newStatus = "pending";
       let reason = null;
 
-      // 🧠 AI Rules
-      if (aiReport.score < 50 || aiReport.verdict === "Auto-Reject") {
+      if (score < 50 || verdict === "Auto-Reject") {
         newStatus = "rejected";
-        reason = `AI Auto-Reject: ${aiReport.flags.join(", ") || "Low Quality Data"}`;
+        reason = `AI Auto-Reject: ${flags.join(", ") || "Low Confidence"}`;
         rejected++;
-      } else if (aiReport.score >= 90) {
-        // Only auto-approve High Confidence
-        newStatus = "approved";
-        approved++;
+      } else if (score >= 90) {
+        newStatus = "verified";
+        verified++;
       } else {
-        manual++;
+        remaining++;
       }
 
-      // 3. If Status Changed, Update DB
-      if (newStatus !== "pending") {
-        // Update Profile Table
-        await pool.query(
-          `UPDATE profiles SET 
-                 verification_status=$1, 
-                 rejection_reason=$2, 
-                 ai_score=$3, 
-                 ai_flags=$4,
-                 updated_at=NOW()
-                 WHERE unique_id=$5`,
-          [
-            newStatus,
-            reason,
-            aiReport.score,
-            aiReport.flags.join(", "),
-            profile.unique_id,
-          ],
-        );
-
-        // If Approved, we MUST update the User Table permissions
-        if (newStatus === "approved") {
-          // Determine Tier
-          const tier = profile.license_number ? "licensed" : "identity";
-
-          await pool.query(
-            `UPDATE users 
-                     SET is_verified_agent = ($1 = 'agent'), 
-                         is_owner = ($1 = 'owner' OR $1 = 'landlord'),
-                         verification_tier = $2,
-                         is_verified = TRUE 
-                     WHERE unique_id = $3`,
-            [profile.role, tier, profile.unique_id],
-          );
-        }
-
-        // Notification
-        const msg =
-          newStatus === "approved"
-            ? "Your profile has been verified! You can now post listings."
-            : `Profile verification failed. Reason: ${reason}`;
-
-        await pool.query(
-          `INSERT INTO notifications (receiver_id, type, title, message)
-                 VALUES ($1, 'system', 'Verification Update', $2)`,
-          [profile.unique_id, msg],
-        );
+      if (newStatus === "pending") {
+        continue;
       }
+
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          verification_status = $1,
+          is_verified = $2,
+          is_verified_agent = CASE
+            WHEN LOWER(role::TEXT) LIKE '%agent%' AND $2 = TRUE THEN TRUE
+            ELSE FALSE
+          END,
+          rejection_reason = $3,
+          updated_at = NOW()
+        WHERE unique_id = $4
+        `,
+        [
+          newStatus,
+          newStatus === "verified",
+          newStatus === "rejected" ? reason : null,
+          unique_id,
+        ]
+      );
+
+      const msg =
+        newStatus === "verified"
+          ? "Your identity has been verified. You can now access restricted features."
+          : `Verification failed. Reason: ${reason}`;
+
+      const notifResult = await pool.query(
+        `
+        INSERT INTO notifications (
+          recipient_id,
+          type,
+          title,
+          message,
+          created_at
+        )
+        VALUES ($1, 'system', 'Verification Update', $2, NOW())
+        RETURNING id, recipient_id, title, message, type, created_at
+        `,
+        [unique_id, msg]
+      );
+
+      emitUserNotification(req.io, unique_id, {
+        title: notifResult.rows[0].title,
+        message: notifResult.rows[0].message,
+        type: "verification_update",
+        link: null,
+        created_at: notifResult.rows[0].created_at,
+        verification_status: newStatus,
+        is_verified: newStatus === "verified",
+      });
     }
 
-    res.json({ success: true, approved, rejected, remaining: manual });
+    return res.json({
+      success: true,
+      verified,
+      rejected,
+      remaining,
+    });
   } catch (err) {
     console.error("Bulk Analysis Error:", err);
-    res.status(500).json({ message: "Bulk scan failed" });
+    return res.status(500).json({ message: "Bulk scan failed" });
   }
 };
 
 // =========================================================
-// 4. MANUAL APPROVE/REJECT (The Gatekeeper)
+// 4. MANUAL VERIFY / REJECT
 // =========================================================
 export const updateProfileStatus = async (req, res) => {
-  const client = await pool.connect(); // Transaction Client
-  try {
-    const { id } = req.params; // Profile ID
-    const { status, reason } = req.body; // 'approved' | 'rejected'
+  const client = await pool.connect();
 
-    if (!["approved", "rejected"].includes(status)) {
+  try {
+    const { id } = req.params;
+    const { status, reason } = req.body;
+
+    if (!["verified", "rejected"].includes(status)) {
       return res.status(400).json({ message: "Invalid status" });
     }
 
-    await client.query("BEGIN"); // Start Transaction
+    await client.query("BEGIN");
 
-    // 1. Update PROFILE status
-    const updateProfile = await client.query(
-      `UPDATE profiles 
-       SET verification_status = $1, rejection_reason = $2, updated_at = NOW() 
-       WHERE unique_id = $3 
-       RETURNING role, license_number, country`,
-      [status, reason || null, id],
+    const profileCheck = await client.query(
+      `
+      SELECT LOWER(role::TEXT) AS role
+      FROM users
+      WHERE unique_id = $1
+      LIMIT 1
+      `,
+      [id]
     );
 
-    if (updateProfile.rows.length === 0) {
+    if (!profileCheck.rows.length) {
       throw new Error("Profile not found");
     }
 
-    const { role, license_number } = updateProfile.rows[0];
-
-    // 2. If Approved, Grant Permissions in USER Table
-    if (status === "approved") {
-      let tier = "none";
-
-      // Strict Tier Logic
-      if (role === "AgencyAgent" || role === "IndependentAgent") {
-        tier = license_number ? "licensed" : "identity";
-      } else if (role === "BrokerageOwner" || role === "Landlord") {
-        tier = "identity"; // Owners get Identity tier
-      }
-
-      await client.query(
-        `UPDATE users 
-             SET is_verified_agent = ($1 = 'AgencyAgent' OR $1 = 'IndependentAgent'), 
-                 is_owner = ($1 = 'BrokerageOwner' OR $1 = 'Landlord'),
-                 verification_tier = $2,
-                 is_verified = TRUE 
-             WHERE unique_id = $3`,
-        [role, tier, id],
-      );
-    } else if (status === "rejected") {
-      // Revoke Permissions
-      await client.query(
-        `UPDATE users 
-             SET is_verified_agent = FALSE, 
-                 verification_tier = 'none',
-                 is_verified = FALSE 
-             WHERE unique_id = $1`,
-        [id],
-      );
-    }
-
-    // 3. Send Notification
-    const msg =
-      status === "approved"
-        ? `Congratulations! Your ${role} account is verified. You can now post listings.`
-        : `Verification Rejected: ${reason}`;
+    const { role } = profileCheck.rows[0];
+    const isVerified = status === "verified";
+    const rejectionReason =
+      status === "rejected"
+        ? reason || "Verification requirements were not met."
+        : null;
 
     await client.query(
-      `INSERT INTO notifications (receiver_id, type, title, message)
-       VALUES ($1, 'system', 'Verification Update', $2)`,
-      [id, msg],
+      `
+      UPDATE users
+      SET
+        verification_status = $1,
+        is_verified = $2,
+        is_verified_agent = CASE
+          WHEN LOWER(role::TEXT) LIKE '%agent%' AND $2 = TRUE THEN TRUE
+          ELSE FALSE
+        END,
+        rejection_reason = $3,
+        updated_at = NOW()
+      WHERE unique_id = $4
+      `,
+      [status, isVerified, rejectionReason, id]
     );
 
-    await client.query("COMMIT"); // Commit Transaction
-    res.json({ success: true, message: `Profile ${status}` });
+    const msg =
+      status === "verified"
+        ? `Congratulations! Your ${role} identity has been verified.`
+        : `Verification Rejected: ${rejectionReason}`;
+
+    const notifResult = await client.query(
+      `
+      INSERT INTO notifications (
+        recipient_id,
+        type,
+        title,
+        message,
+        created_at
+      )
+      VALUES ($1, 'system', 'Verification Update', $2, NOW())
+      RETURNING id, recipient_id, title, message, type, created_at
+      `,
+      [id, msg]
+    );
+
+    await client.query("COMMIT");
+
+    emitUserNotification(req.io, id, {
+      title: notifResult.rows[0].title,
+      message: notifResult.rows[0].message,
+      type: "verification_update",
+      link: null,
+      created_at: notifResult.rows[0].created_at,
+      verification_status: status,
+      is_verified: isVerified,
+    });
+
+    return res.json({
+      success: true,
+      message: `Profile ${status}`,
+    });
   } catch (err) {
-    await client.query("ROLLBACK"); // Revert on Error
+    await client.query("ROLLBACK");
     console.error("Verification Update Error:", err);
-    res.status(500).json({ message: "Update Failed" });
+    return res.status(500).json({ message: "Update Failed" });
   } finally {
     client.release();
   }

@@ -4,6 +4,8 @@ import crypto from "crypto";
 import axios from "axios";
 import { performFullAnalysis } from "../services/analysisService.js";
 import { COUNTRY_ISO_MAP } from "../utils/countryMap.js";
+import { evaluateListingRisk } from "../services/listingRiskService.js";
+import { enforceListingLimit } from "../services/subscriptionService.js";
 
 /* ----------------- helpers ----------------- */
 function generateProductId() {
@@ -208,11 +210,18 @@ const runBackgroundProcessing = async (
     // 5. Update DB -> Set Status to 'Pending' (Ready for Admin)
     await pool.query(
       `UPDATE listings 
-       SET photos = $1, latitude = $2, longitude = $3, 
-           video_url = $4, video_public_id = $5,
-           virtual_tour_url = $6, virtual_tour_public_id = $7,
-           status = 'pending' 
-       WHERE product_id = $8`,
+SET photos = $1,
+    latitude = $2,
+    longitude = $3, 
+    video_url = $4,
+    video_public_id = $5,
+    virtual_tour_url = $6,
+    virtual_tour_public_id = $7,
+    status = CASE 
+      WHEN status = 'approved' THEN 'approved'
+      ELSE 'pending'
+    END
+WHERE product_id = $8`,
       [
         JSON.stringify(uploadedPhotos),
         coords.lat || 0,
@@ -246,6 +255,14 @@ const runBackgroundProcessing = async (
   }
 };
 
+
+// if (!req.user?.is_verified && req.user?.verification_status !== "approved") {
+//   return res.status(403).json({
+//     error: "You must verify your account before creating listings",
+//   });
+// }
+
+
 /* -------------------------------------------------------
    🚀 CREATE LISTING (Async High Performance)
 ------------------------------------------------------- */
@@ -257,6 +274,28 @@ export const createListing = async (req, res) => {
 
     const userId = req.user?.unique_id;
     if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+    // ✅ HARD VERIFICATION GATE
+if (!req.user?.is_verified && req.user?.verification_status !== "approved") {
+  return res.status(403).json({
+    message: "You must verify your account before creating listings.",
+    code: "VERIFICATION_REQUIRED",
+  });
+}
+
+// ✅ SUBSCRIPTION / LISTING LIMIT GATE
+const limitCheck = await enforceListingLimit({ userId });
+
+if (!limitCheck.allowed) {
+  return res.status(403).json({
+    message: limitCheck.message,
+    code: "LISTING_LIMIT_REACHED",
+    current_count: limitCheck.current_count,
+    max_listings: limitCheck.max_listings,
+    plan: limitCheck.plan,
+  });
+}
+
 
     // Fetch agent email
     const emailRes = await pool.query(
@@ -335,7 +374,36 @@ export const createListing = async (req, res) => {
       featuresArr = [];
     }
 
-    // 🔹 Insert "Shell" Listing (Status: 'processing')
+    // 🔹 Insert "Shell" Listing (Status: '$32')
+
+
+    // 🔥 RISK EVALUATION
+const riskResult = evaluateListingRisk({
+  listing: {
+    title,
+    description,
+    price,
+    address,
+    city,
+    country,
+    latitude: lat,
+    longitude: lng,
+    photos: req.files?.photos || [],
+  },
+  user: req.user,
+});
+
+// Decide initial moderation state
+let status = "pending";
+let autoPublished = false;
+
+if (riskResult.should_publish_immediately) {
+  status = "approved";
+  autoPublished = true;
+}
+
+
+
     const query = `
       INSERT INTO listings (
         product_id, agent_unique_id, created_by, email,
@@ -347,7 +415,8 @@ export const createListing = async (req, res) => {
         year_built, square_footage, furnishing, lot_size,
         features, photos, video_url, virtual_tour_url,
         contact_name, contact_email, contact_phone, contact_method,
-        status, is_active, payment_status, created_at, updated_at
+        status, is_active, payment_status,
+risk_score, risk_level, risk_flags, auto_published, created_at, updated_at
       )
       VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
@@ -356,7 +425,9 @@ export const createListing = async (req, res) => {
         $20, $21, $22, $23, $24, $25, $26, $27, 
         '[]', null, null,
         $28, $29, $30, $31,
-        'processing', false, 'unpaid', NOW(), NOW()
+$32, $33, $34,
+$35, $36, $37, $38,
+NOW(), NOW()
       )
       RETURNING *;
     `;
@@ -393,6 +464,13 @@ export const createListing = async (req, res) => {
       contact_email || null,
       contact_phone || null,
       contact_method || null,
+      status,
+      false,
+      "unpaid",
+      riskResult.score,
+      riskResult.risk_level,
+      JSON.stringify(riskResult.flags),
+      autoPublished,
     ];
 
     const result = await pool.query(query, params);

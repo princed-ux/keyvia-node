@@ -1,168 +1,249 @@
 import express from "express";
 import { pool } from "../db.js";
+import { authenticateAndAttachUser } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-// ============================================================
-// BROKERAGE DASHBOARD - Stats & Overview
-// ============================================================
+router.use(authenticateAndAttachUser);
 
-/**
- * GET /api/brokerage/stats
- * Get dashboard statistics (active projects, agents, properties, revenue)
- */
+const getUserId = (req) => req.user?.unique_id || null;
+
+const requireUser = (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return null;
+  }
+  return userId;
+};
+
+// ============================================================
+// BROKERAGE DASHBOARD - Stats
+// ============================================================
 router.get("/stats", async (req, res) => {
   try {
-    const userId = req.headers["x-user-id"]; // From auth middleware
-    
-    // Get stats from database
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
     const statsQuery = `
       SELECT
-        (SELECT COUNT(*) FROM listings WHERE created_by = $1 AND status = 'active') as active_projects,
-        (SELECT COUNT(*) FROM users WHERE role = 'agent' AND brokerage_id = $1) as total_agents,
-        (SELECT COUNT(*) FROM listings WHERE created_by = $1) as total_properties,
-        (SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) FROM payments WHERE receiver_id = $1 AND status = 'completed' AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM NOW())) as revenue_ytd
-    `;
-    
-    const { rows } = await pool.query(statsQuery, [userId]);
-    const stats = rows[0];
+        (
+          SELECT COUNT(*)
+          FROM listings
+          WHERE uploaded_by_id = $1
+            AND status = 'active'
+        ) AS active_projects,
 
-    res.json({
-      projects: stats.active_projects || 0,
-      agents: stats.total_agents || 0,
-      properties: stats.total_properties || 0,
-      revenue: stats.revenue_ytd || 0,
+        (
+          SELECT COUNT(*)
+          FROM users
+          WHERE linked_agency_id = $1
+            AND LOWER(role::TEXT) = 'agent'
+        ) AS total_agents,
+
+        (
+          SELECT COUNT(*)
+          FROM listings
+          WHERE uploaded_by_id = $1
+        ) AS total_properties,
+
+        (
+          SELECT COALESCE(SUM(amount), 0)
+          FROM payments
+          WHERE user_id = $1
+            AND status = 'completed'
+            AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM NOW())
+        ) AS revenue_ytd
+    `;
+
+    const { rows } = await pool.query(statsQuery, [userId]);
+    const stats = rows[0] || {};
+
+    return res.json({
+      projects: Number(stats.active_projects || 0),
+      agents: Number(stats.total_agents || 0),
+      properties: Number(stats.total_properties || 0),
+      revenue: Number(stats.revenue_ytd || 0),
     });
   } catch (err) {
     console.error("Brokerage Stats Error:", err);
-    res.status(500).json({ error: "Failed to fetch stats" });
+    return res.status(500).json({ error: "Failed to fetch stats" });
   }
 });
 
 // ============================================================
 // BROKERAGE PROJECTS
 // ============================================================
-
-/**
- * GET /api/brokerage/projects
- * Get all projects under the brokerage
- */
 router.get("/projects", async (req, res) => {
   try {
-    const userId = req.headers["x-user-id"];
+    const userId = requireUser(req, res);
+    if (!userId) return;
 
     const { rows } = await pool.query(
-      `SELECT 
-        id, 
-        title as name, 
-        location, 
-        status, 
+      `
+      SELECT
+        id,
+        title AS name,
+        COALESCE(city, state, country, address, 'No location') AS location,
+        status,
         description,
         created_at,
         updated_at
-      FROM listings 
-      WHERE created_by = $1 
-      ORDER BY created_at DESC`,
+      FROM listings
+      WHERE uploaded_by_id = $1
+      ORDER BY created_at DESC
+      `,
       [userId]
     );
 
-    // Calculate progress percentage (mock for now)
     const projects = rows.map((p) => ({
       ...p,
-      progress: Math.floor(Math.random() * 100),
-      unitsLeft: Math.floor(Math.random() * 50),
+      progress: 0,
+      unitsLeft: 0,
     }));
 
-    res.json(projects);
+    return res.json(projects);
   } catch (err) {
     console.error("Get Projects Error:", err);
-    res.status(500).json({ error: "Failed to fetch projects" });
+    return res.status(500).json({ error: "Failed to fetch projects" });
   }
 });
 
-/**
- * POST /api/brokerage/projects
- * Create a new project
- */
 router.post("/projects", async (req, res) => {
-  const { title, location, description, status } = req.body;
-  const userId = req.headers["x-user-id"];
-
   try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { title, location, description, status } = req.body;
+
+    if (!title) {
+      return res.status(400).json({ error: "Title is required" });
+    }
+
     const { rows } = await pool.query(
-      `INSERT INTO listings 
-       (title, location, description, status, created_by, listing_type)
-       VALUES ($1, $2, $3, $4, $5, 'sale')
-       RETURNING id, title as name, location, status, created_at`,
-      [title, location, description, status || "planning", userId]
+      `
+      INSERT INTO listings (
+        title,
+        city,
+        description,
+        status,
+        uploaded_by_id,
+        listing_type
+      )
+      VALUES ($1, $2, $3, $4, $5, 'sale')
+      RETURNING
+        id,
+        title AS name,
+        COALESCE(city, 'No location') AS location,
+        status,
+        description,
+        created_at
+      `,
+      [title, location || null, description || null, status || "draft", userId]
     );
 
-    res.status(201).json(rows[0]);
+    return res.status(201).json(rows[0]);
   } catch (err) {
     console.error("Create Project Error:", err);
-    res.status(500).json({ error: "Failed to create project" });
+    return res.status(500).json({ error: "Failed to create project" });
   }
 });
 
-/**
- * PATCH /api/brokerage/projects/:id
- * Update a project
- */
 router.patch("/projects/:id", async (req, res) => {
-  const { id } = req.params;
-  const { title, location, description, status } = req.body;
-
   try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { id } = req.params;
+    const { title, location, description, status } = req.body;
+
     const { rows } = await pool.query(
-      `UPDATE listings 
-       SET title = COALESCE($1, title), 
-           location = COALESCE($2, location),
-           description = COALESCE($3, description),
-           status = COALESCE($4, status),
-           updated_at = NOW()
-       WHERE id = $5
-       RETURNING id, title as name, location, status`,
-      [title, location, description, status, id]
+      `
+      UPDATE listings
+      SET
+        title = COALESCE($1, title),
+        city = COALESCE($2, city),
+        description = COALESCE($3, description),
+        status = COALESCE($4, status),
+        updated_at = NOW()
+      WHERE id = $5
+        AND uploaded_by_id = $6
+      RETURNING
+        id,
+        title AS name,
+        COALESCE(city, state, country, address, 'No location') AS location,
+        status,
+        description,
+        updated_at
+      `,
+      [title, location, description, status, id, userId]
     );
 
-    if (!rows.length) return res.status(404).json({ error: "Project not found" });
-    res.json(rows[0]);
+    if (!rows.length) {
+      return res.status(404).json({ error: "Project not found or access denied" });
+    }
+
+    return res.json(rows[0]);
   } catch (err) {
     console.error("Update Project Error:", err);
-    res.status(500).json({ error: "Failed to update project" });
+    return res.status(500).json({ error: "Failed to update project" });
   }
 });
 
-/**
- * DELETE /api/brokerage/projects/:id
- * Delete a project
- */
 router.delete("/projects/:id", async (req, res) => {
-  const { id } = req.params;
-
   try {
-    await pool.query("DELETE FROM listings WHERE id = $1", [id]);
-    res.json({ success: true, message: "Project deleted" });
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      DELETE FROM listings
+      WHERE id = $1
+        AND uploaded_by_id = $2
+      `,
+      [id, userId]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "Project not found or access denied" });
+    }
+
+    return res.json({ success: true, message: "Project deleted" });
   } catch (err) {
     console.error("Delete Project Error:", err);
-    res.status(500).json({ error: "Failed to delete project" });
+    return res.status(500).json({ error: "Failed to delete project" });
   }
 });
 
 // ============================================================
-// BROKERAGE AGENTS (Team Management)
+// BROKERAGE AGENTS
 // ============================================================
-
-/**
- * GET /api/brokerage/agents
- * Get all agents under the brokerage
- */
 router.get("/agents", async (req, res) => {
   try {
-    const userId = req.headers["x-user-id"];
+    const userId = requireUser(req, res);
+    if (!userId) return;
 
     const { rows } = await pool.query(
-      `SELECT 
+      `
+      SELECT
+        u.id,
+        u.unique_id,
+        u.name,
+        u.email,
+        u.phone,
+        u.role,
+        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
+        COUNT(l.id)::int AS listings_count
+      FROM users u
+      LEFT JOIN profiles p
+        ON p.unique_id::uuid = u.unique_id
+      LEFT JOIN listings l
+        ON l.uploaded_by_id = u.unique_id
+      WHERE u.linked_agency_id = $1
+        AND LOWER(u.role::TEXT) = 'agent'
+      GROUP BY
         u.id,
         u.unique_id,
         u.name,
@@ -170,198 +251,278 @@ router.get("/agents", async (req, res) => {
         u.phone,
         u.role,
         p.avatar_url,
-        COUNT(l.id) as listings_count
-      FROM users u
-      LEFT JOIN profiles p ON p.unique_id = u.unique_id
-      LEFT JOIN listings l ON l.created_by = u.unique_id
-      WHERE u.brokerage_id = $1 AND u.role = 'agent'
-      GROUP BY u.id, u.unique_id, u.name, u.email, u.phone, u.role, p.avatar_url
-      ORDER BY u.created_at DESC`,
+        u.avatar_url
+      ORDER BY u.created_at DESC
+      `,
       [userId]
     );
 
-    res.json(rows);
+    return res.json(rows);
   } catch (err) {
     console.error("Get Agents Error:", err);
-    res.status(500).json({ error: "Failed to fetch agents" });
+    return res.status(500).json({ error: "Failed to fetch agents" });
   }
 });
 
-/**
- * POST /api/brokerage/agents
- * Add an agent to the brokerage
- */
+// Team-code join info instead of direct user creation
 router.post("/agents", async (req, res) => {
-  const { email, name, phone } = req.body;
-  const brokerageId = req.headers["x-user-id"];
-
-  if (!email || !name) {
-    return res.status(400).json({ error: "Email and name are required" });
-  }
-
   try {
+    const brokerageId = requireUser(req, res);
+    if (!brokerageId) return;
+
     const { rows } = await pool.query(
-      `INSERT INTO users (name, email, phone, role, brokerage_id)
-       VALUES ($1, $2, $3, 'agent', $4)
-       ON CONFLICT (email) DO UPDATE
-       SET brokerage_id = EXCLUDED.brokerage_id
-       RETURNING id, unique_id, name, email, phone, role`,
-      [name, email, phone, brokerageId]
+      `
+      SELECT team_code, company_name
+      FROM brokerage_profiles
+      WHERE unique_id = $1
+      LIMIT 1
+      `,
+      [brokerageId]
     );
 
-    res.status(201).json(rows[0]);
+    if (!rows.length) {
+      return res.status(404).json({ error: "Brokerage profile not found" });
+    }
+
+    return res.json({
+      success: true,
+      message: "Use the team code to let agents join this brokerage.",
+      team_code: rows[0].team_code,
+      company_name: rows[0].company_name,
+    });
   } catch (err) {
-    console.error("Add Agent Error:", err);
-    res.status(500).json({ error: "Failed to add agent" });
+    console.error("Brokerage Agent Join Info Error:", err);
+    return res.status(500).json({ error: "Failed to prepare agent join flow" });
   }
 });
 
-/**
- * DELETE /api/brokerage/agents/:id
- * Remove an agent from the brokerage
- */
 router.delete("/agents/:id", async (req, res) => {
-  const { id } = req.params;
-
   try {
-    await pool.query(
-      "UPDATE users SET brokerage_id = NULL WHERE unique_id = $1",
-      [id]
+    const brokerageId = requireUser(req, res);
+    if (!brokerageId) return;
+
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        linked_agency_id = NULL,
+        is_solo_agent = TRUE,
+        updated_at = NOW()
+      WHERE unique_id = $1
+        AND linked_agency_id = $2
+      `,
+      [id, brokerageId]
     );
-    res.json({ success: true, message: "Agent removed from brokerage" });
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "Agent not found or access denied" });
+    }
+
+    return res.json({ success: true, message: "Agent removed from brokerage" });
   } catch (err) {
     console.error("Remove Agent Error:", err);
-    res.status(500).json({ error: "Failed to remove agent" });
+    return res.status(500).json({ error: "Failed to remove agent" });
   }
 });
 
 // ============================================================
-// BROKERAGE PAYMENTS & TRANSACTIONS
+// BROKERAGE PAYMENTS
 // ============================================================
-
-/**
- * GET /api/brokerage/payments
- * Get payment history
- */
 router.get("/payments", async (req, res) => {
   try {
-    const userId = req.headers["x-user-id"];
+    const userId = requireUser(req, res);
+    if (!userId) return;
 
     const { rows } = await pool.query(
-      `SELECT 
+      `
+      SELECT
         id,
         description,
         amount,
         status,
         created_at,
-        updated_at
+        completed_at
       FROM payments
-      WHERE receiver_id = $1 OR sender_id = $1
+      WHERE user_id = $1
       ORDER BY created_at DESC
-      LIMIT 50`,
+      LIMIT 50
+      `,
       [userId]
     );
 
-    res.json(rows);
+    return res.json(rows);
   } catch (err) {
     console.error("Get Payments Error:", err);
-    res.status(500).json({ error: "Failed to fetch payments" });
+    return res.status(500).json({ error: "Failed to fetch payments" });
   }
 });
 
-/**
- * GET /api/brokerage/payments/:id
- * Get payment receipt
- */
 router.get("/payments/:id", async (req, res) => {
-  const { id } = req.params;
-
   try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { id } = req.params;
+
     const { rows } = await pool.query(
-      `SELECT * FROM payments WHERE id = $1`,
-      [id]
+      `
+      SELECT *
+      FROM payments
+      WHERE id = $1
+        AND user_id = $2
+      `,
+      [id, userId]
     );
 
-    if (!rows.length) return res.status(404).json({ error: "Payment not found" });
-    res.json(rows[0]);
+    if (!rows.length) {
+      return res.status(404).json({ error: "Payment not found or access denied" });
+    }
+
+    return res.json(rows[0]);
   } catch (err) {
     console.error("Get Payment Error:", err);
-    res.status(500).json({ error: "Failed to fetch payment" });
+    return res.status(500).json({ error: "Failed to fetch payment" });
   }
 });
 
 // ============================================================
-// BROKERAGE PROFILE & SETTINGS
+// BROKERAGE PROFILE
 // ============================================================
-
-/**
- * GET /api/brokerage/profile
- * Get brokerage profile information
- */
 router.get("/profile", async (req, res) => {
   try {
-    const userId = req.headers["x-user-id"];
+    const userId = requireUser(req, res);
+    if (!userId) return;
 
     const { rows } = await pool.query(
-      `SELECT 
+      `
+      SELECT
         u.id,
         u.unique_id,
         u.name,
         u.email,
         u.phone,
         u.role,
-        p.avatar_url,
+        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
         p.bio,
-        p.license_number,
-        p.company_name
+        u.license_number,
+        bp.company_name,
+        bp.brokerage_address
       FROM users u
-      LEFT JOIN profiles p ON p.unique_id = u.unique_id
-      WHERE u.unique_id = $1`,
+      LEFT JOIN profiles p ON p.unique_id::uuid = u.unique_id
+      LEFT JOIN brokerage_profiles bp ON bp.unique_id = u.unique_id
+      WHERE u.unique_id = $1
+      LIMIT 1
+      `,
       [userId]
     );
 
-    if (!rows.length) return res.status(404).json({ error: "Profile not found" });
-    res.json(rows[0]);
+    if (!rows.length) {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+
+    return res.json(rows[0]);
   } catch (err) {
     console.error("Get Profile Error:", err);
-    res.status(500).json({ error: "Failed to fetch profile" });
+    return res.status(500).json({ error: "Failed to fetch profile" });
   }
 });
 
-/**
- * PATCH /api/brokerage/profile
- * Update brokerage profile
- */
 router.patch("/profile", async (req, res) => {
-  const userId = req.headers["x-user-id"];
-  const { name, phone, company_name, license_number, bio, address } = req.body;
+  const client = await pool.connect();
 
   try {
-    // Update users table
-    await pool.query(
-      `UPDATE users 
-       SET name = COALESCE($1, name),
-           phone = COALESCE($2, phone)
-       WHERE unique_id = $3`,
-      [name, phone, userId]
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { name, phone, company_name, license_number, bio, address } = req.body;
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `
+      UPDATE users
+      SET
+        name = COALESCE($1, name),
+        phone = COALESCE($2, phone),
+        license_number = COALESCE($3, license_number),
+        updated_at = NOW()
+      WHERE unique_id = $4
+      `,
+      [name, phone, license_number, userId]
     );
 
-    // Update profiles table
-    await pool.query(
-      `INSERT INTO profiles (unique_id, company_name, license_number, bio, address)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (unique_id) DO UPDATE
-       SET company_name = COALESCE($2, company_name),
-           license_number = COALESCE($3, license_number),
-           bio = COALESCE($4, bio),
-           address = COALESCE($5, address)`,
-      [userId, company_name, license_number, bio, address]
+    await client.query(
+      `
+      INSERT INTO profiles (unique_id, full_name, phone, bio, updated_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (unique_id)
+      DO UPDATE SET
+        full_name = COALESCE(EXCLUDED.full_name, profiles.full_name),
+        phone = COALESCE(EXCLUDED.phone, profiles.phone),
+        bio = COALESCE(EXCLUDED.bio, profiles.bio),
+        updated_at = NOW()
+      `,
+      [userId, name || null, phone || null, bio || null]
     );
 
-    res.json({ success: true, message: "Profile updated successfully" });
+    await client.query(
+      `
+      INSERT INTO brokerage_profiles (unique_id, company_name, brokerage_address, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (unique_id)
+      DO UPDATE SET
+        company_name = COALESCE(EXCLUDED.company_name, brokerage_profiles.company_name),
+        brokerage_address = COALESCE(EXCLUDED.brokerage_address, brokerage_profiles.brokerage_address),
+        updated_at = NOW()
+      `,
+      [userId, company_name || null, address || null]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({ success: true, message: "Profile updated successfully" });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("Update Profile Error:", err);
-    res.status(500).json({ error: "Failed to update profile" });
+    return res.status(500).json({ error: "Failed to update profile" });
+  } finally {
+    client.release();
+  }
+});
+
+// ============================================================
+// BROKERAGE APPLICATIONS
+// ============================================================
+router.get("/applications", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        a.id,
+        a.status,
+        a.created_at,
+        l.title AS property_title,
+        COALESCE(l.city, l.state, l.country, l.address, 'No location') AS property_location,
+        l.price AS offer_price,
+        u.name AS buyer_name
+      FROM applications a
+      JOIN listings l ON l.id = a.listing_id
+      JOIN users u ON u.unique_id = a.applicant_id
+      WHERE l.uploaded_by_id = $1
+      ORDER BY a.created_at DESC
+      `,
+      [userId]
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    console.error("Get Applications Error:", err);
+    return res.status(500).json({ error: "Failed to fetch applications" });
   }
 });
 

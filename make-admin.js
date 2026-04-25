@@ -5,21 +5,22 @@ const makeAdmin = async () => {
     console.log("Connecting to AWS RDS...");
 
     const result = await pool.query(`
-      UPDATE users 
-      SET role = 'admin', 
-          is_admin = TRUE, 
-          is_super_admin = FALSE, -- Keeps them as a regular Admin/Moderator
-          verification_status = 'verified'
-      WHERE email = 'official.rixade@gmail.com'
-      RETURNING email, role, is_admin, is_super_admin;
+      UPDATE users
+      SET role = 'admin',
+          is_admin = TRUE,
+          is_super_admin = FALSE,
+          verification_status = 'verified',
+          is_verified = TRUE
+      WHERE LOWER(email) = LOWER('official.rixade@gmail.com')
+      RETURNING email, role, is_admin, is_super_admin, verification_status;
     `);
 
     if (result.rowCount === 0) {
       console.log(
-        "⚠️ No user found with that email! Make sure official.rixade@gmail.com has signed up on the frontend first.",
+        "⚠️ No user found with that email. Make sure official.rixade@gmail.com already exists in users."
       );
     } else {
-      console.log("✅ SUCCESS! User promoted to REGULAR Admin (Moderator):");
+      console.log("✅ SUCCESS! User promoted to regular Admin:");
       console.log(result.rows[0]);
     }
   } catch (error) {

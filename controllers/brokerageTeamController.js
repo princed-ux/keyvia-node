@@ -17,7 +17,7 @@ import { v4 as uuidv4 } from "uuid";
  */
 export const removeAgent = async (req, res) => {
   try {
-    const ownerId = req.user?.id;
+    const ownerId = req.user?.unique_id;
     const { agent_id } = req.params;
 
     if (!ownerId || !agent_id) {
@@ -218,7 +218,7 @@ export const postTeamMessage = async (req, res) => {
  */
 export const getTeamMessages = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const userId = req.user?.unique_id;
     const { limit = 50, offset = 0 } = req.query;
 
     // Get user's brokerage
@@ -288,7 +288,7 @@ export const getTeamMessages = async (req, res) => {
  */
 export const getTeamMembers = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const userId = req.user?.unique_id;
 
     // Get user's brokerage
     const brokerageQuery = `
@@ -365,7 +365,7 @@ export const getTeamMembers = async (req, res) => {
  */
 export const getTeamStats = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const userId = req.user?.unique_id;
 
     // Get brokerage
     const brokerageQuery = `
@@ -396,7 +396,7 @@ export const getTeamStats = async (req, res) => {
         COALESCE(SUM(l.views_count), 0) as total_views
       FROM brokerages b
       LEFT JOIN users u ON u.linked_agency_id = b.id
-      LEFT JOIN listings l ON l.agency_id = b.id
+      LEFT JOIN listings l ON l.uploaded_by_id = u.unique_id
       WHERE b.id = $1
     `;
 

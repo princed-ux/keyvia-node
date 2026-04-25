@@ -15,7 +15,7 @@ import crypto from "crypto";
  */
 export const createBrokerage = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    const userId = req.user?.unique_id;
     if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
     const {
@@ -106,7 +106,7 @@ export const createBrokerage = async (req, res) => {
 export const generateNewTeamCode = async (req, res) => {
   try {
     const { brokerage_id } = req.params;
-    const userId = req.user?.id;
+    const userId = req.user?.unique_id;
 
     // Verify user owns this brokerage
     const brokerageCheck = await pool.query(
@@ -236,8 +236,8 @@ export const getBrokerage = async (req, res) => {
         COUNT(DISTINCT l.id) as listing_count
       FROM brokerages b
       LEFT JOIN users u ON b.owner_id = u.unique_id
-      LEFT JOIN users ag ON ag.linked_agency_id = b.id AND ag.role = 'agent'
-      LEFT JOIN listings l ON l.agency_id = b.id
+      LEFT JOIN users ag ON ag.linked_agency_id = b.id AND LOWER(ag.role::TEXT) LIKE '%agent%'
+      LEFT JOIN listings l ON l.uploaded_by_id = u.unique_id
       WHERE b.id = $1
       GROUP BY b.id, u.name, u.avatar_url
     `;
@@ -312,7 +312,7 @@ export const getBrokerageAgents = async (req, res) => {
 export const updateBrokerage = async (req, res) => {
   try {
     const { brokerage_id } = req.params;
-    const userId = req.user?.id;
+    const userId = req.user?.unique_id;
     const { company_name, phone, website, headquarters_city, logo_url } =
       req.body;
 

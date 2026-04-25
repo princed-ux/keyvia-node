@@ -1,272 +1,333 @@
 import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
 
-// ---------------- Helper: Find User ----------------
-// Checks both USERS and PROFILES tables to support all user types
+/**
+ * Normalize role checks so we don't depend on inconsistent casing.
+ */
+const normalizeRole = (role) => String(role || "").trim().toLowerCase();
+
+/**
+ * Load authenticated user ONLY from users table.
+ * This becomes the single source of truth for auth/session identity.
+ */
 async function findUserByUniqueId(unique_id) {
-  try {
-    // 1. Try USERS table (Primary for Auth & Ban status)
-    const userQ = await pool.query(
-      `SELECT id, unique_id, name, email, role, is_admin, is_super_admin, avatar_url,
-              is_banned, ban_reason, banned_until
-       FROM users WHERE unique_id=$1`,
-      [unique_id],
-    );
+  const query = `
+    SELECT
+      id,
+      unique_id,
+      name,
+      email,
+      role,
+      avatar_url,
+      is_admin,
+      is_super_admin,
+      is_banned,
+      ban_reason,
+      banned_until,
+      verification_status,
+      special_id,
+      phone_verified,
+      team_code,
+      linked_agency_id,
+      is_solo_agent,
+      license_number,
+      brokerage_address
+    FROM users
+    WHERE unique_id = $1
+    LIMIT 1
+  `;
 
-    if (userQ.rows.length) {
-      const u = userQ.rows[0];
-      return {
-        id: u.id,
-        unique_id: u.unique_id,
-        name: u.name,
-        email: u.email,
-        role: u.role,
-        is_admin: !!u.is_admin,
-        is_super_admin: !!u.is_super_admin,
-        avatar_url: u.avatar_url || null,
+  const result = await pool.query(query, [unique_id]);
 
-        // Ban Info
-        is_banned: u.is_banned,
-        ban_reason: u.ban_reason,
-        banned_until: u.banned_until,
+  if (!result.rows.length) return null;
 
-        source: "users",
-      };
-    }
+  const u = result.rows[0];
 
-    // 2. Fallback: Profiles table
-    const profileQ = await pool.query(
-      `SELECT id, unique_id, username, full_name, email, role, 
-              'false' as is_admin, 'false' as is_super_admin
-       FROM profiles WHERE unique_id=$1`,
-      [unique_id],
-    );
+  return {
+    id: u.id,
+    unique_id: u.unique_id,
+    name: u.name,
+    email: u.email,
+    role: u.role,
+    avatar_url: u.avatar_url || null,
 
-    if (profileQ.rows.length) {
-      const p = profileQ.rows[0];
-      return {
-        id: p.id,
-        unique_id: p.unique_id,
-        name: p.full_name || p.username,
-        email: p.email,
-        role: p.role,
-        is_admin: false,
-        is_super_admin: false,
-        avatar_url: null, // Profiles table might handle avatars differently
-        source: "profile",
-      };
-    }
+    is_admin: !!u.is_admin,
+    is_super_admin: !!u.is_super_admin,
 
-    return null;
-  } catch (err) {
-    console.error("[AuthMiddleware] DB fetch error:", err);
-    throw new Error("Database query failed");
-  }
+    is_banned: !!u.is_banned,
+    ban_reason: u.ban_reason || null,
+    banned_until: u.banned_until || null,
+
+    verification_status: u.verification_status || "new",
+    special_id: u.special_id || null,
+    phone_verified: !!u.phone_verified,
+    team_code: u.team_code || null,
+    linked_agency_id: u.linked_agency_id || null,
+    is_solo_agent: u.is_solo_agent,
+    license_number: u.license_number || null,
+    brokerage_address: u.brokerage_address || null,
+
+    source: "users",
+  };
 }
 
-// ---------------- 1. Strict Middleware (Blocks Guests) ----------------
+/**
+ * Handle ban logic in one place.
+ * Returns an object if request should be blocked, otherwise null.
+ */
+async function evaluateBanStatus(user) {
+  if (!user?.is_banned) return null;
+
+  if (user.banned_until) {
+    const expiryDate = new Date(user.banned_until);
+
+    if (Number.isNaN(expiryDate.getTime())) {
+      return {
+        status: 403,
+        body: {
+          message: "Account Suspended",
+          reason: user.ban_reason || "Suspended account",
+        },
+      };
+    }
+
+    if (new Date() > expiryDate) {
+      await pool.query(
+        `UPDATE users
+         SET is_banned = FALSE, banned_until = NULL, ban_reason = NULL
+         WHERE unique_id = $1`,
+        [user.unique_id]
+      );
+
+      return null;
+    }
+
+    return {
+      status: 403,
+      body: {
+        message: "Account Suspended",
+        reason: user.ban_reason || "Suspended account",
+        expires_at: expiryDate,
+      },
+    };
+  }
+
+  return {
+    status: 403,
+    body: {
+      message: "Account Permanently Banned",
+      reason: user.ban_reason || "Permanently banned",
+    },
+  };
+}
+
+/**
+ * Extract bearer token from Authorization header.
+ */
+function getBearerToken(req) {
+  const authHeader =
+    req.headers["authorization"] || req.headers["Authorization"];
+
+  if (!authHeader) return null;
+  if (!authHeader.startsWith("Bearer ")) return null;
+
+  const token = authHeader.split(" ")[1];
+  if (!token || token === "null" || token === "undefined") return null;
+
+  return token;
+}
+
+/**
+ * Strict auth middleware
+ */
 export const authenticateAndAttachUser = async (req, res, next) => {
   try {
-    const authHeader =
-      req.headers["authorization"] || req.headers["Authorization"];
+    const token = getBearerToken(req);
 
-    // 1. Check Header Existence
-    if (!authHeader) {
-      console.log(
-        "❌ [AuthMiddleware] REJECTED: No Authorization Header present.",
-      );
-      return res.status(401).json({ message: "No token provided" });
+    if (!token) {
+      return res.status(401).json({
+        message: "No token provided",
+        code: "NO_TOKEN",
+      });
     }
 
-    // 2. Check Bearer Format
-    if (!authHeader.startsWith("Bearer ")) {
-      console.log(
-        "❌ [AuthMiddleware] REJECTED: Invalid header format (Missing 'Bearer ').",
-      );
-      return res.status(401).json({ message: "Invalid token format" });
-    }
-
-    const token = authHeader.split(" ")[1];
-
-    // 3. Check Token String
-    if (!token || token === "null" || token === "undefined") {
-      console.log(
-        "❌ [AuthMiddleware] REJECTED: Token string is null/undefined.",
-      );
-      return res.status(401).json({ message: "No token provided" });
-    }
-
-    // 4. ✅ CRITICAL FIX: Access Secret INSIDE the function
-    // This prevents "undefined" secret issues if imports happen before dotenv config
     const secret = process.env.ACCESS_TOKEN_SECRET;
     if (!secret) {
-      console.error("🔥 [CRITICAL] ACCESS_TOKEN_SECRET is missing in .env!");
-      return res.status(500).json({ message: "Server configuration error" });
+      console.error("[AuthMiddleware] ACCESS_TOKEN_SECRET is missing.");
+      return res.status(500).json({
+        message: "Server configuration error",
+        code: "SERVER_CONFIG_ERROR",
+      });
     }
 
-    // ... inside authenticateAndAttachUser ...
+    let decoded;
+    try {
+      decoded = jwt.verify(token, secret);
+    } catch (err) {
+      console.error(
+        `[AuthMiddleware] JWT rejected: ${err.name} - ${err.message}`
+      );
 
-    // 5. Verify Token
-    jwt.verify(token, secret, async (err, decoded) => {
-      if (err) {
-        // 🔴 CHANGE THIS BLOCK TO SEE THE REAL ERROR
-        console.error(
-          `❌ [AuthMiddleware] JWT REJECTED: ${err.name} - ${err.message}`,
-        );
-
-        if (err.name === "TokenExpiredError") {
-          return res
-            .status(401)
-            .json({ message: "Token has expired", code: "TOKEN_EXPIRED" });
-        }
-        return res
-          .status(401)
-          .json({ message: "Invalid token", code: "INVALID_TOKEN" });
+      if (err.name === "TokenExpiredError") {
+        return res.status(401).json({
+          message: "Token has expired",
+          code: "TOKEN_EXPIRED",
+        });
       }
 
-      // Check Payload
-      if (!decoded?.unique_id) {
-        console.error(
-          "❌ [AuthMiddleware] REJECTED: Token missing 'unique_id'. Payload:",
-          decoded,
-        );
-        return res.status(401).json({ message: "Invalid token payload" });
-      }
+      return res.status(401).json({
+        message: "Invalid token",
+        code: "INVALID_TOKEN",
+      });
+    }
 
-      // 6. Find User
-      const user = await findUserByUniqueId(decoded.unique_id);
+    if (!decoded?.unique_id) {
+      return res.status(401).json({
+        message: "Invalid token payload",
+        code: "INVALID_TOKEN_PAYLOAD",
+      });
+    }
 
-      if (!user) {
-        console.log(
-          `❌ [AuthMiddleware] REJECTED: User ${decoded.unique_id} not found in DB.`,
-        );
-        return res.status(404).json({ message: "User not found" });
-      }
+    const user = await findUserByUniqueId(decoded.unique_id);
 
-      // 7. Ban Check
-      if (user.is_banned) {
-        if (user.banned_until) {
-          const expiryDate = new Date(user.banned_until);
-          if (new Date() > expiryDate) {
-            // Auto-unban logic
-            await pool.query(
-              `UPDATE users SET is_banned = FALSE, banned_until = NULL WHERE unique_id = $1`,
-              [user.unique_id],
-            );
-            user.is_banned = false;
-          } else {
-            console.log(
-              `⛔ [AuthMiddleware] REJECTED: User is suspended until ${expiryDate}`,
-            );
-            return res
-              .status(403)
-              .json({
-                message: "Account Suspended",
-                reason: user.ban_reason,
-                expires_at: expiryDate,
-              });
-          }
-        } else {
-          console.log(
-            "⛔ [AuthMiddleware] REJECTED: User is permanently banned.",
-          );
-          return res
-            .status(403)
-            .json({
-              message: "Account Permanently Banned",
-              reason: user.ban_reason,
-            });
-        }
-      }
+    if (!user) {
+      console.log(
+        `[AuthMiddleware] Rejected: user ${decoded.unique_id} not found in users table.`
+      );
+      return res.status(404).json({
+        message: "User not found",
+        code: "USER_NOT_FOUND",
+      });
+    }
 
-      // ✅ SUCCESS
-      req.user = { ...user, token_payload: decoded };
-      next();
-    });
+    const banBlock = await evaluateBanStatus(user);
+    if (banBlock) {
+      return res.status(banBlock.status).json(banBlock.body);
+    }
+
+    req.user = {
+      ...user,
+      token_payload: decoded,
+    };
+
+    return next();
   } catch (err) {
     console.error("[AuthMiddleware] Unexpected error:", err);
-    res.status(500).json({ message: "Unexpected server error" });
+    return res.status(500).json({
+      message: "Unexpected server error",
+      code: "AUTH_MIDDLEWARE_ERROR",
+    });
   }
 };
 
-// ---------------- 2. Optional Auth (Guest Friendly) ----------------
+/**
+ * Optional auth middleware
+ * If token is missing/invalid, request continues as guest.
+ */
 export const optionalAuth = async (req, res, next) => {
   try {
-    const authHeader =
-      req.headers["authorization"] || req.headers["Authorization"];
+    const token = getBearerToken(req);
 
-    // If No Header or Invalid Token, proceed as Guest
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      req.user = null;
-      return next();
-    }
-
-    const token = authHeader.split(" ")[1];
-    if (!token || token === "null" || token === "undefined") {
+    if (!token) {
       req.user = null;
       return next();
     }
 
     const secret = process.env.ACCESS_TOKEN_SECRET;
     if (!secret) {
-      // If secret is missing, we can't verify, so treat as guest
       req.user = null;
       return next();
     }
 
-    jwt.verify(token, secret, async (err, decoded) => {
-      if (err) {
-        req.user = null;
-        return next();
-      }
+    let decoded;
+    try {
+      decoded = jwt.verify(token, secret);
+    } catch {
+      req.user = null;
+      return next();
+    }
 
-      try {
-        const user = await findUserByUniqueId(decoded.unique_id);
-        if (user && !user.is_banned) {
-          req.user = { ...user, token_payload: decoded };
-        } else {
-          req.user = null;
-        }
-      } catch (dbErr) {
-        req.user = null;
-      }
+    if (!decoded?.unique_id) {
+      req.user = null;
+      return next();
+    }
 
-      next();
-    });
+    const user = await findUserByUniqueId(decoded.unique_id);
+
+    if (!user) {
+      req.user = null;
+      return next();
+    }
+
+    const banBlock = await evaluateBanStatus(user);
+    if (banBlock) {
+      req.user = null;
+      return next();
+    }
+
+    req.user = {
+      ...user,
+      token_payload: decoded,
+    };
+
+    return next();
   } catch (err) {
     console.error("[OptionalAuth] Error:", err);
-    req.user = null; // Fail safe -> Guest Mode
-    next();
+    req.user = null;
+    return next();
   }
 };
 
-// ---------------- Admin Middleware ----------------
+/**
+ * Admin guard
+ */
 export const verifyAdmin = (req, res, next) => {
-  if (!req.user)
-    return res.status(401).json({ message: "Unauthorized: No user attached" });
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized: No user attached",
+    });
+  }
+
+  const role = normalizeRole(req.user.role);
 
   if (
-    req.user.role === "Admin" ||
-    req.user.role === "SuperAdmin" ||
+    role === "admin" ||
+    role === "superadmin" ||
     req.user.is_admin === true ||
     req.user.is_super_admin === true
   ) {
     return next();
   }
-  return res.status(403).json({ message: "Forbidden: Admins only" });
+
+  return res.status(403).json({
+    message: "Forbidden: Admins only",
+  });
 };
 
-// ---------------- Super Admin Middleware ----------------
+/**
+ * Super admin guard
+ */
 export const verifySuperAdmin = (req, res, next) => {
-  if (!req.user) return res.status(401).json({ message: "Unauthorized" });
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
 
-  if (req.user.is_super_admin === true) {
+  const role = normalizeRole(req.user.role);
+
+  if (role === "superadmin" || req.user.is_super_admin === true) {
     return next();
   }
-  return res.status(403).json({ message: "Forbidden: Super Admins only" });
+
+  return res.status(403).json({
+    message: "Forbidden: Super Admins only",
+  });
 };
 
-// ---------------- Aliases ----------------
+/**
+ * Aliases
+ */
 export const authenticate = authenticateAndAttachUser;
 export const verifyToken = authenticateAndAttachUser;
 export const authenticateToken = authenticateAndAttachUser;

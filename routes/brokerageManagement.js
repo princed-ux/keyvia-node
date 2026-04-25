@@ -1,12 +1,6 @@
-// keyvia-node/routes/brokerageManagement.js
-// ============================================================================
-// BROKERAGE MANAGEMENT ROUTES - Full Team Code & Brokerage Operations
-// ============================================================================
-
 import express from "express";
 import {
   authenticateToken,
-  verifyAdmin,
 } from "../middleware/authMiddleware.js";
 import {
   createBrokerage,
@@ -20,56 +14,33 @@ import {
 const router = express.Router();
 
 /**
- * ============================================================================
  * PUBLIC ROUTES
- * ============================================================================
  */
 
-/**
- * POST /api/brokerage/verify-team-code
- * Verify team code (used during agent signup)
- * No authentication required
- */
+// POST /api/brokerage/manage/verify-team-code
 router.post("/verify-team-code", verifyTeamCode);
 
-/**
- * GET /api/brokerage/:brokerage_id
- * Get public brokerage info
- */
-router.get("/:brokerage_id", getBrokerage);
+// GET /api/brokerage/manage/public/:brokerage_id
+router.get("/public/:brokerage_id", getBrokerage);
+
+// GET /api/brokerage/manage/public/:brokerage_id/agents
+router.get("/public/:brokerage_id/agents", getBrokerageAgents);
 
 /**
- * GET /api/brokerage/:brokerage_id/agents
- * Get all agents in a brokerage
- */
-router.get("/:brokerage_id/agents", getBrokerageAgents);
-
-/**
- * ============================================================================
- * PROTECTED ROUTES (Authenticated Users)
- * ============================================================================
+ * PROTECTED ROUTES
  */
 
-/**
- * POST /api/brokerage/create
- * Create new brokerage (brokerage owner signup)
- */
+// POST /api/brokerage/manage/create
 router.post("/create", authenticateToken, createBrokerage);
 
-/**
- * PUT /api/brokerage/:brokerage_id
- * Update brokerage info (owner only)
- */
+// PUT /api/brokerage/manage/:brokerage_id
 router.put("/:brokerage_id", authenticateToken, updateBrokerage);
 
-/**
- * POST /api/brokerage/:brokerage_id/generate-team-code
- * Generate new team code (owner only)
- */
+// POST /api/brokerage/manage/:brokerage_id/generate-team-code
 router.post(
   "/:brokerage_id/generate-team-code",
   authenticateToken,
-  generateNewTeamCode,
+  generateNewTeamCode
 );
 
 export default router;

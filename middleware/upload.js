@@ -8,7 +8,7 @@ import path from "path";
    🪣 S3 CLIENT
 ====================================================== */
 export const s3 = new S3Client({
-  region: "eu-west-3", // Hardcode it here or use a specific S3_REGION env var
+  region: "eu-west-1", // Hardcode it here or use a specific S3_REGION env var
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,

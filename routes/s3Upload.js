@@ -1,212 +1,249 @@
-// routes/s3Upload.js
-// ============================================================================
-// S3 PRESIGNED URL GENERATION
-// Purpose: Generate secure presigned URLs for direct client-to-S3 uploads
-// Prevents server load and enables fast uploads from browser
-// ============================================================================
-
-import express from 'express';
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { v4 as uuidv4 } from 'uuid';
-import { pool } from '../db.js';
+import express from "express";
+import {
+  GetObjectCommand,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { v4 as uuidv4 } from "uuid";
+import { pool } from "../db.js";
+import { authenticateAndAttachUser } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-// Initialize S3 Client
+const AWS_REGION = process.env.AWS_REGION || "eu-west-1";
+const S3_BUCKET = process.env.AWS_S3_BUCKET;
+const MEDIA_CDN_URL = process.env.MEDIA_CDN_URL || "";
+
 const s3Client = new S3Client({
-  region: process.env.AWS_REGION || 'us-east-1',
+  region: AWS_REGION,
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
 
-const S3_BUCKET = process.env.AWS_S3_BUCKET || 'keyvia-real-estate';
+router.use(authenticateAndAttachUser);
 
-/**
- * ============================================================================
- * 1. GENERATE PRESIGNED URL FOR UPLOAD
- * ============================================================================
- * POST /api/s3/generate-presigned-url
- * 
- * Purpose: Generate a presigned URL that allows client-side upload to S3
- * 
- * Request Body:
- * {
- *   "file_name": "photo.jpg",
- *   "file_type": "image/jpeg",
- *   "resource_type": "listing", // listing, profile, document
- *   "resource_id": "uuid-here"  // Optional: ID of resource
- * }
- * 
- * Response:
- * {
- *   "presigned_url": "https://s3.amazonaws.com/...",
- *   "s3_key": "listings/uuid/photo.jpg",
- *   "s3_url": "https://keyvia.s3.amazonaws.com/listings/uuid/photo.jpg",
- *   "upload_id": "uuid"  // Track this for confirmation
- * }
- * ============================================================================
- */
-router.post('/generate-presigned-url', async (req, res) => {
+const getUserId = (req) => req.user?.unique_id || null;
+
+const allowedTypes = [
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+];
+
+const validResourceTypes = ["listing", "profile", "document", "license"];
+
+const buildFileUrl = (bucket, key) => {
+  if (MEDIA_CDN_URL) {
+    return `${MEDIA_CDN_URL.replace(/\/$/, "")}/${key}`;
+  }
+
+  return `https://${bucket}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+};
+
+const sanitizeExtension = (fileName = "") => {
+  const ext = fileName.includes(".") ? fileName.split(".").pop() : "bin";
+  return String(ext || "bin").toLowerCase().replace(/[^a-z0-9]/g, "") || "bin";
+};
+
+// ============================================================================
+// 1. GENERATE PRESIGNED URL
+// ============================================================================
+router.post("/generate-presigned-url", async (req, res) => {
   try {
     const { file_name, file_type, resource_type, resource_id } = req.body;
-    const userId = req.headers['x-user-id'] || req.user?.id;
+    const userId = getUserId(req);
 
-    // Validation
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    if (!S3_BUCKET) {
+      return res.status(500).json({ error: "AWS_S3_BUCKET is not configured" });
+    }
+
     if (!file_name || !file_type || !resource_type) {
       return res.status(400).json({
-        error: 'Missing required fields: file_name, file_type, resource_type',
+        error: "Missing required fields: file_name, file_type, resource_type",
       });
     }
 
-    // Security: Validate file type
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
     if (!allowedTypes.includes(file_type)) {
       return res.status(400).json({
-        error: 'File type not allowed. Allowed types: images (JPEG, PNG, WebP, GIF) and PDFs',
+        error:
+          "File type not allowed. Allowed types: images, videos, and PDFs.",
       });
     }
 
-    // Security: Validate resource type
-    const validResourceTypes = ['listing', 'profile', 'document', 'license'];
     if (!validResourceTypes.includes(resource_type)) {
       return res.status(400).json({
-        error: 'Invalid resource type',
+        error: "Invalid resource type",
       });
     }
 
-    // Generate unique key
     const uploadId = uuidv4();
-    const fileExtension = file_name.split('.').pop();
-    const s3Key = `${resource_type}s/${resource_id || 'temp'}/${uploadId}.${fileExtension}`;
+    const fileExtension = sanitizeExtension(file_name);
+    const safeResourceId = resource_id || "temp";
 
-    // S3 Presigned URL (valid for 15 minutes)
+    const folder =
+      resource_type === "listing"
+        ? "listings"
+        : resource_type === "profile"
+          ? "profiles"
+          : resource_type === "document"
+            ? "documents"
+            : "licenses";
+
+    const s3Key = `${folder}/${safeResourceId}/${uploadId}.${fileExtension}`;
+
     const command = new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: s3Key,
       ContentType: file_type,
       Metadata: {
-        'uploaded-by': userId,
-        'resource-type': resource_type,
-        'resource-id': resource_id || 'temp',
+        uploaded_by: String(userId),
+        resource_type: String(resource_type),
+        resource_id: String(safeResourceId),
       },
     });
 
-    const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 }); // 15 min
+    const presignedUrl = await getSignedUrl(s3Client, command, {
+      expiresIn: 900,
+    });
 
-    // Store upload record in database for tracking
-    const s3Url = `https://${S3_BUCKET}.s3.amazonaws.com/${s3Key}`;
-    
+    const fileUrl = buildFileUrl(S3_BUCKET, s3Key);
+
     await pool.query(
-      `INSERT INTO s3_uploads (uploaded_by, file_name, file_type, s3_bucket, s3_key, s3_url, resource_type, resource_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [userId, file_name, file_type, S3_BUCKET, s3Key, s3Url, resource_type, resource_id || null]
+      `
+      INSERT INTO s3_uploads (
+        uploader_id,
+        s3_key,
+        s3_url,
+        file_name,
+        file_type,
+        resource_type,
+        resource_id
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `,
+      [
+        userId,
+        s3Key,
+        fileUrl,
+        file_name,
+        file_type,
+        resource_type,
+        resource_id || null,
+      ],
     );
 
-    res.json({
+    return res.json({
       presigned_url: presignedUrl,
       s3_key: s3Key,
-      s3_url: s3Url,
+      s3_url: fileUrl,
       upload_id: uploadId,
-      expires_in: 900, // 15 minutes
+      expires_in: 900,
       bucket: S3_BUCKET,
+      cdn_enabled: Boolean(MEDIA_CDN_URL),
     });
   } catch (error) {
-    console.error('❌ S3 Presigned URL Error:', error);
-    res.status(500).json({ error: 'Failed to generate presigned URL' });
+    console.error("S3 Presigned URL Error:", error);
+    return res.status(500).json({ error: "Failed to generate presigned URL" });
   }
 });
 
-/**
- * ============================================================================
- * 2. CONFIRM UPLOAD (After client completes upload to S3)
- * ============================================================================
- * POST /api/s3/confirm-upload
- * 
- * Purpose: Confirm that upload was successful and finalize in database
- * 
- * Request Body:
- * {
- *   "s3_key": "listings/uuid/photo.jpg",
- *   "resource_type": "listing",
- *   "resource_id": "uuid-of-listing"
- * }
- * ============================================================================
- */
-router.post('/confirm-upload', async (req, res) => {
+// ============================================================================
+// 2. CONFIRM UPLOAD
+// ============================================================================
+router.post("/confirm-upload", async (req, res) => {
   try {
     const { s3_key, resource_type, resource_id } = req.body;
-    const userId = req.headers['x-user-id'] || req.user?.id;
+    const userId = getUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
     if (!s3_key || !resource_type || !resource_id) {
       return res.status(400).json({
-        error: 'Missing required fields: s3_key, resource_type, resource_id',
+        error: "Missing required fields: s3_key, resource_type, resource_id",
       });
     }
 
-    // Verify upload exists and belongs to user
     const uploadCheck = await pool.query(
-      `SELECT id, s3_url FROM s3_uploads WHERE s3_key = $1 AND uploaded_by = $2`,
-      [s3_key, userId]
+      `
+      SELECT id, s3_url
+      FROM s3_uploads
+      WHERE s3_key = $1
+        AND uploader_id = $2
+      LIMIT 1
+      `,
+      [s3_key, userId],
     );
 
-    if (uploadCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Upload record not found' });
+    if (!uploadCheck.rows.length) {
+      return res.status(404).json({ error: "Upload record not found" });
     }
 
     const { s3_url } = uploadCheck.rows[0];
 
-    // Update upload status
     await pool.query(
-      `UPDATE s3_uploads SET upload_status = $1, resource_id = $2 
-       WHERE s3_key = $3`,
-      ['completed', resource_id, s3_key]
+      `
+      UPDATE s3_uploads
+      SET resource_id = $1
+      WHERE s3_key = $2
+        AND uploader_id = $3
+      `,
+      [resource_id, s3_key, userId],
     );
 
-    res.json({
+    return res.json({
       success: true,
-      message: 'Upload confirmed',
-      s3_url: s3_url,
-      s3_key: s3_key,
+      message: "Upload confirmed",
+      s3_url,
+      s3_key,
     });
   } catch (error) {
-    console.error('❌ Upload Confirmation Error:', error);
-    res.status(500).json({ error: 'Failed to confirm upload' });
+    console.error("Upload Confirmation Error:", error);
+    return res.status(500).json({ error: "Failed to confirm upload" });
   }
 });
 
-/**
- * ============================================================================
- * 3. BULK PRESIGNED URLS (For multiple files)
- * ============================================================================
- * POST /api/s3/generate-bulk-urls
- * 
- * Purpose: Generate multiple presigned URLs for batch uploads
- * 
- * Request Body:
- * {
- *   "files": [
- *     { "file_name": "photo1.jpg", "file_type": "image/jpeg" },
- *     { "file_name": "photo2.jpg", "file_type": "image/jpeg" }
- *   ],
- *   "resource_type": "listing",
- *   "resource_id": "uuid"
- * }
- * ============================================================================
- */
-router.post('/generate-bulk-urls', async (req, res) => {
+// ============================================================================
+// 3. GENERATE BULK URLS
+// ============================================================================
+router.post("/generate-bulk-urls", async (req, res) => {
   try {
     const { files, resource_type, resource_id } = req.body;
-    const userId = req.headers['x-user-id'] || req.user?.id;
+    const userId = getUserId(req);
 
-    if (!Array.isArray(files) || files.length === 0) {
-      return res.status(400).json({ error: 'Files array is required' });
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
-    if (files.length > 10) {
-      return res.status(400).json({ error: 'Maximum 10 files per batch' });
+    if (!S3_BUCKET) {
+      return res.status(500).json({ error: "AWS_S3_BUCKET is not configured" });
+    }
+
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: "Files array is required" });
+    }
+
+    if (files.length > 15) {
+      return res.status(400).json({ error: "Maximum 15 files per batch" });
+    }
+
+    if (!validResourceTypes.includes(resource_type)) {
+      return res.status(400).json({ error: "Invalid resource type" });
     }
 
     const presignedUrls = [];
@@ -214,60 +251,106 @@ router.post('/generate-bulk-urls', async (req, res) => {
     for (const file of files) {
       const { file_name, file_type } = file;
 
-      // Generate S3 key and presigned URL
+      if (!file_name || !file_type) {
+        return res.status(400).json({
+          error: "Each file must include file_name and file_type",
+        });
+      }
+
+      if (!allowedTypes.includes(file_type)) {
+        return res.status(400).json({
+          error: `File type not allowed for ${file_name}`,
+        });
+      }
+
       const uploadId = uuidv4();
-      const fileExtension = file_name.split('.').pop();
-      const s3Key = `${resource_type}s/${resource_id}/${uploadId}.${fileExtension}`;
+      const fileExtension = sanitizeExtension(file_name);
+      const safeResourceId = resource_id || "temp";
+
+      const folder =
+        resource_type === "listing"
+          ? "listings"
+          : resource_type === "profile"
+            ? "profiles"
+            : resource_type === "document"
+              ? "documents"
+              : "licenses";
+
+      const s3Key = `${folder}/${safeResourceId}/${uploadId}.${fileExtension}`;
 
       const command = new PutObjectCommand({
         Bucket: S3_BUCKET,
         Key: s3Key,
         ContentType: file_type,
+        Metadata: {
+          uploaded_by: String(userId),
+          resource_type: String(resource_type),
+          resource_id: String(safeResourceId),
+        },
       });
 
-      const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
-      const s3Url = `https://${S3_BUCKET}.s3.amazonaws.com/${s3Key}`;
+      const presignedUrl = await getSignedUrl(s3Client, command, {
+        expiresIn: 900,
+      });
+
+      const fileUrl = buildFileUrl(S3_BUCKET, s3Key);
 
       presignedUrls.push({
         file_name,
+        file_type,
         s3_key: s3Key,
         presigned_url: presignedUrl,
-        s3_url: s3Url,
+        s3_url: fileUrl,
         upload_id: uploadId,
       });
 
-      // Store in database
       await pool.query(
-        `INSERT INTO s3_uploads (uploaded_by, file_name, file_type, s3_bucket, s3_key, s3_url, resource_type, resource_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [userId, file_name, file_type, S3_BUCKET, s3Key, s3Url, resource_type, resource_id]
+        `
+        INSERT INTO s3_uploads (
+          uploader_id,
+          s3_key,
+          s3_url,
+          file_name,
+          file_type,
+          resource_type,
+          resource_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `,
+        [
+          userId,
+          s3Key,
+          fileUrl,
+          file_name,
+          file_type,
+          resource_type,
+          resource_id || null,
+        ],
       );
     }
 
-    res.json({
+    return res.json({
       success: true,
       urls: presignedUrls,
       expires_in: 900,
+      bucket: S3_BUCKET,
+      cdn_enabled: Boolean(MEDIA_CDN_URL),
     });
   } catch (error) {
-    console.error('❌ Bulk URL Generation Error:', error);
-    res.status(500).json({ error: 'Failed to generate bulk URLs' });
+    console.error("Bulk URL Generation Error:", error);
+    return res.status(500).json({ error: "Failed to generate bulk URLs" });
   }
 });
 
-/**
- * ============================================================================
- * 4. GET OBJECT PRESIGNED URL (For downloading/viewing files)
- * ============================================================================
- * GET /api/s3/get-presigned-url?s3_key=...
- * ============================================================================
- */
-router.get('/get-presigned-url', async (req, res) => {
+// ============================================================================
+// 4. GET OBJECT PRESIGNED URL
+// ============================================================================
+router.get("/get-presigned-url", async (req, res) => {
   try {
     const { s3_key } = req.query;
 
     if (!s3_key) {
-      return res.status(400).json({ error: 's3_key is required' });
+      return res.status(400).json({ error: "s3_key is required" });
     }
 
     const command = new GetObjectCommand({
@@ -275,52 +358,58 @@ router.get('/get-presigned-url', async (req, res) => {
       Key: s3_key,
     });
 
-    const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 }); // 1 hour
+    const presignedUrl = await getSignedUrl(s3Client, command, {
+      expiresIn: 3600,
+    });
 
-    res.json({
+    return res.json({
       presigned_url: presignedUrl,
-      s3_key: s3_key,
+      s3_key,
     });
   } catch (error) {
-    console.error('❌ Get Presigned URL Error:', error);
-    res.status(500).json({ error: 'Failed to generate download URL' });
+    console.error("Get Presigned URL Error:", error);
+    return res.status(500).json({ error: "Failed to generate download URL" });
   }
 });
 
-/**
- * ============================================================================
- * 5. DELETE S3 OBJECT (Admin only)
- * ============================================================================
- * DELETE /api/s3/delete?s3_key=...
- * ============================================================================
- */
-router.delete('/delete', async (req, res) => {
+// ============================================================================
+// 5. DELETE S3 OBJECT
+// ============================================================================
+router.delete("/delete", async (req, res) => {
   try {
     const { s3_key } = req.query;
-    const userId = req.headers['x-user-id'] || req.user?.id;
+    const userId = getUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
     if (!s3_key) {
-      return res.status(400).json({ error: 's3_key is required' });
+      return res.status(400).json({ error: "s3_key is required" });
     }
 
-    // Verify user owns this upload
     const uploadRecord = await pool.query(
-      `SELECT id, uploaded_by FROM s3_uploads WHERE s3_key = $1`,
-      [s3_key]
+      `
+      SELECT id, uploader_id
+      FROM s3_uploads
+      WHERE s3_key = $1
+      LIMIT 1
+      `,
+      [s3_key],
     );
 
-    if (uploadRecord.rows.length === 0) {
-      return res.status(404).json({ error: 'Upload not found' });
+    if (!uploadRecord.rows.length) {
+      return res.status(404).json({ error: "Upload not found" });
     }
 
-    // Check authorization (user must own or be admin)
-    const { uploaded_by } = uploadRecord.rows[0];
-    if (uploaded_by !== userId) {
-      return res.status(403).json({ error: 'Unauthorized to delete this file' });
+    const { uploader_id } = uploadRecord.rows[0];
+
+    if (String(uploader_id) !== String(userId)) {
+      return res.status(403).json({
+        error: "Unauthorized to delete this file",
+      });
     }
 
-    // Delete from S3
-    const { DeleteObjectCommand } = await import('@aws-sdk/client-s3');
     const deleteCommand = new DeleteObjectCommand({
       Bucket: S3_BUCKET,
       Key: s3_key,
@@ -328,20 +417,23 @@ router.delete('/delete', async (req, res) => {
 
     await s3Client.send(deleteCommand);
 
-    // Update database
     await pool.query(
-      `UPDATE s3_uploads SET upload_status = $1 WHERE s3_key = $2`,
-      ['deleted', s3_key]
+      `
+      DELETE FROM s3_uploads
+      WHERE s3_key = $1
+        AND uploader_id = $2
+      `,
+      [s3_key, userId],
     );
 
-    res.json({
+    return res.json({
       success: true,
-      message: 'File deleted successfully',
-      s3_key: s3_key,
+      message: "File deleted successfully",
+      s3_key,
     });
   } catch (error) {
-    console.error('❌ S3 Delete Error:', error);
-    res.status(500).json({ error: 'Failed to delete file' });
+    console.error("S3 Delete Error:", error);
+    return res.status(500).json({ error: "Failed to delete file" });
   }
 });
 

@@ -9,7 +9,7 @@ import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 import nodemailer from "nodemailer";
 
 const sesClient = new SESClient({
-  region: process.env.AWS_SES_REGION || "eu-west-3",
+  region: process.env.AWS_SES_REGION || "eu-west-1",
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
