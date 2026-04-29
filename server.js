@@ -16,6 +16,7 @@ import {
 import apmService from "./services/apmService.js";
 import logger from "./utils/logger.js";
 import { registerSocketHandlers } from "./socket/registerSocketHandlers.js";
+import { startSubscriptionRenewalJob } from "./jobs/subscriptionRenewalJob.js";
 
 // 1. Load Environment Variables
 dotenv.config();
@@ -47,6 +48,8 @@ import ivsRoutes from "./routes/ivsRoutes.js"; // ✅ AWS IVS Live Tours
 import teamRoutes from "./routes/teamRoutes.js"; // ✅ Brokerage Team Management
 import monitoringRoutes from "./routes/monitoringRoutes.js"; // ✅ Admin Monitoring & Metrics
 import subscriptionRoutes from "./routes/subscriptions.js";
+import mediaProcessingRoutes from "./routes/mediaProcessingRoutes.js";
+// import s3UploadRoutes from "./routes/s3Upload.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -119,6 +122,8 @@ app.use("/api/favorites", favoriteRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/super-admin", superAdminRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
+app.use("/api/media-processing", mediaProcessingRoutes);
+app.use("/api/media", s3UploadRoutes);
 
 // ✅ Applications Route (One unified route for Agents, Owners, and Buyers)
 app.use("/api/applications", applicationRoutes);
@@ -142,7 +147,7 @@ app.use("/api/brokerage/manage", brokerageManagementRoutes);
 app.use("/api/followers", followersRoutes);
 
 // ✅ S3 Upload Routes (Presigned URLs for direct uploads)
-app.use("/api/s3", s3UploadRoutes);
+// app.use("/api/s3", s3UploadRoutes); 
 
 // ✅ AWS IVS Live Tours (Go live, viewer access, paywall)
 app.use("/api/ivs", ivsRoutes);
@@ -171,12 +176,14 @@ pool
     console.log("✅ Connected to PostgreSQL");
     client.release();
 
-    // 🚀 Start server immediately
     server.listen(PORT, () => {
       console.log(`🚀 Server + Socket.IO running on http://localhost:${PORT}`);
+
+      // ✅ START AUTO-RENEW SYSTEM HERE
+      startSubscriptionRenewalJob();
+      console.log("🔁 Subscription renewal job started");
     });
   })
-
   .catch((err) => {
     console.error("❌ Failed to connect to PostgreSQL:", err.stack);
     process.exit(1);

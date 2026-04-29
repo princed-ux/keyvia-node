@@ -343,42 +343,76 @@ const activateSubscription = async ({ reference, providerData }) => {
 
     const plan = getPlan(payment.role, payment.plan);
 
+
+    const paystackAuth = providerData?.data?.authorization || null;
+const paystackCustomer = providerData?.data?.customer || null;
+
+const reusableAuth =
+  payment.provider === "paystack" &&
+  paystackAuth?.reusable === true &&
+  paystackAuth?.authorization_code
+    ? paystackAuth
+    : null;
+
+const billingEmail =
+  providerData?.data?.customer?.email ||
+  paystackCustomer?.email ||
+  null;
+
+const providerCustomerId =
+  paystackCustomer?.customer_code ||
+  paystackCustomer?.id ||
+  null;
+
+const providerSubscriptionId =
+  reusableAuth?.authorization_code || null;
+
     if (!plan) {
       throw new Error("Invalid plan");
     }
 
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + plan.durationDays);
+   const now = new Date();
+const periodStart = new Date(now);
+const periodEnd = new Date(now);
+periodEnd.setDate(periodEnd.getDate() + plan.durationDays);
 
-    await client.query(
-      `
-      UPDATE subscription_payments
-      SET status = 'paid',
-          provider_response = $1,
-          paid_at = NOW(),
-          updated_at = NOW()
-      WHERE reference = $2
-      `,
-      [JSON.stringify(providerData || {}), reference],
-    );
-
-    await client.query(
-      `
-      UPDATE users
-      SET subscription_plan = $1,
-          subscription_status = 'active',
-          subscription_expires_at = $2
-      WHERE unique_id = $3
-      `,
-      [payment.plan, expiresAt, payment.user_id],
-    );
+await client.query(
+  `
+  UPDATE users
+  SET subscription_plan = $1,
+      subscription_status = 'active',
+      subscription_started_at = COALESCE(subscription_started_at, $2),
+      current_period_start = $3,
+      current_period_end = $4,
+      next_billing_at = $4,
+      subscription_expires_at = $4,
+      cancel_at_period_end = FALSE,
+      provider_subscription_id = COALESCE($5, provider_subscription_id),
+      provider_customer_id = COALESCE($6, provider_customer_id),
+      billing_email = COALESCE($7, billing_email),
+      payment_authorization = COALESCE($8, payment_authorization)
+  WHERE unique_id = $9
+  `,
+  [
+    payment.plan,
+    now,
+    periodStart,
+    periodEnd,
+    providerSubscriptionId,
+    providerCustomerId,
+    billingEmail,
+    reusableAuth ? JSON.stringify(reusableAuth) : null,
+    payment.user_id,
+  ],
+);
 
     await client.query("COMMIT");
 
     return {
       ...payment,
       status: "paid",
-      subscription_expires_at: expiresAt,
+      next_billing_at: nextBillingAt,
+current_period_end: periodEnd,
     };
   } catch (err) {
     await client.query("ROLLBACK");
@@ -498,13 +532,16 @@ export const getMySubscription = async (req, res) => {
     const userRes = await pool.query(
       `
       SELECT 
-        subscription_plan,
-        subscription_status,
-        subscription_expires_at,
-        free_listing_limit
-      FROM users
-      WHERE unique_id = $1
-      LIMIT 1
+  subscription_plan,
+  subscription_status,
+  subscription_expires_at,
+  current_period_end,
+  next_billing_at,
+  cancel_at_period_end,
+  free_listing_limit
+FROM users
+WHERE unique_id = $1
+LIMIT 1
       `,
       [userId],
     );
@@ -537,11 +574,14 @@ export const getMySubscription = async (req, res) => {
     return res.json({
       success: true,
       subscription: {
-        plan: user.subscription_plan || "free",
-        status: user.subscription_status || "inactive",
-        expires_at: user.subscription_expires_at,
-        free_listing_limit: user.free_listing_limit || 3,
-      },
+  plan: user.subscription_plan || "free",
+  status: user.subscription_status || "inactive",
+  expires_at: user.subscription_expires_at,
+  current_period_end: user.current_period_end,
+  next_billing_at: user.next_billing_at,
+  cancel_at_period_end: user.cancel_at_period_end || false,
+  free_listing_limit: user.free_listing_limit || 3,
+},
       latest_payment: paymentRes.rows[0] || null,
     });
   } catch (err) {
@@ -549,6 +589,181 @@ export const getMySubscription = async (req, res) => {
 
     return res.status(500).json({
       message: "Failed to fetch subscription",
+      details: err.message,
+    });
+  }
+};
+
+
+
+export const cancelMySubscription = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const userRes = await pool.query(
+      `
+      SELECT 
+        subscription_plan,
+        subscription_status,
+        current_period_end,
+        next_billing_at,
+        cancel_at_period_end
+      FROM users
+      WHERE unique_id = $1
+      LIMIT 1
+      `,
+      [userId],
+    );
+
+    const user = userRes.rows[0];
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.subscription_status !== "active") {
+      return res.status(400).json({
+        message: "You do not have an active subscription to cancel.",
+      });
+    }
+
+    if (user.cancel_at_period_end === true) {
+      return res.json({
+        success: true,
+        message: "Your subscription is already scheduled for cancellation.",
+        subscription: {
+          plan: user.subscription_plan,
+          status: user.subscription_status,
+          cancel_at_period_end: true,
+          current_period_end: user.current_period_end,
+          next_billing_at: null,
+        },
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET cancel_at_period_end = TRUE,
+          next_billing_at = NULL
+      WHERE unique_id = $1
+      RETURNING 
+        subscription_plan,
+        subscription_status,
+        subscription_expires_at,
+        current_period_end,
+        next_billing_at,
+        cancel_at_period_end
+      `,
+      [userId],
+    );
+
+    return res.json({
+      success: true,
+      message:
+        "Subscription cancelled. Your plan will remain active until the end of the current billing period.",
+      subscription: {
+        plan: result.rows[0].subscription_plan,
+        status: result.rows[0].subscription_status,
+        expires_at: result.rows[0].subscription_expires_at,
+        current_period_end: result.rows[0].current_period_end,
+        next_billing_at: result.rows[0].next_billing_at,
+        cancel_at_period_end: result.rows[0].cancel_at_period_end,
+      },
+    });
+  } catch (err) {
+    console.error("Cancel subscription error:", err);
+
+    return res.status(500).json({
+      message: "Failed to cancel subscription",
+      details: err.message,
+    });
+  }
+};
+
+
+export const reactivateMySubscription = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const userRes = await pool.query(
+      `
+      SELECT 
+        subscription_plan,
+        subscription_status,
+        current_period_end,
+        subscription_expires_at,
+        cancel_at_period_end
+      FROM users
+      WHERE unique_id = $1
+      LIMIT 1
+      `,
+      [userId],
+    );
+
+    const user = userRes.rows[0];
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.subscription_status !== "active") {
+      return res.status(400).json({
+        message: "You do not have an active subscription to reactivate.",
+      });
+    }
+
+    if (!user.cancel_at_period_end) {
+      return res.status(400).json({
+        message: "Your subscription is already active and renewing.",
+      });
+    }
+
+    const nextBillingAt =
+      user.current_period_end || user.subscription_expires_at;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET cancel_at_period_end = FALSE,
+          next_billing_at = $1
+      WHERE unique_id = $2
+      RETURNING 
+        subscription_plan,
+        subscription_status,
+        subscription_expires_at,
+        current_period_end,
+        next_billing_at,
+        cancel_at_period_end
+      `,
+      [nextBillingAt, userId],
+    );
+
+    return res.json({
+      success: true,
+      message: "Subscription reactivated. Automatic renewal is now enabled.",
+      subscription: {
+        plan: result.rows[0].subscription_plan,
+        status: result.rows[0].subscription_status,
+        expires_at: result.rows[0].subscription_expires_at,
+        current_period_end: result.rows[0].current_period_end,
+        next_billing_at: result.rows[0].next_billing_at,
+        cancel_at_period_end: result.rows[0].cancel_at_period_end,
+      },
+    });
+  } catch (err) {
+    console.error("Reactivate subscription error:", err);
+
+    return res.status(500).json({
+      message: "Failed to reactivate subscription",
       details: err.message,
     });
   }

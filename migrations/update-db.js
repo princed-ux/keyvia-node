@@ -1,5 +1,5 @@
 // update-db.js
-import { pool } from "./db.js"; // Make sure this path points to your actual db.js file
+import { pool } from "../db.js"; // Make sure this path points to your actual db.js file
 
 const updateDatabase = async () => {
   try {

@@ -1,4 +1,5 @@
 import express from "express";
+
 import {
   getListings,
   getListingByProductId,
@@ -14,37 +15,43 @@ import {
   batchAnalyzeListings,
 } from "../controllers/listingsController.js";
 
-// ✅ IMPORT optionalAuth HERE
 import {
   authenticateToken,
   optionalAuth,
   verifyAdmin,
 } from "../middleware/authMiddleware.js";
-import { upload } from "../middleware/upload.js";
+
 import { validateListingInput } from "../middleware/inputValidation.js";
 
 const router = express.Router();
 
 /* ============================================================
-   1. PUBLIC & STATIC ROUTES
+   KEYVIA LISTINGS ROUTES
+   Direct-to-S3 flow:
+   - Frontend uploads media directly to S3 first
+   - Frontend sends JSON metadata to these routes
+   - No multer needed here
 ============================================================ */
 
-// ✅ 1. Homepage / Search Feed
-// CHANGED: authenticateToken -> optionalAuth
-// This allows guests to view listings without a 401 error.
-// If a token IS present, it attaches the user so 'is_favorited' works.
+/* ============================================================
+   1. PUBLIC / STATIC ROUTES
+   Keep these BEFORE "/:product_id"
+============================================================ */
+
+// Homepage / public search feed
 router.get("/public", optionalAuth, getListings);
 
-// ✅ 2. Agent Portfolio (Protected - Agent viewing their own)
+// Logged-in user's own listings
+// Name is still "agent", but this supports agent / owner / brokerage owner
 router.get("/agent", authenticateToken, getAgentListings);
 
-// ✅ 3. Public Agent Profile (Publicly accessible)
+// Public agent / owner / brokerage profile
 router.get("/public/agent/:unique_id", getPublicAgentProfile);
 
-// ✅ 4. Admin Dashboard
+// Admin listing dashboard
 router.get("/admin/all", authenticateToken, verifyAdmin, getAllListingsAdmin);
 
-// ✅ 5. AI Analysis (Admin)
+// Admin bulk AI listing analysis
 router.post(
   "/admin/analyze-all",
   authenticateToken,
@@ -53,51 +60,23 @@ router.post(
 );
 
 /* ============================================================
-   2. CRUD OPERATIONS (Create, Read, Update, Delete)
+   2. CREATE LISTING
 ============================================================ */
 
-// ✅ Create Listing (Async) - WITH INPUT VALIDATION
+// Create listing after direct S3 upload metadata is ready
 router.post(
   "/",
   authenticateToken,
   validateListingInput,
-  upload.fields([
-    { name: "photos", maxCount: 15 },
-    { name: "video_file", maxCount: 1 },
-    { name: "virtual_file", maxCount: 1 },
-  ]),
   createListing,
 );
 
-// ✅ Get Single Listing (Details Page)
-// CHANGED: authenticateToken -> optionalAuth
-// Guests should be able to see property details too!
-router.get("/:product_id", optionalAuth, getListingByProductId);
-
-// ✅ Update Listing - WITH INPUT VALIDATION
-router.put(
-  "/:product_id",
-  authenticateToken,
-  validateListingInput,
-  upload.fields([
-    { name: "photos", maxCount: 15 },
-    { name: "video_file", maxCount: 1 },
-    { name: "virtual_file", maxCount: 1 },
-  ]),
-  updateListing,
-);
-
-// ✅ Delete Listing
-router.delete("/:product_id", authenticateToken, deleteListing);
-
-// ✅ Activate Listing (After Payment)
-router.put("/:product_id/activate", authenticateToken, activateListing);
-
 /* ============================================================
-   3. ADMIN & ANALYSIS ACTIONS
+   3. LISTING ACTION ROUTES
+   Put action routes before "/:product_id" for safety
 ============================================================ */
 
-// Single Analysis
+// Single AI analysis
 router.post(
   "/:product_id/analyze",
   authenticateToken,
@@ -105,7 +84,7 @@ router.post(
   analyzeListing,
 );
 
-// Status Updates
+// Update listing status manually from admin
 router.put(
   "/:product_id/status",
   authenticateToken,
@@ -113,24 +92,56 @@ router.put(
   updateListingStatus,
 );
 
+// Approve listing
 router.put(
   "/:product_id/approve",
   authenticateToken,
   verifyAdmin,
   (req, res, next) => {
     req.body.status = "approved";
-    updateListingStatus(req, res, next);
+    return updateListingStatus(req, res, next);
   },
 );
 
+// Reject listing
 router.put(
   "/:product_id/reject",
   authenticateToken,
   verifyAdmin,
   (req, res, next) => {
     req.body.status = "rejected";
-    updateListingStatus(req, res, next);
+    return updateListingStatus(req, res, next);
   },
+);
+
+// Activate listing after payment
+router.put(
+  "/:product_id/activate",
+  authenticateToken,
+  activateListing,
+);
+
+/* ============================================================
+   4. SINGLE LISTING CRUD
+   Keep these near the bottom because "/:product_id" is dynamic
+============================================================ */
+
+// Get single listing
+router.get("/:product_id", optionalAuth, getListingByProductId);
+
+// Update listing
+router.put(
+  "/:product_id",
+  authenticateToken,
+  validateListingInput,
+  updateListing,
+);
+
+// Delete listing
+router.delete(
+  "/:product_id",
+  authenticateToken,
+  deleteListing,
 );
 
 export default router;

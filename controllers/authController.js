@@ -32,41 +32,61 @@ const signAccessToken = (user) => {
   );
 };
 
+
+const buildPublicMediaUrl = (value) => {
+  if (!value) return null;
+
+  const raw = String(value);
+
+  if (raw.startsWith("http://") || raw.startsWith("https://")) {
+    return raw;
+  }
+
+  if (process.env.MEDIA_CDN_URL) {
+    return `${process.env.MEDIA_CDN_URL.replace(/\/$/, "")}/${raw.replace(/^\/+/, "")}`;
+  }
+
+  return `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${raw.replace(/^\/+/, "")}`;
+};
+
 // ================= ROLE HELPERS =================
-const mapRoleToEnum = (role, agent_type = null) => {
-  switch (role) {
-    case "Buyer":
+const mapRoleToEnum = (role) => {
+  switch (String(role || "").toLowerCase()) {
     case "buyer":
-      return "Buyer";
-    case "BrokerageOwner":
+      return "buyer";
     case "brokerage":
-      return "BrokerageOwner";
-    case "AgencyAgent":
-    case "IndependentAgent":
+    case "brokerage_owner":
+      return "brokerage_owner";
     case "agent":
-      return agent_type === "solo" ? "IndependentAgent" : "AgencyAgent";
+    case "agencyagent":
+    case "independentagent":
+      return "agent";
     case "owner":
-      return "landlord";
+    case "landlord":
+      return "owner";
+    case "admin":
+      return "admin";
+    case "superadmin":
+    case "super_admin":
+      return "super_admin";
     default:
-      return role;
+      return "pending";
   }
 };
 
 const mapEnumToRole = (dbRole) => {
-  switch (dbRole) {
-    case "Buyer":
+  switch (String(dbRole || "").toLowerCase()) {
+    case "buyer":
       return "buyer";
-    case "Landlord":
-    case "landlord":
+    case "owner":
       return "owner";
-    case "BrokerageOwner":
+    case "brokerage_owner":
       return "brokerage";
-    case "AgencyAgent":
-    case "IndependentAgent":
+    case "agent":
       return "agent";
-    case "Admin":
+    case "admin":
       return "admin";
-    case "SuperAdmin":
+    case "super_admin":
       return "superadmin";
     default:
       return String(dbRole || "").toLowerCase();
@@ -1160,28 +1180,46 @@ export const finishOnboarding = async (req, res) => {
       }
     }
 
+
+    
+
     const specialId = currentUser.special_id || generateSpecialId(normalizedRole);
 
-    let avatarUrl = null;
-    let documentUrl = null;
+const docFolder =
+  normalizedRole === "agent"
+    ? "documents/agents"
+    : normalizedRole === "brokerage"
+      ? "documents/brokerages"
+      : "documents/owners";
 
-    if (avatarFile) {
-      avatarUrl = await uploadToS3(avatarFile, "avatars");
-    }
+let avatarUrl = null;
+let documentUrl = null;
 
-    const docFolder =
-      normalizedRole === "agent"
-        ? "documents/agents"
-        : normalizedRole === "brokerage"
-          ? "documents/brokerages"
-          : "documents/owners";
+if (avatarFile) {
+  const avatarUpload = await uploadToS3(avatarFile, "profiles/avatars", {
+    visibility: "semi-public",
+  });
 
-    documentUrl = await uploadToS3(documentFile, docFolder);
+  avatarUrl = buildPublicMediaUrl(
+  avatarUpload.url ||
+    avatarUpload.s3_url ||
+    avatarUpload.Location ||
+    avatarUpload.key ||
+    avatarUpload.s3_key
+);
 
-    const docColumn =
-      normalizedRole === "agent" || normalizedRole === "brokerage"
-        ? "license_document_url"
-        : "identity_document_url";
+}
+
+const documentUpload = await uploadToS3(documentFile, docFolder, {
+  visibility: "private",
+});
+
+documentUrl = documentUpload.key || documentUpload.s3_key || null;
+
+const docColumn =
+  normalizedRole === "agent" || normalizedRole === "brokerage"
+    ? "license_document_url"
+    : "identity_document_url";
 
     await client.query(
       `
@@ -1405,6 +1443,9 @@ export const finishOnboarding = async (req, res) => {
     client.release();
   }
 };
+
+
+
 
 // ===================================================
 // 13. DELETE TEST USER

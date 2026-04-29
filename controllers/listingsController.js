@@ -1,5 +1,6 @@
 import { pool } from "../db.js";
-import cloudinary from "../utils/cloudinary.js";
+import { uploadToS3, s3 } from "../middleware/upload.js";
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import crypto from "crypto";
 import axios from "axios";
 import { performFullAnalysis } from "../services/analysisService.js";
@@ -12,142 +13,274 @@ function generateProductId() {
   return "PRD-" + crypto.randomUUID().split("-")[0].toUpperCase();
 }
 
-function genAssetId(prefix = "asset") {
-  return `${prefix}_${crypto.randomUUID().split("-")[0]}`;
-}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ✅ HELPER: Sleep function for rate limiting
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const toNumberOrNull = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
 
-// ✅ ROBUST GEOCODING HELPER (With Retry Logic)
+const safeJsonParse = (value, fallback = []) => {
+  if (!value) return fallback;
+  if (Array.isArray(value)) return value;
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+
+const normalizeFeatures = (features) => {
+  let featuresArr = [];
+
+  try {
+    if (features) {
+      featuresArr = typeof features === "string" ? JSON.parse(features) : features;
+
+      if (!Array.isArray(featuresArr) && typeof featuresArr === "object") {
+        featuresArr = Object.keys(featuresArr).filter((key) => featuresArr[key]);
+      }
+    }
+  } catch {
+    featuresArr = [];
+  }
+
+  return Array.isArray(featuresArr) ? featuresArr : [];
+};
+
+const normalizeExistingPhotos = (existing = []) => {
+  const parsed = safeJsonParse(existing, []);
+
+  return parsed
+    .map((photo) => {
+      if (!photo) return null;
+
+      if (typeof photo === "string") {
+        return {
+          url: photo,
+          key: null,
+          public_id: null,
+          type: "image",
+          provider: "legacy",
+        };
+      }
+
+      return {
+        url: photo.url || photo.secure_url || null,
+        key: photo.key || photo.s3_key || null,
+        public_id: photo.public_id || photo.publicId || photo.key || photo.s3_key || null,
+        type: photo.type || "image",
+        provider: photo.provider || (photo.key || photo.s3_key ? "s3" : "legacy"),
+        bucket: photo.bucket || null,
+      };
+    })
+    .filter(Boolean);
+};
+
+const normalizePhotosForResponse = (photosValue) => {
+  return normalizeExistingPhotos(photosValue).map((photo) => ({
+    ...photo,
+    url: photo.url || photo,
+    type: photo.type || "image",
+  }));
+};
+
+/* ----------------- AWS S3 MEDIA HELPERS ----------------- */
+
+const AWS_S3_BUCKET = process.env.AWS_S3_BUCKET;
+const LISTING_UPLOAD_CONCURRENCY = Number(process.env.LISTING_UPLOAD_CONCURRENCY || 3);
+const LISTING_PHOTO_LIMITS = {
+  free: 25,
+  basic: 25,
+
+  pro: 65,
+  pro_agent: 65,
+  professional: 65,
+
+  elite: 100,
+  elite_agent: 100,
+  plus: 100,
+
+  brokerage: 150,
+  brokerage_basic: 75,
+  brokerage_pro: 150,
+  brokerage_elite: 250,
+  enterprise: 250,
+};
+
+const getListingPhotoLimit = (user = {}) => {
+  const plan = String(
+    user.subscription_plan ||
+      user.plan ||
+      user.account_plan ||
+      "free",
+  ).toLowerCase();
+
+  return LISTING_PHOTO_LIMITS[plan] || 25;
+};
+
+const isVideoFile = (file) => String(file?.mimetype || "").startsWith("video/");
+const isImageFile = (file) => String(file?.mimetype || "").startsWith("image/");
+
+const chunkArray = (arr = [], size = 3) => {
+  const chunks = [];
+
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+
+  return chunks;
+};
+
+const uploadListingImageToS3 = async (file, listingId) => {
+  if (!file) return null;
+
+  if (!isImageFile(file)) {
+    throw new Error(`Invalid image file type: ${file.mimetype}`);
+  }
+
+  const uploaded = await uploadToS3(file, `listings/${listingId}/photos`, {
+    visibility: "public",
+    cacheControl: "public, max-age=31536000, immutable",
+  });
+
+  return {
+    url: uploaded.url,
+    key: uploaded.key,
+    public_id: uploaded.key,
+    type: "image",
+    provider: "s3",
+    bucket: uploaded.bucket,
+  };
+};
+
+const uploadListingVideoToS3 = async (file, listingId, kind = "video") => {
+  if (!file) return null;
+
+  if (!isVideoFile(file)) {
+    throw new Error(`Invalid video file type: ${file.mimetype}`);
+  }
+
+  const folder =
+    kind === "virtual_tour"
+      ? `listings/${listingId}/virtual-tours`
+      : `listings/${listingId}/videos`;
+
+  const uploaded = await uploadToS3(file, folder, {
+    visibility: "public",
+    cacheControl: "public, max-age=31536000, immutable",
+  });
+
+  return {
+    url: uploaded.url,
+    key: uploaded.key,
+    public_id: uploaded.key,
+    type: "video",
+    provider: "s3",
+    bucket: uploaded.bucket,
+  };
+};
+
+const deleteS3Asset = async (key) => {
+  if (!key || !AWS_S3_BUCKET) return;
+
+  try {
+    await s3.send(
+      new DeleteObjectCommand({
+        Bucket: AWS_S3_BUCKET,
+        Key: key,
+      }),
+    );
+  } catch (err) {
+    console.warn("⚠️ Failed to delete S3 asset:", key, err.message);
+  }
+};
+
+const deleteListingAsset = async (asset) => {
+  if (!asset) return;
+
+  const key =
+    typeof asset === "string"
+      ? asset
+      : asset.key || asset.s3_key || asset.public_id || null;
+
+  if (!key) return;
+
+  await deleteS3Asset(key);
+};
+
+const uploadPhotosWithLimit = async (photoFiles = [], listingId, photoLimit = 25) => {
+  const uploadedPhotos = [];
+  const validPhotos = photoFiles.filter(Boolean).slice(0, photoLimit);
+  const chunks = chunkArray(validPhotos, LISTING_UPLOAD_CONCURRENCY);
+
+  for (const chunk of chunks) {
+    const results = await Promise.allSettled(
+      chunk.map((file) => uploadListingImageToS3(file, listingId)),
+    );
+
+    for (const result of results) {
+      if (result.status === "fulfilled" && result.value) {
+        uploadedPhotos.push(result.value);
+      } else {
+        console.error("❌ Photo upload failed:", result.reason?.message || result.reason);
+      }
+    }
+  }
+
+  return uploadedPhotos;
+};
+
+/* ----------------- geocoding ----------------- */
+
 const processGeolocation = async (address, city, state, country, zip) => {
   const userAgent = "KeyviaApp/1.0";
-  let queryParts = [address, city, state, zip, country].filter(Boolean);
-  if (queryParts.length === 0) return null;
+  const queryParts = [address, city, state, zip, country].filter(Boolean);
+  if (!queryParts.length) return null;
 
-  let query = queryParts.join(", ");
+  const query = queryParts.join(", ");
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await sleep(1000 * attempt); // Wait 1s, 2s, 3s
-      let url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&addressdetails=1&limit=1`;
-      let res = await axios.get(url, { headers: { "User-Agent": userAgent } });
+      await sleep(1000 * attempt);
+
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
+        query,
+      )}&addressdetails=1&limit=1`;
+
+      const res = await axios.get(url, {
+        headers: { "User-Agent": userAgent },
+        timeout: 10000,
+      });
 
       if (res.data && res.data.length > 0) {
         const result = res.data[0];
         console.log("✅ Location found:", result.display_name);
-        return { lat: parseFloat(result.lat), lng: parseFloat(result.lon) };
+
+        return {
+          lat: parseFloat(result.lat),
+          lng: parseFloat(result.lon),
+        };
       }
+
       return null;
     } catch (error) {
-      if (error.response && error.response.status === 429) {
-        console.warn(`⏳ Geocoding rate limit hit. Retrying in ${attempt}s...`);
+      if (error.response?.status === 429) {
+        console.warn(`⏳ Geocoding rate limit hit. Retrying attempt ${attempt}/3...`);
       } else {
         console.error("❌ Geocoding API Error:", error.message);
         if (attempt === 3) return null;
       }
     }
   }
+
   return null;
 };
 
-const uploadImageFileToCloudinary = async (file) => {
-  try {
-    const public_id = genAssetId("img");
-    return await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          public_id,
-          folder: "listings",
-          resource_type: "image",
-          overwrite: false,
-        },
-        (error, result) => {
-          if (error) return reject(error);
-          resolve({
-            url: result.secure_url,
-            public_id: result.public_id,
-            type: "image",
-          });
-        },
-      );
-      stream.end(file.buffer);
-    });
-  } catch (err) {
-    throw err;
-  }
-};
+/* ----------------- background workers ----------------- */
 
-async function uploadVideoFileToCloudinary(file) {
-  try {
-    const public_id = genAssetId("vid");
-    return await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          public_id,
-          folder: "listings",
-          resource_type: "video",
-          overwrite: false,
-        },
-        async (error, result) => {
-          if (error) return reject(error);
-          if (result.duration && result.duration > 90) {
-            await cloudinary.uploader.destroy(result.public_id, {
-              resource_type: "video",
-            });
-            return reject(
-              new Error("Video too long. Max allowed is 90 seconds."),
-            );
-          }
-          resolve({
-            url: result.secure_url,
-            public_id: result.public_id,
-            type: "video",
-          });
-        },
-      );
-      stream.end(file.buffer);
-    });
-  } catch (err) {
-    throw err;
-  }
-}
-
-async function deleteCloudinaryAsset(public_id, type = "image") {
-  if (!public_id) return;
-  try {
-    await cloudinary.uploader.destroy(public_id, {
-      resource_type: type === "video" ? "video" : "image",
-    });
-  } catch (e) {
-    console.warn("⚠ Failed to delete Cloudinary asset:", public_id);
-  }
-}
-
-function normalizeExistingPhotos(existing = []) {
-  if (!existing) return [];
-  if (!Array.isArray(existing)) {
-    try {
-      existing = JSON.parse(existing);
-    } catch {
-      return [];
-    }
-  }
-  return existing
-    .map((p) => {
-      if (!p) return null;
-      if (typeof p === "string")
-        return { url: p, public_id: null, type: "image" };
-      return {
-        url: p.url || p.secure_url || null,
-        public_id: p.public_id || p.publicId || null,
-        type: p.type || "image",
-      };
-    })
-    .filter(Boolean);
-}
-
-// ✅ BACKGROUND PROCESSOR (Handles Uploads & Geocoding)
 const runBackgroundProcessing = async (
   listingId,
   photoFiles,
@@ -155,47 +288,46 @@ const runBackgroundProcessing = async (
   videoFile,
   virtualFile,
 ) => {
-  console.log(`⚙️ Background processing started for ${listingId}...`);
+  console.log(`⚙️ AWS background processing started for ${listingId}...`);
 
   try {
-    // 1. Process Photos (Parallel Uploads - 3 at a time)
-    const uploadedPhotos = [];
-    for (let i = 0; i < photoFiles.length; i += 3) {
-      const chunk = photoFiles.slice(i, i + 3);
-      const results = await Promise.all(
-        chunk.map((file) => uploadImageFileToCloudinary(file)),
-      );
-      uploadedPhotos.push(...results);
-    }
+    const uploadedPhotos = await uploadPhotosWithLimit(photoFiles, listingId, 25);
 
-    // 2. Process Video
-    let finalVideoUrl = null,
-      finalVideoPublicId = null;
+    let finalVideoUrl = null;
+    let finalVideoKey = null;
+
     if (videoFile) {
       try {
-        const vid = await uploadVideoFileToCloudinary(videoFile);
-        finalVideoUrl = vid.url;
-        finalVideoPublicId = vid.public_id;
-      } catch (e) {
-        console.error("Video upload failed", e);
+        const uploadedVideo = await uploadListingVideoToS3(videoFile, listingId, "video");
+        finalVideoUrl = uploadedVideo?.url || null;
+        finalVideoKey = uploadedVideo?.key || null;
+      } catch (err) {
+        console.error("❌ Video upload failed:", err.message);
       }
     }
 
-    // 3. Process Virtual Tour
-    let finalVirtualUrl = null,
-      finalVirtualPublicId = null;
+    let finalVirtualUrl = null;
+    let finalVirtualKey = null;
+
     if (virtualFile) {
       try {
-        const tour = await uploadVideoFileToCloudinary(virtualFile);
-        finalVirtualUrl = tour.url;
-        finalVirtualPublicId = tour.public_id;
-      } catch (e) {
-        console.error("Virtual tour upload failed", e);
+        const uploadedVirtual = await uploadListingVideoToS3(
+          virtualFile,
+          listingId,
+          "virtual_tour",
+        );
+        finalVirtualUrl = uploadedVirtual?.url || null;
+        finalVirtualKey = uploadedVirtual?.key || null;
+      } catch (err) {
+        console.error("❌ Virtual tour upload failed:", err.message);
       }
     }
 
-    // 4. Geocoding
-    let coords = { lat: addressData.lat, lng: addressData.lng };
+    let coords = {
+      lat: addressData?.lat,
+      lng: addressData?.lng,
+    };
+
     if (!coords.lat || !coords.lng) {
       const geo = await processGeolocation(
         addressData.address,
@@ -204,371 +336,106 @@ const runBackgroundProcessing = async (
         addressData.country,
         addressData.zip,
       );
+
       if (geo) coords = geo;
     }
 
-    // 5. Update DB -> Set Status to 'Pending' (Ready for Admin)
     await pool.query(
-      `UPDATE listings 
-SET photos = $1,
-    latitude = $2,
-    longitude = $3, 
-    video_url = $4,
-    video_public_id = $5,
-    virtual_tour_url = $6,
-    virtual_tour_public_id = $7,
-    status = CASE 
-      WHEN status = 'approved' THEN 'approved'
-      ELSE 'pending'
-    END
-WHERE product_id = $8`,
+      `
+      UPDATE listings
+      SET
+        photos = $1,
+        latitude = $2,
+        longitude = $3,
+        video_url = $4,
+        video_public_id = $5,
+        virtual_tour_url = $6,
+        virtual_tour_public_id = $7,
+        status = CASE
+          WHEN status = 'approved' THEN 'approved'
+          ELSE 'pending'
+        END,
+        updated_at = NOW()
+      WHERE product_id = $8
+      `,
       [
         JSON.stringify(uploadedPhotos),
         coords.lat || 0,
         coords.lng || 0,
         finalVideoUrl,
-        finalVideoPublicId,
+        finalVideoKey,
         finalVirtualUrl,
-        finalVirtualPublicId,
+        finalVirtualKey,
         listingId,
       ],
     );
 
-    console.log(
-      `✅ Listing ${listingId} processing complete & ready for review.`,
-    );
+    console.log(`✅ AWS media processing complete for ${listingId}.`);
   } catch (error) {
-    console.error(`❌ Background processing failed for ${listingId}:`, error);
+    console.error(`❌ AWS background processing failed for ${listingId}:`, error);
 
-    // ✅ CRITICAL FIX: Mark listing as failed so it doesn't stay stuck forever
     try {
       await pool.query(
-        `UPDATE listings SET status = 'draft', admin_notes = $1 WHERE product_id = $2`,
-        [
-          `System Error: Upload failed. Please try again. (${error.message})`,
-          listingId,
-        ],
+        `
+        UPDATE listings
+        SET status = 'draft',
+            admin_notes = $1,
+            updated_at = NOW()
+        WHERE product_id = $2
+        `,
+        [`System Error: Upload failed. Please try again. (${error.message})`, listingId],
       );
     } catch (dbErr) {
-      console.error("Failed to update listing status to error:", dbErr);
+      console.error("❌ Failed to mark listing as draft:", dbErr.message);
     }
   }
 };
 
-
-// if (!req.user?.is_verified && req.user?.verification_status !== "approved") {
-//   return res.status(403).json({
-//     error: "You must verify your account before creating listings",
-//   });
-// }
-
-
-/* -------------------------------------------------------
-   🚀 CREATE LISTING (Async High Performance)
-------------------------------------------------------- */
-export const createListing = async (req, res) => {
-  try {
-    // 🔍 DEBUG: See what files are coming in
-    console.log("📂 Incoming Files:", req.files);
-    console.log("📝 Incoming Body:", req.body);
-
-    const userId = req.user?.unique_id;
-    if (!userId) return res.status(401).json({ message: "Unauthorized" });
-
-    // ✅ HARD VERIFICATION GATE
-if (!req.user?.is_verified && req.user?.verification_status !== "approved") {
-  return res.status(403).json({
-    message: "You must verify your account before creating listings.",
-    code: "VERIFICATION_REQUIRED",
-  });
-}
-
-// ✅ SUBSCRIPTION / LISTING LIMIT GATE
-const limitCheck = await enforceListingLimit({ userId });
-
-if (!limitCheck.allowed) {
-  return res.status(403).json({
-    message: limitCheck.message,
-    code: "LISTING_LIMIT_REACHED",
-    current_count: limitCheck.current_count,
-    max_listings: limitCheck.max_listings,
-    plan: limitCheck.plan,
-  });
-}
-
-
-    // Fetch agent email
-    const emailRes = await pool.query(
-      "SELECT email FROM profiles WHERE unique_id=$1",
-      [userId],
-    );
-    if (!emailRes.rows.length)
-      return res.status(400).json({ message: "Agent profile not found" });
-    const agentEmail = emailRes.rows[0].email;
-
-    let {
-      product_id,
-      title,
-      description,
-      price,
-      price_currency,
-      price_period,
-      category,
-      property_type,
-      listing_type,
-      address,
-      city,
-      state,
-      country,
-      zip_code,
-      latitude,
-      longitude,
-      bedrooms,
-      bathrooms,
-      parking,
-      year_built,
-      square_footage,
-      furnishing,
-      lot_size,
-      features,
-      contact_name,
-      contact_email,
-      contact_phone,
-      contact_method,
-    } = req.body;
-
-    // Mapping CamelCase
-    price_currency = price_currency || req.body.priceCurrency;
-    property_type = property_type || req.body.propertyType;
-    listing_type = listing_type || req.body.listingType;
-    contact_name = contact_name || req.body.contactName;
-    contact_email = contact_email || req.body.contactEmail;
-    contact_phone = contact_phone || req.body.contactPhone;
-    contact_method = contact_method || req.body.contactMethod;
-    bedrooms = bedrooms || req.body.bedrooms;
-    bathrooms = bathrooms || req.body.bathrooms;
-    year_built = year_built || req.body.yearBuilt;
-    square_footage = square_footage || req.body.squareFootage;
-    lot_size = lot_size || req.body.lotSize;
-    zip_code = zip_code || req.body.zipCode;
-
-    if (!title || !price || !address) {
-      return res.status(400).json({ message: "Missing required fields." });
-    }
-
-    if (!product_id) product_id = generateProductId();
-
-    let lat = latitude ? Number(latitude) : 0;
-    let lng = longitude ? Number(longitude) : 0;
-
-    let featuresArr = [];
-    try {
-      if (features) {
-        featuresArr =
-          typeof features === "string" ? JSON.parse(features) : features;
-        if (!Array.isArray(featuresArr) && typeof featuresArr === "object") {
-          featuresArr = Object.keys(featuresArr).filter((k) => featuresArr[k]);
-        }
-      }
-    } catch {
-      featuresArr = [];
-    }
-
-    // 🔹 Insert "Shell" Listing (Status: '$32')
-
-
-    // 🔥 RISK EVALUATION
-const riskResult = evaluateListingRisk({
-  listing: {
-    title,
-    description,
-    price,
-    address,
-    city,
-    country,
-    latitude: lat,
-    longitude: lng,
-    photos: req.files?.photos || [],
-  },
-  user: req.user,
-});
-
-// Decide initial moderation state
-let status = "pending";
-let autoPublished = false;
-
-if (riskResult.should_publish_immediately) {
-  status = "approved";
-  autoPublished = true;
-}
-
-
-
-    const query = `
-      INSERT INTO listings (
-        product_id, agent_unique_id, created_by, email,
-        title, description, price, price_currency, price_period,
-        category, property_type, listing_type,
-        address, city, state, country, zip_code,
-        latitude, longitude,
-        bedrooms, bathrooms, parking,
-        year_built, square_footage, furnishing, lot_size,
-        features, photos, video_url, virtual_tour_url,
-        contact_name, contact_email, contact_phone, contact_method,
-        status, is_active, payment_status,
-risk_score, risk_level, risk_flags, auto_published, created_at, updated_at
-      )
-      VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-        $13, $14, $15, $16, $17, 
-        $18, $19,
-        $20, $21, $22, $23, $24, $25, $26, $27, 
-        '[]', null, null,
-        $28, $29, $30, $31,
-$32, $33, $34,
-$35, $36, $37, $38,
-NOW(), NOW()
-      )
-      RETURNING *;
-    `;
-
-    const params = [
-      product_id,
-      userId,
-      userId,
-      agentEmail,
-      title || null,
-      description || null,
-      price ? Number(price) : null,
-      price_currency || "USD",
-      price_period || null,
-      category || null,
-      property_type || null,
-      listing_type || null,
-      address || null,
-      city || null,
-      state || null,
-      country || null,
-      zip_code || null,
-      lat,
-      lng,
-      bedrooms ? Number(bedrooms) : null,
-      bathrooms ? Number(bathrooms) : null,
-      parking || null,
-      year_built ? Number(year_built) : null,
-      square_footage ? Number(square_footage) : null,
-      furnishing || null,
-      lot_size ? Number(lot_size) : null,
-      JSON.stringify(featuresArr),
-      contact_name || null,
-      contact_email || null,
-      contact_phone || null,
-      contact_method || null,
-      status,
-      false,
-      "unpaid",
-      riskResult.score,
-      riskResult.risk_level,
-      JSON.stringify(riskResult.flags),
-      autoPublished,
-    ];
-
-    const result = await pool.query(query, params);
-    const listing = result.rows[0];
-
-    // ⚡ RESPOND IMMEDIATELY
-    res.status(201).json({
-      success: true,
-      message: "Listing created! Media processing in background...",
-      listing: { ...listing, status: "processing", photos: [] },
-    });
-
-    // ⚙️ TRIGGER BACKGROUND WORK
-    const photoFiles = req.files?.photos || [];
-    const videoFile = req.files?.video_file?.[0] || null;
-    const virtualFile = req.files?.virtual_file?.[0] || null;
-
-    // This runs AFTER response is sent
-    runBackgroundProcessing(
-      product_id,
-      photoFiles,
-      { address, city, state, country, zip: zip_code, lat, lng },
-      videoFile,
-      virtualFile,
-    );
-  } catch (err) {
-    console.error("CreateListing Error:", err);
-    if (!res.headersSent) {
-      res.status(500).json({
-        message: "Server Error",
-        code: "CREATE_LISTING_FAIL",
-        details: err?.message,
-      });
-    }
-  }
-};
-
-/* -------------------------------------------------------
-   🚀 HIGH-PERFORMANCE UPDATE LISTING (Async)
-   Returns immediately, processes media/geo in background.
-------------------------------------------------------- */
-
-// ✅ BACKGROUND WORKER FOR UPDATES
-const runUpdateBackgroundProcessing = async (listingId, data) => {
+const runUpdateBackgroundProcessing = async (listingId, data = {}) => {
   const {
-    photoFiles,
-    videoFile,
-    virtualFile,
-    removeList,
-    addressData,
-    addressChanged,
+    photoFiles = [],
+    videoFile = null,
+    virtualFile = null,
+    removeList = [],
+    addressData = {},
+    addressChanged = false,
   } = data;
 
-  console.log(`⚙️ Background Update started for ${listingId}...`);
+  console.log(`⚙️ AWS background update started for ${listingId}...`);
 
   try {
-    // 1. Cloudinary Deletions (Parallel & Non-blocking)
     if (removeList.length > 0) {
-      Promise.all(
-        removeList.map((pid) => deleteCloudinaryAsset(pid, "image")),
-      ).catch((e) => console.warn("Del failed", e));
-    }
-
-    // 2. Upload New Photos
-    const uploadedPhotos = [];
-    for (let i = 0; i < photoFiles.length; i += 3) {
-      const chunk = photoFiles.slice(i, i + 3);
-      const results = await Promise.all(
-        chunk.map((file) => uploadImageFileToCloudinary(file)),
+      Promise.allSettled(removeList.map((asset) => deleteListingAsset(asset))).catch((err) =>
+        console.warn("⚠️ Background S3 delete failed:", err.message),
       );
-      uploadedPhotos.push(...results);
     }
 
-    // 3. Upload Video/Virtual Tour
-    let vidUpdates = {};
-    if (videoFile) {
-      try {
-        const up = await uploadVideoFileToCloudinary(videoFile);
-        vidUpdates.video_url = up.url;
-        vidUpdates.video_public_id = up.public_id;
-      } catch (e) {
-        console.error("Video update failed", e);
-      }
-    }
-    if (virtualFile) {
-      try {
-        const up = await uploadVideoFileToCloudinary(virtualFile);
-        vidUpdates.virtual_tour_url = up.url;
-        vidUpdates.virtual_tour_public_id = up.public_id;
-      } catch (e) {
-        console.error("Virtual update failed", e);
-      }
+    const uploadedPhotos = await uploadPhotosWithLimit(photoFiles, listingId, 25);
+
+    const currentRes = await pool.query("SELECT photos FROM listings WHERE product_id = $1", [
+      listingId,
+    ]);
+
+    let currentPhotos = normalizeExistingPhotos(currentRes.rows[0]?.photos || []);
+
+    if (removeList.length > 0) {
+      const removeSet = new Set(
+        removeList.map((item) =>
+          typeof item === "string" ? item : item?.key || item?.s3_key || item?.public_id,
+        ),
+      );
+
+      currentPhotos = currentPhotos.filter((photo) => {
+        const key = photo.key || photo.s3_key || photo.public_id;
+        return !removeSet.has(key);
+      });
     }
 
-    // 4. Geocoding (Only if address changed)
+    const finalPhotos = [...currentPhotos, ...uploadedPhotos].slice(0, 25);
+
     let geoUpdates = {};
+
     if (addressChanged) {
-      console.log("📍 Address changed, recalculating coordinates...");
       const coords = await processGeolocation(
         addressData.address,
         addressData.city,
@@ -576,168 +443,834 @@ const runUpdateBackgroundProcessing = async (listingId, data) => {
         addressData.country,
         addressData.zip,
       );
+
       if (coords) {
         geoUpdates.latitude = coords.lat;
         geoUpdates.longitude = coords.lng;
       }
     }
 
-    // 5. Final DB Update
-    // Fetch current photos to append new ones
-    const currentRes = await pool.query(
-      "SELECT photos FROM listings WHERE product_id=$1",
-      [listingId],
-    );
-    let currentPhotos = currentRes.rows[0]?.photos || [];
-    if (typeof currentPhotos === "string")
-      currentPhotos = JSON.parse(currentPhotos);
+    let videoUpdates = {};
 
-    const finalPhotos = [...currentPhotos, ...uploadedPhotos];
+    if (videoFile) {
+      try {
+        const uploadedVideo = await uploadListingVideoToS3(videoFile, listingId, "video");
+        videoUpdates.video_url = uploadedVideo?.url || null;
+        videoUpdates.video_public_id = uploadedVideo?.key || null;
+      } catch (err) {
+        console.error("❌ Video update upload failed:", err.message);
+      }
+    }
 
-    // Dynamic SQL Building
-    let fields = ["photos=$1", "updated_at=NOW()"];
-    let values = [JSON.stringify(finalPhotos)];
+    if (virtualFile) {
+      try {
+        const uploadedVirtual = await uploadListingVideoToS3(
+          virtualFile,
+          listingId,
+          "virtual_tour",
+        );
+        videoUpdates.virtual_tour_url = uploadedVirtual?.url || null;
+        videoUpdates.virtual_tour_public_id = uploadedVirtual?.key || null;
+      } catch (err) {
+        console.error("❌ Virtual tour update upload failed:", err.message);
+      }
+    }
+
+    const fields = ["photos = $1", "updated_at = NOW()"];
+    const values = [JSON.stringify(finalPhotos)];
     let idx = 2;
 
-    if (geoUpdates.latitude) {
-      fields.push(`latitude=$${idx++}`, `longitude=$${idx++}`);
-      values.push(geoUpdates.latitude, geoUpdates.longitude);
+    if (geoUpdates.latitude && geoUpdates.longitude) {
+      fields.push(`latitude = $${idx++}`);
+      values.push(geoUpdates.latitude);
+
+      fields.push(`longitude = $${idx++}`);
+      values.push(geoUpdates.longitude);
     }
-    if (vidUpdates.video_url) {
-      fields.push(`video_url=$${idx++}`, `video_public_id=$${idx++}`);
-      values.push(vidUpdates.video_url, vidUpdates.video_public_id);
+
+    if (videoUpdates.video_url) {
+      fields.push(`video_url = $${idx++}`);
+      values.push(videoUpdates.video_url);
+
+      fields.push(`video_public_id = $${idx++}`);
+      values.push(videoUpdates.video_public_id);
     }
-    if (vidUpdates.virtual_tour_url) {
-      fields.push(
-        `virtual_tour_url=$${idx++}`,
-        `virtual_tour_public_id=$${idx++}`,
-      );
-      values.push(
-        vidUpdates.virtual_tour_url,
-        vidUpdates.virtual_tour_public_id,
-      );
+
+    if (videoUpdates.virtual_tour_url) {
+      fields.push(`virtual_tour_url = $${idx++}`);
+      values.push(videoUpdates.virtual_tour_url);
+
+      fields.push(`virtual_tour_public_id = $${idx++}`);
+      values.push(videoUpdates.virtual_tour_public_id);
     }
 
     values.push(listingId);
 
-    // We explicitly DO NOT set status='approved' here. It stays 'pending' from the main controller.
     await pool.query(
-      `UPDATE listings SET ${fields.join(", ")} WHERE product_id=$${idx}`,
+      `
+      UPDATE listings
+      SET ${fields.join(", ")}
+      WHERE product_id = $${idx}
+      `,
       values,
     );
 
-    console.log(`✅ Listing ${listingId} background update complete.`);
+    console.log(`✅ AWS listing update processing complete for ${listingId}.`);
   } catch (err) {
-    console.error(`❌ Background update failed for ${listingId}`, err);
+    console.error(`❌ AWS background update failed for ${listingId}:`, err);
+
+    try {
+      await pool.query(
+        `
+        UPDATE listings
+        SET admin_notes = $1,
+            updated_at = NOW()
+        WHERE product_id = $2
+        `,
+        [`System Error: Media update failed. (${err.message})`, listingId],
+      );
+    } catch (dbErr) {
+      console.error("❌ Failed to save update failure note:", dbErr.message);
+    }
   }
 };
 
+const runDeleteBackgroundCleanup = async (assets = []) => {
+  console.log(`🗑️ Starting AWS cleanup for ${assets.length} assets...`);
+
+  try {
+    const results = await Promise.allSettled(assets.map((asset) => deleteListingAsset(asset)));
+    const failed = results.filter((result) => result.status === "rejected");
+
+    if (failed.length) {
+      console.warn(`⚠️ ${failed.length} S3 assets failed to delete.`);
+    }
+
+    console.log("✅ AWS background cleanup complete.");
+  } catch (err) {
+    console.error("❌ AWS background cleanup error:", err.message);
+  }
+};
+
+
+
+
+/* -------------------------------------------------------
+   CREATE LISTING
+------------------------------------------------------- */
+export const createListing = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const userRes = await pool.query(
+      `
+      SELECT
+        unique_id,
+        email,
+        name,
+        role,
+        verification_status,
+        is_verified,
+        is_verified_agent,
+        is_banned,
+        subscription_plan,
+        subscription_status
+      FROM users
+      WHERE unique_id = $1::uuid
+      LIMIT 1;
+      `,
+      [String(userId)],
+    );
+
+    const currentUser = userRes.rows[0];
+
+    if (!currentUser) {
+      return res.status(401).json({
+        message: "User account not found.",
+        code: "USER_NOT_FOUND",
+      });
+    }
+
+    const photoLimit = getListingPhotoLimit(currentUser);
+
+    if (currentUser.is_banned) {
+      return res.status(403).json({
+        message: "Your account is restricted from creating listings.",
+        code: "ACCOUNT_RESTRICTED",
+      });
+    }
+
+    const verificationStatus = String(
+      currentUser.verification_status || req.user?.verification_status || "",
+    ).toLowerCase();
+
+    const isVerifiedUser =
+      currentUser.is_verified === true ||
+      verificationStatus === "approved" ||
+      verificationStatus === "verified";
+
+    if (!isVerifiedUser) {
+      return res.status(403).json({
+        message: "You must complete verification before creating listings.",
+        code: "VERIFICATION_REQUIRED",
+      });
+    }
+
+    const allowedListingRoles = new Set([
+      "agent",
+      "owner",
+      "brokerage_owner",
+      "admin",
+      "super_admin",
+    ]);
+
+    const role = String(currentUser.role || req.user?.role || "").toLowerCase();
+
+    if (!allowedListingRoles.has(role)) {
+      return res.status(403).json({
+        message: "Your account role cannot create property listings.",
+        code: "ROLE_NOT_ALLOWED",
+      });
+    }
+
+    const limitCheck = await enforceListingLimit({ userId });
+
+    if (!limitCheck.allowed) {
+      return res.status(403).json({
+        message: limitCheck.message,
+        code: "LISTING_LIMIT_REACHED",
+      });
+    }
+
+    const b = req.body;
+
+    if (!b.title || !b.price || !b.address) {
+      return res.status(400).json({
+        message: "Missing required fields.",
+        code: "MISSING_REQUIRED_FIELDS",
+      });
+    }
+
+    const price = toNumberOrNull(b.price);
+
+    if (!price || price <= 0) {
+      return res.status(400).json({
+        message: "Invalid listing price.",
+        code: "INVALID_PRICE",
+      });
+    }
+
+    const product_id = generateProductId();
+
+    const safePhotos = Array.isArray(b.photos)
+      ? b.photos.slice(0, photoLimit)
+      : [];
+
+    const featuresArr = normalizeFeatures(b.features || b.amenities);
+
+    const amenitiesArr = Array.isArray(b.amenities)
+      ? b.amenities
+      : normalizeFeatures(b.amenities);
+
+    const paymentOptions = Array.isArray(b.payment_options)
+      ? b.payment_options
+      : safeJsonParse(b.payment_options, []);
+
+    const preferredTourDays = Array.isArray(b.preferred_tour_days)
+      ? b.preferred_tour_days
+      : safeJsonParse(b.preferred_tour_days, []);
+
+    const latitude = toNumberOrNull(b.latitude);
+    const longitude = toNumberOrNull(b.longitude);
+
+    const areaSqft = toNumberOrNull(
+      b.area_sqft || b.square_footage || b.squareFootage,
+    );
+
+    const landAreaSqft = toNumberOrNull(
+      b.land_area_sqft || b.lot_size || b.lotSize,
+    );
+
+    const videoUrl = b.video?.url || b.video_url || null;
+    const videoKey = b.video?.key || b.video_public_id || null;
+
+    const virtualUrl =
+      b.virtual_tour_file?.url ||
+      b.virtual_tour?.url ||
+      b.virtual_tour_url ||
+      null;
+
+    const virtualKey =
+      b.virtual_tour_file?.key ||
+      b.virtual_tour?.key ||
+      b.virtual_tour_public_id ||
+      null;
+
+    const result = await pool.query(
+      `
+      INSERT INTO listings (
+        product_id,
+        draft_listing_id,
+        uploaded_by_id,
+        created_by,
+        agent_unique_id,
+        agency_id,
+
+        title,
+        description,
+
+        property_type,
+        property_subtype,
+        listing_type,
+        category,
+
+        price,
+        currency,
+        price_currency,
+        price_period,
+
+        estimated_monthly_payment,
+        down_payment_percent,
+        interest_rate_estimate,
+        hoa_fee,
+        service_charge,
+        property_tax_estimate,
+        insurance_estimate,
+        price_per_sqft,
+        price_negotiable,
+        payment_options,
+
+        bedrooms,
+        bathrooms,
+        total_rooms,
+        floors,
+        floor_number,
+        total_floors,
+        garage_spaces,
+        area_sqft,
+        square_footage,
+        land_area_sqft,
+        lot_size,
+        building_area_unit,
+        land_area_unit,
+        year_built,
+        parking,
+        furnishing,
+        property_condition,
+        construction_status,
+        ownership_type,
+
+        address,
+        city,
+        state,
+        country,
+        postal_code,
+        zip_code,
+        neighborhood,
+        estate_name,
+        landmark,
+        road_access,
+
+        latitude,
+        longitude,
+        geom,
+
+        power_supply,
+        water_supply,
+        internet_available,
+        drainage,
+        security_type,
+        generator_available,
+        borehole,
+        prepaid_meter,
+        waste_disposal,
+
+        caution_fee,
+        agency_fee,
+        legal_fee,
+        refundable_deposit,
+        minimum_rent_duration,
+        rent_payment_frequency,
+        pets_policy,
+        smoking_policy,
+        guest_policy,
+
+        mortgage_available,
+        installment_available,
+        rent_to_own_available,
+        closing_cost_estimate,
+
+        title_document_type,
+        title_verified,
+        title_document_file,
+        survey_available,
+        building_approval_available,
+
+        photos,
+        floor_plans,
+        staging_photos,
+        panorama_photos,
+        video_url,
+        video_public_id,
+        virtual_tour_url,
+        virtual_tour_public_id,
+        virtual_tour_file,
+        three_d_home_url,
+
+        allow_tour_requests,
+        allow_video_tour,
+        allow_in_person_tour,
+        preferred_tour_days,
+        preferred_tour_times,
+        minimum_notice_hours,
+
+        availability_status,
+        available_from,
+
+        contact_name,
+        contact_email,
+        contact_phone,
+        contact_method,
+        show_contact_phone,
+
+        features,
+        amenities,
+
+        status,
+        moderation_status,
+        is_active,
+        payment_status,
+        listed_at,
+        last_updated_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,$2,$3::uuid,$3::uuid,$3::uuid,$4,
+
+        $5,$6,
+
+        $7,$8,$9,$10,
+
+        $11,$12,$12,$13,
+
+        $14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb,
+
+        $24,$25,$26,$27,$28,$29,$30,$31,$31,$32,$32,$33,$34,$35,$36,$37,$38,$39,$40,
+
+        $41,$42,$43,$44,$45,$45,$46,$47,$48,$49,
+
+        $50,$51,
+        CASE
+          WHEN $50::numeric IS NOT NULL AND $51::numeric IS NOT NULL
+          THEN ST_SetSRID(ST_MakePoint($51::numeric, $50::numeric), 4326)
+          ELSE NULL
+        END,
+
+        $52,$53,$54,$55,$56,$57,$58,$59,$60,
+
+        $61,$62,$63,$64,$65,$66,$67,$68,$69,
+
+        $70,$71,$72,$73,
+
+        $74,$75,$76::jsonb,$77,$78,
+
+        $79::jsonb,$80::jsonb,$81::jsonb,$82::jsonb,$83,$84,$85,$86,$87::jsonb,$88,
+
+        $89,$90,$91,$92::jsonb,$93,$94,
+
+        $95,$96,
+
+        $97,$98,$99,$100,$101,
+
+        $102::jsonb,$103::jsonb,
+
+        'pending',
+        'pending',
+        false,
+        'unpaid',
+        NOW(),
+        NOW(),
+        NOW(),
+        NOW()
+      )
+      RETURNING *;
+      `,
+      [
+        product_id,
+        b.draft_listing_id || b.draftListingId || product_id,
+        String(userId),
+        b.agency_id || null,
+
+        b.title,
+        b.description || null,
+
+        b.property_type || b.propertyType || null,
+        b.property_subtype || b.propertySubtype || null,
+        b.listing_type || b.listingType || null,
+        b.category || b.listing_type || b.listingType || null,
+
+        price,
+        b.currency || b.price_currency || b.priceCurrency || "USD",
+        b.price_period || b.pricePeriod || null,
+
+        toNumberOrNull(b.estimated_monthly_payment),
+        toNumberOrNull(b.down_payment_percent),
+        toNumberOrNull(b.interest_rate_estimate),
+        toNumberOrNull(b.hoa_fee),
+        toNumberOrNull(b.service_charge),
+        toNumberOrNull(b.property_tax_estimate),
+        toNumberOrNull(b.insurance_estimate),
+        toNumberOrNull(b.price_per_sqft),
+        b.price_negotiable === true,
+        JSON.stringify(paymentOptions),
+
+        toNumberOrNull(b.bedrooms),
+        toNumberOrNull(b.bathrooms),
+        toNumberOrNull(b.total_rooms),
+        toNumberOrNull(b.floors),
+        toNumberOrNull(b.floor_number),
+        toNumberOrNull(b.total_floors),
+        toNumberOrNull(b.garage_spaces),
+        areaSqft,
+        landAreaSqft,
+        b.building_area_unit || "sqft",
+        b.land_area_unit || "sqft",
+        toNumberOrNull(b.year_built || b.yearBuilt),
+        b.parking || null,
+        b.furnishing || null,
+        b.property_condition || null,
+        b.construction_status || null,
+        b.ownership_type || null,
+
+        b.address,
+        b.city || null,
+        b.state || null,
+        b.country || null,
+        b.postal_code || b.zip_code || b.zipCode || null,
+        b.neighborhood || null,
+        b.estate_name || b.estateName || null,
+        b.landmark || null,
+        b.road_access || b.roadAccess || null,
+
+        latitude,
+        longitude,
+
+        b.power_supply || null,
+        b.water_supply || null,
+        b.internet_available === true,
+        b.drainage || null,
+        b.security_type || null,
+        b.generator_available === true,
+        b.borehole === true,
+        b.prepaid_meter === true,
+        b.waste_disposal || null,
+
+        toNumberOrNull(b.caution_fee),
+        toNumberOrNull(b.agency_fee),
+        toNumberOrNull(b.legal_fee),
+        toNumberOrNull(b.refundable_deposit),
+        b.minimum_rent_duration || null,
+        b.rent_payment_frequency || null,
+        b.pets_policy || null,
+        b.smoking_policy || null,
+        b.guest_policy || null,
+
+        b.mortgage_available === true,
+        b.installment_available === true,
+        b.rent_to_own_available === true,
+        toNumberOrNull(b.closing_cost_estimate),
+
+        b.title_document_type || null,
+        false,
+        b.title_document_file ? JSON.stringify(b.title_document_file) : null,
+        b.survey_available === true,
+        b.building_approval_available === true,
+
+        JSON.stringify(safePhotos),
+        JSON.stringify(Array.isArray(b.floor_plans) ? b.floor_plans : []),
+        JSON.stringify(Array.isArray(b.staging_photos) ? b.staging_photos : []),
+        JSON.stringify(Array.isArray(b.panorama_photos) ? b.panorama_photos : []),
+        videoUrl,
+        videoKey,
+        virtualUrl,
+        virtualKey,
+        b.virtual_tour_file ? JSON.stringify(b.virtual_tour_file) : null,
+        b.three_d_home_url || b.threeDHomeUrl || null,
+
+        b.allow_tour_requests !== false,
+        b.allow_video_tour !== false,
+        b.allow_in_person_tour !== false,
+        JSON.stringify(preferredTourDays),
+        b.preferred_tour_times || null,
+        toNumberOrNull(b.minimum_notice_hours) || 24,
+
+        b.availability_status || "available_now",
+        b.available_from || null,
+
+        b.contact_name || b.contactName || currentUser.name || null,
+        b.contact_email || b.contactEmail || currentUser.email || null,
+        b.contact_phone || b.contactPhone || null,
+        b.contact_method || b.contactMethod || "platform",
+        b.show_contact_phone === true,
+
+        JSON.stringify(featuresArr),
+        JSON.stringify(amenitiesArr),
+      ],
+    );
+
+    const listing = result.rows[0];
+
+    return res.status(201).json({
+      success: true,
+      message: "Listing submitted for review.",
+      listing: {
+        ...listing,
+        photos: normalizePhotosForResponse(listing.photos),
+        floor_plans: safeJsonParse(listing.floor_plans, []),
+        staging_photos: safeJsonParse(listing.staging_photos, []),
+        panorama_photos: safeJsonParse(listing.panorama_photos, []),
+        features: safeJsonParse(listing.features, []),
+        amenities: safeJsonParse(listing.amenities, []),
+
+        agent_unique_id: listing.uploaded_by_id,
+        created_by: listing.uploaded_by_id,
+        price_currency: listing.price_currency || listing.currency || "USD",
+        square_footage: listing.square_footage || listing.area_sqft || null,
+        zip_code: listing.zip_code || listing.postal_code || null,
+        payment_status: listing.payment_status || "unpaid",
+      },
+    });
+  } catch (err) {
+    console.error("[CreateListing] Error:", err);
+
+    return res.status(500).json({
+      message: "Failed to create listing",
+      code: "CREATE_LISTING_FAIL",
+      details: err?.message,
+    });
+  }
+};
+
+
+
+ 
+
+/* -------------------------------------------------------
+   UPDATE LISTING - DIRECT S3 / PRODUCTION STYLE
+------------------------------------------------------- */
 export const updateListing = async (req, res) => {
   try {
     const product_id =
       req.params.product_id || req.params.id || req.params.productId;
-    const userId = req.user?.unique_id;
-    if (!userId) return res.status(401).json({ message: "Unauthorized" });
 
-    // 1. Fetch Existing
+    const userId = req.user?.unique_id;
+
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
     const found = await pool.query(
       "SELECT * FROM listings WHERE product_id=$1",
-      [product_id],
+      [product_id]
     );
+
     const listing = found.rows[0];
-    if (!listing) return res.status(404).json({ message: "Listing not found" });
-    if (listing.agent_unique_id !== userId)
-      return res.status(403).json({ message: "Forbidden" });
 
-    // 2. Prepare Data (Helpers)
+    if (!listing) {
+      return res.status(404).json({ message: "Listing not found" });
+    }
+
+    const listingOwnerId = listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
+
+if (String(listingOwnerId) !== String(userId)) {
+  return res.status(403).json({ message: "Forbidden" });
+}
+
     const b = req.body;
-    const toNum = (v, prev) => (v ? Number(v) : prev);
 
-    // 3. Handle Photos (Reordering & Deletion)
-    // We handle deletions *immediately* in the DB record to make the UI snappy.
-    // The actual Cloudinary deletion happens in background.
-    let currentPhotos =
-      typeof listing.photos === "string"
-        ? JSON.parse(listing.photos || "[]")
-        : listing.photos || [];
+    const toNum = (value, previous) => {
+      if (value === undefined || value === null || value === "") return previous;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : previous;
+    };
 
-    // Process removals logic
+    let currentPhotos = normalizeExistingPhotos(listing.photos || []);
+
     let removeList = [];
     try {
-      if (req.body.removePhotos)
+      if (b.removePhotos) {
         removeList =
-          typeof req.body.removePhotos === "string"
-            ? JSON.parse(req.body.removePhotos)
-            : req.body.removePhotos;
+          typeof b.removePhotos === "string"
+            ? JSON.parse(b.removePhotos)
+            : b.removePhotos;
+      }
     } catch {
       removeList = [];
     }
 
-    // Filter out removed photos from the array we will save immediately
-    currentPhotos = currentPhotos.filter(
-      (p) => !removeList.includes(p.public_id),
+    if (removeList.length > 0) {
+      const removeSet = new Set(
+        removeList.map((item) =>
+          typeof item === "string"
+            ? item
+            : item?.key || item?.s3_key || item?.public_id
+        )
+      );
+
+      currentPhotos = currentPhotos.filter((photo) => {
+        const key = photo.key || photo.s3_key || photo.public_id;
+        return !removeSet.has(key);
+      });
+    }
+
+    const incomingPhotos = Array.isArray(b.photos)
+      ? normalizeExistingPhotos(b.photos)
+      : [];
+
+    let finalPhotos = [...currentPhotos, ...incomingPhotos];
+
+    if (b.existingPhotos) {
+      const orderedPhotos = normalizeExistingPhotos(b.existingPhotos);
+      const photoMap = new Map(
+        finalPhotos.map((photo) => [
+          photo.key || photo.s3_key || photo.public_id || photo.url,
+          photo,
+        ])
+      );
+
+      const reordered = [];
+
+      orderedPhotos.forEach((photo) => {
+        const key = photo.key || photo.s3_key || photo.public_id || photo.url;
+        if (photoMap.has(key)) {
+          reordered.push(photoMap.get(key));
+        }
+      });
+
+      finalPhotos.forEach((photo) => {
+        const key = photo.key || photo.s3_key || photo.public_id || photo.url;
+        const alreadyAdded = reordered.some((item) => {
+          const itemKey = item.key || item.s3_key || item.public_id || item.url;
+          return itemKey === key;
+        });
+
+        if (!alreadyAdded) {
+          reordered.push(photo);
+        }
+      });
+
+      finalPhotos = reordered;
+    }
+
+    const planRes = await pool.query(
+  `
+  SELECT subscription_plan, subscription_status
+  FROM users
+  WHERE unique_id = $1::uuid
+  LIMIT 1
+  `,
+  [String(userId)],
+);
+
+const photoLimit = getListingPhotoLimit(planRes.rows[0] || {});
+
+    finalPhotos = finalPhotos.slice(0, photoLimit);
+
+    const featuresArr = normalizeFeatures(
+      b.features || b.amenities || listing.features
     );
 
-    // Handle reordering (if existingPhotos sent)
-    if (req.body.existingPhotos) {
-      const orderMap = normalizeExistingPhotos(req.body.existingPhotos);
-      // Map public_id to actual photo objects to reconstruct valid array
-      const photoMap = new Map(currentPhotos.map((p) => [p.public_id, p]));
-      const reordered = [];
-      orderMap.forEach((p) => {
-        if (photoMap.has(p.public_id))
-          reordered.push(photoMap.get(p.public_id));
-      });
-      // Add any that were missed (edge case safety)
-      currentPhotos.forEach((p) => {
-        if (!reordered.find((r) => r.public_id === p.public_id))
-          reordered.push(p);
-      });
-      currentPhotos = reordered;
-    }
-
-    // 4. Features
-    let featuresArr = [];
-    try {
-      featuresArr = b.features
-        ? typeof b.features === "string"
-          ? JSON.parse(b.features)
-          : b.features
-        : JSON.parse(listing.features || "[]");
-      if (!Array.isArray(featuresArr))
-        featuresArr = Object.keys(featuresArr).filter((k) => featuresArr[k]);
-    } catch {
-      featuresArr = [];
-    }
-
-    // 5. Detect Address Change
     const newAddr = b.address ?? listing.address;
     const newCity = b.city ?? listing.city;
     const newState = b.state ?? listing.state;
     const newCountry = b.country ?? listing.country;
-    const newZip = b.zip_code || b.zipCode || listing.zip_code;
+    const newZip =
+      b.zip_code || b.zipCode || b.postal_code || listing.zip_code;
 
-    const addressChanged =
-      newAddr !== listing.address ||
-      newCity !== listing.city ||
-      newState !== listing.state ||
-      newCountry !== listing.country ||
-      newZip !== listing.zip_code;
+    const latitude =
+      b.latitude !== undefined && b.latitude !== null && b.latitude !== ""
+        ? Number(b.latitude)
+        : listing.latitude;
 
-    // 6. Immediate DB Update (Text & Status Only)
-    // We set status='pending' and is_active=false immediately.
-    // We KEEP old lat/long/video for now until background worker updates them.
+    const longitude =
+      b.longitude !== undefined && b.longitude !== null && b.longitude !== ""
+        ? Number(b.longitude)
+        : listing.longitude;
+
+    const videoUrl =
+      b.video?.url !== undefined
+        ? b.video.url
+        : b.video_url !== undefined
+          ? b.video_url
+          : listing.video_url;
+
+    const videoKey =
+      b.video?.key !== undefined
+        ? b.video.key
+        : b.video_public_id !== undefined
+          ? b.video_public_id
+          : listing.video_public_id;
+
+    const virtualTourUrl =
+      b.virtual_tour?.url !== undefined
+        ? b.virtual_tour.url
+        : b.virtual_tour_url !== undefined
+          ? b.virtual_tour_url
+          : listing.virtual_tour_url;
+
+    const virtualTourKey =
+      b.virtual_tour?.key !== undefined
+        ? b.virtual_tour.key
+        : b.virtual_tour_public_id !== undefined
+          ? b.virtual_tour_public_id
+          : listing.virtual_tour_public_id;
+
     const query = `
       UPDATE listings SET
-        title=$1, description=$2, price=$3, price_currency=$4, price_period=$5,
-        category=$6, property_type=$7, listing_type=$8,
-        address=$9, city=$10, state=$11, country=$12, zip_code=$13,
-        bedrooms=$14, bathrooms=$15, parking=$16,
-        year_built=$17, square_footage=$18, furnishing=$19, lot_size=$20,
-        features=$21, photos=$22,
-        contact_name=$23, contact_email=$24, contact_phone=$25, contact_method=$26,
-        status='pending', is_active=false, updated_at=NOW()
-      WHERE product_id=$27
+        title=$1,
+        description=$2,
+        price=$3,
+        price_currency=$4,
+        price_period=$5,
+        category=$6,
+        property_type=$7,
+        listing_type=$8,
+        address=$9,
+        city=$10,
+        state=$11,
+        country=$12,
+        zip_code=$13,
+        latitude=$14,
+        longitude=$15,
+        bedrooms=$16,
+        bathrooms=$17,
+        parking=$18,
+        year_built=$19,
+        square_footage=$20,
+        furnishing=$21,
+        lot_size=$22,
+        features=$23,
+        photos=$24,
+        video_url=$25,
+        video_public_id=$26,
+        virtual_tour_url=$27,
+        virtual_tour_public_id=$28,
+        contact_name=$29,
+        contact_email=$30,
+        contact_phone=$31,
+        contact_method=$32,
+        status='pending',
+        is_active=false,
+        updated_at=NOW()
+      WHERE product_id=$33
       RETURNING *;
     `;
 
@@ -745,8 +1278,8 @@ export const updateListing = async (req, res) => {
       b.title ?? listing.title,
       b.description ?? listing.description,
       toNum(b.price, listing.price),
-      b.price_currency || b.priceCurrency || listing.price_currency,
-      b.price_period ?? listing.price_period,
+      b.price_currency || b.priceCurrency || b.currency || listing.price_currency,
+      b.price_period ?? b.pricePeriod ?? listing.price_period,
       b.category ?? listing.category,
       b.property_type || b.propertyType || listing.property_type,
       b.listing_type || b.listingType || listing.listing_type,
@@ -755,15 +1288,24 @@ export const updateListing = async (req, res) => {
       newState,
       newCountry,
       newZip,
+      latitude,
+      longitude,
       toNum(b.bedrooms, listing.bedrooms),
       toNum(b.bathrooms, listing.bathrooms),
       b.parking ?? listing.parking,
       toNum(b.year_built || b.yearBuilt, listing.year_built),
-      toNum(b.square_footage || b.squareFootage, listing.square_footage),
+      toNum(
+        b.square_footage || b.squareFootage || b.area_sqft,
+        listing.square_footage
+      ),
       b.furnishing ?? listing.furnishing,
-      toNum(b.lot_size || b.lotSize, listing.lot_size),
+      toNum(b.lot_size || b.lotSize || b.land_area_sqft, listing.lot_size),
       JSON.stringify(featuresArr),
-      JSON.stringify(currentPhotos),
+      JSON.stringify(finalPhotos),
+      videoUrl,
+      videoKey,
+      virtualTourUrl,
+      virtualTourKey,
       b.contact_name || b.contactName || listing.contact_name,
       b.contact_email || b.contactEmail || listing.contact_email,
       b.contact_phone || b.contactPhone || listing.contact_phone,
@@ -772,162 +1314,112 @@ export const updateListing = async (req, res) => {
     ];
 
     const result = await pool.query(query, params);
-    const updatedListing = result.rows[0];
 
-    // 7. ⚡ RESPOND IMMEDIATELY
-    res.json({
+    return res.json({
       success: true,
-      message: "Update received! Media processing in background...",
-      listing: updatedListing,
-    });
-
-    // 8. ⚙️ TRIGGER BACKGROUND WORK
-    const photoFiles = req.files?.photos || [];
-    const videoFile = req.files?.video_file?.[0] || null;
-    const virtualFile = req.files?.virtual_file?.[0] || null;
-
-    runUpdateBackgroundProcessing(product_id, {
-      photoFiles,
-      videoFile,
-      virtualFile,
-      removeList,
-      addressData: {
-        address: newAddr,
-        city: newCity,
-        state: newState,
-        country: newCountry,
-        zip: newZip,
-      },
-      addressChanged,
+      message: "Listing updated successfully and sent for review.",
+      listing: result.rows[0],
     });
   } catch (err) {
     console.error("UpdateListing Error:", err);
-    if (!res.headersSent) {
-      res.status(500).json({
-        message: "Server Error",
-        code: "UPDATE_FAIL",
-        details: err?.message,
-      });
-    }
+
+    return res.status(500).json({
+      message: "Server Error",
+      code: "UPDATE_FAIL",
+      details: err?.message,
+    });
   }
 };
 
-/* -------------------------------------------------------
-   DELETE LISTING (High Performance)
-   1. Removes from DB immediately.
-   2. Cleans up Cloudinary assets in background.
-------------------------------------------------------- */
-
-// ✅ BACKGROUND WORKER FOR DELETION
-const runDeleteBackgroundCleanup = async (assets) => {
-  console.log(`🗑️ Starting background cleanup for ${assets.length} assets...`);
-
-  // We don't want to crash the server if this fails, just log it
-  try {
-    await Promise.all(
-      assets.map(async (asset) => {
-        if (!asset.public_id) return;
-        await deleteCloudinaryAsset(asset.public_id, asset.type);
-      }),
-    );
-    console.log("✅ Background cleanup complete.");
-  } catch (err) {
-    console.error("❌ Background cleanup error:", err);
-  }
-};
 
 export const deleteListing = async (req, res) => {
   try {
     const product_id =
       req.params.product_id || req.params.id || req.params.productId;
+
     const userId = req.user?.unique_id;
 
-    if (!userId)
-      return res
-        .status(401)
-        .json({ message: "Unauthorized", code: "UNAUTHORIZED" });
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
 
-    // 1. Fetch listing to verify ownership & get asset IDs BEFORE deleting
     const found = await pool.query(
-      "SELECT photos, video_public_id, virtual_tour_public_id, agent_unique_id FROM listings WHERE product_id=$1",
-      [product_id],
+      "SELECT photos, video_public_id, virtual_tour_public_id, uploaded_by_id, agent_unique_id, created_by FROM listings WHERE product_id=$1",
+      [product_id]
     );
+
     const listing = found.rows[0];
 
-    if (!listing)
-      return res
-        .status(404)
-        .json({ message: "Listing not found", code: "LISTING_NOT_FOUND" });
-
-    if (listing.agent_unique_id !== userId) {
-      return res
-        .status(403)
-        .json({ message: "Not authorized", code: "FORBIDDEN" });
+    if (!listing) {
+      return res.status(404).json({
+        message: "Listing not found",
+        code: "LISTING_NOT_FOUND",
+      });
     }
 
-    // 2. Collect Assets for Background Deletion
+    const listingOwnerId = listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
+
+if (String(listingOwnerId) !== String(userId)) {
+  return res.status(403).json({
+    message: "Not authorized",
+    code: "FORBIDDEN",
+  });
+}
+
+    // ✅ collect S3 keys
     const assetsToDelete = [];
+    const photos = normalizeExistingPhotos(listing.photos || []);
 
-    // Parse Photos
-    let photos = [];
-    try {
-      photos =
-        typeof listing.photos === "string"
-          ? JSON.parse(listing.photos || "[]")
-          : listing.photos || [];
-    } catch {
-      photos = [];
-    }
-
-    // Add Photos to delete list
-    photos.forEach((p) => {
-      if (p.public_id)
-        assetsToDelete.push({ public_id: p.public_id, type: "image" });
+    photos.forEach((photo) => {
+      const key = photo.key || photo.s3_key || photo.public_id;
+      if (key) assetsToDelete.push(key);
     });
 
-    // Add Video
     if (listing.video_public_id) {
-      assetsToDelete.push({
-        public_id: listing.video_public_id,
-        type: "video",
-      });
+      assetsToDelete.push(listing.video_public_id);
     }
 
-    // Add Virtual Tour
     if (listing.virtual_tour_public_id) {
-      assetsToDelete.push({
-        public_id: listing.virtual_tour_public_id,
-        type: "video",
-      });
+      assetsToDelete.push(listing.virtual_tour_public_id);
     }
 
-    // 3. Delete from DB (Immediate)
-    // Clear notifications first (Foreign Key constraint)
-    await pool.query("DELETE FROM notifications WHERE product_id=$1", [
-      product_id,
-    ]);
-    // Delete the Listing
+    // ✅ delete DB first (FAST)
+    await pool.query("DELETE FROM notifications WHERE product_id=$1", [product_id]);
     await pool.query("DELETE FROM listings WHERE product_id=$1", [product_id]);
 
-    // 4. Fetch updated agent stats (Optional, useful for UI refresh)
-    const profileRes = await pool.query(
-      "SELECT unique_id, email, full_name, username, avatar_url, agency_name FROM profiles WHERE unique_id=$1",
-      [userId],
-    );
-
-    // 5. ⚡ SEND RESPONSE IMMEDIATELY
+    // ✅ respond immediately (DO NOT WAIT FOR S3)
     res.json({
       success: true,
       message: "Listing deleted successfully",
-      agent: profileRes.rows[0] || null,
     });
 
-    // 6. ⚙️ TRIGGER BACKGROUND CLEANUP
+    // ✅ async cleanup (lightweight, no background system)
     if (assetsToDelete.length > 0) {
-      runDeleteBackgroundCleanup(assetsToDelete);
+      setImmediate(async () => {
+        try {
+          await Promise.allSettled(
+            assetsToDelete.map((key) =>
+              s3.send(
+                new DeleteObjectCommand({
+                  Bucket: process.env.AWS_S3_BUCKET,
+                  Key: key,
+                })
+              )
+            )
+          );
+          console.log("🗑️ S3 cleanup complete");
+        } catch (err) {
+          console.warn("⚠️ S3 cleanup failed:", err.message);
+        }
+      });
     }
+
   } catch (err) {
     console.error("[DeleteListing] Error:", err);
+
     res.status(500).json({
       message: "Delete failed",
       code: "DELETE_LISTING_FAIL",
@@ -937,8 +1429,7 @@ export const deleteListing = async (req, res) => {
 };
 
 /* -------------------------------------------------------
-   1. GET LISTINGS (Public - /buy, /rent, Homepage)
-   UPDATED: Fix for Polygon Search
+   GET LISTINGS - PUBLIC
 ------------------------------------------------------- */
 export const getListings = async (req, res) => {
   try {
@@ -960,71 +1451,51 @@ export const getListings = async (req, res) => {
       polygon,
     } = req.query;
 
-    // Log Incoming Params
-    console.log("📥 Query Params:", {
-      category,
-      type,
-      city,
-      hasPolygon: !!polygon,
-      hasViewport: !!minLat && !!maxLat,
-    });
-
     let currentUserId = null;
-    if (req.user && req.user.unique_id) {
-      currentUserId = req.user.unique_id;
-    }
+    if (req.user && req.user.unique_id) currentUserId = req.user.unique_id;
 
     let queryText = `
-      SELECT 
-        l.*, 
-        u.name as agent_name, 
+      SELECT
+        l.*,
+        u.name as agent_name,
         u.avatar_url as agent_avatar,
         u.username as agent_username,
-        u.role as agent_role, 
+        u.role as agent_role,
         u.phone as agent_phone,
         CASE WHEN f.product_id IS NOT NULL THEN true ELSE false END as is_favorited
       FROM listings l
       JOIN users u ON l.uploaded_by_id = u.unique_id
       LEFT JOIN favorites f ON l.product_id = f.product_id AND f.user_id = $1
-      WHERE l.status = 'approved' 
+      WHERE l.status = 'approved'
       AND l.is_active = true
     `;
 
     const queryParams = [currentUserId];
     let paramCounter = 2;
 
-    // --- 1. POLYGON SEARCH (THE FIX) ---
     if (polygon) {
       try {
-        console.log("🔹 Parsing Polygon JSON...");
         const geoJson = JSON.parse(polygon);
 
-        // Validate JSON structure
         if (!geoJson.type || !geoJson.coordinates) {
           throw new Error("Invalid GeoJSON structure");
         }
 
-        // ✅ FIX: Construct Point from Lat/Lng columns on the fly
-        // This bypasses any issues with the 'location' column being null or stale.
-        // ST_MakePoint takes (Longitude, Latitude) -> (X, Y)
-        queryText += ` 
-                AND l.longitude IS NOT NULL 
-                AND l.latitude IS NOT NULL
-                AND ST_Intersects(
-                    ST_SetSRID(ST_GeomFromGeoJSON($${paramCounter}), 4326), 
-                    ST_SetSRID(ST_MakePoint(l.longitude::float, l.latitude::float), 4326)
-                )`;
+        queryText += `
+          AND l.longitude IS NOT NULL
+          AND l.latitude IS NOT NULL
+          AND ST_Intersects(
+            ST_SetSRID(ST_GeomFromGeoJSON($${paramCounter}), 4326),
+            ST_SetSRID(ST_MakePoint(l.longitude::float, l.latitude::float), 4326)
+          )`;
 
         queryParams.push(JSON.stringify(geoJson));
         paramCounter++;
-        console.log("✅ Polygon Filter Added (Using Dynamic ST_MakePoint)");
-      } catch (e) {
-        console.error("❌ Invalid Polygon JSON received:", e.message);
-        // Don't crash, just ignore the polygon filter if it's bad
+      } catch (err) {
+        console.error("❌ Invalid Polygon JSON received:", err.message);
       }
     }
 
-    // --- 2. STANDARD FILTERS ---
     if (category && category !== "undefined") {
       queryText += ` AND (category ILIKE $${paramCounter} OR listing_type ILIKE $${paramCounter})`;
       queryParams.push(category);
@@ -1057,30 +1528,21 @@ export const getListings = async (req, res) => {
 
     if (search) {
       queryText += ` AND (
-        l.city ILIKE $${paramCounter} OR 
-        l.address ILIKE $${paramCounter} OR 
+        l.city ILIKE $${paramCounter} OR
+        l.address ILIKE $${paramCounter} OR
         l.state ILIKE $${paramCounter} OR
         l.country ILIKE $${paramCounter} OR
-        l.zip_code ILIKE $${paramCounter} 
+        l.zip_code ILIKE $${paramCounter}
       )`;
       queryParams.push(`%${search}%`);
       paramCounter++;
     }
 
-    // Viewport Search (Fallback - only if NO polygon)
-    if (
-      !polygon &&
-      minLat &&
-      maxLat &&
-      minLng &&
-      maxLng &&
-      !isNaN(Number(minLat))
-    ) {
-      console.log("🔹 Using Viewport (Bounds) Search");
-      queryText += ` 
-        AND l.latitude::numeric >= $${paramCounter} 
+    if (!polygon && minLat && maxLat && minLng && maxLng && !isNaN(Number(minLat))) {
+      queryText += `
+        AND l.latitude::numeric >= $${paramCounter}
         AND l.latitude::numeric <= $${paramCounter + 1}
-        AND l.longitude::numeric >= $${paramCounter + 2} 
+        AND l.longitude::numeric >= $${paramCounter + 2}
         AND l.longitude::numeric <= $${paramCounter + 3}
       `;
       queryParams.push(minLat, maxLat, minLng, maxLng);
@@ -1089,41 +1551,24 @@ export const getListings = async (req, res) => {
 
     queryText += " ORDER BY l.activated_at DESC NULLS LAST LIMIT 500";
 
-    // --- 3. EXECUTE ---
-    // console.log("📝 SQL:", queryText);
     const result = await pool.query(queryText, queryParams);
 
-    console.log(`✅ Database returned ${result.rows.length} rows`);
-
-    // --- 4. FORMAT RESPONSE ---
-    const listings = result.rows.map((l) => {
-      let photos = [],
-        features = [];
-      try {
-        photos =
-          typeof l.photos === "string" ? JSON.parse(l.photos) : l.photos || [];
-      } catch (e) {}
-      try {
-        features =
-          typeof l.features === "string"
-            ? JSON.parse(l.features)
-            : l.features || [];
-      } catch (e) {}
-
-      photos = photos.map((p) => ({ url: p.url || p, type: "image" }));
+    const listings = result.rows.map((listing) => {
+      const photos = normalizePhotosForResponse(listing.photos);
+      const features = safeJsonParse(listing.features, []);
 
       return {
-        ...l,
+        ...listing,
         photos,
         features,
-        latitude: l.latitude ? parseFloat(l.latitude) : null,
-        longitude: l.longitude ? parseFloat(l.longitude) : null,
+        latitude: listing.latitude ? parseFloat(listing.latitude) : null,
+        longitude: listing.longitude ? parseFloat(listing.longitude) : null,
         agent: {
-          name: l.agent_name,
-          avatar: l.agent_avatar,
-          username: l.agent_username,
-          role: l.agent_role,
-          agency: l.agency_name,
+          name: listing.agent_name,
+          avatar: listing.agent_avatar,
+          username: listing.agent_username,
+          role: listing.agent_role,
+          agency: listing.agency_name,
         },
       };
     });
@@ -1141,75 +1586,110 @@ export const getListings = async (req, res) => {
 export const getAgentListings = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
+
     const query = `
-      SELECT l.*, 
-             p.full_name, p.username, p.avatar_url, p.bio, 
-             p.agency_name, p.experience, p.country as agent_country, p.city as agent_city,
-             p.role as agent_role  -- 👈 ADDED THIS
+      SELECT
+        l.*,
+
+        u.unique_id AS uploader_unique_id,
+        u.name AS uploader_name,
+        u.email AS uploader_email,
+        u.phone AS uploader_phone,
+        u.role AS uploader_role,
+        u.avatar_url AS uploader_avatar_url,
+        u.bio AS uploader_bio,
+        u.country AS uploader_country,
+        u.city AS uploader_city,
+        u.brokerage_name AS uploader_brokerage_name,
+        u.verification_status AS uploader_verification_status,
+        u.is_verified AS uploader_is_verified,
+        u.is_verified_agent AS uploader_is_verified_agent
+
       FROM listings l
-      LEFT JOIN profiles p ON l.agent_unique_id = p.unique_id
-      WHERE l.agent_unique_id=$1
+      LEFT JOIN users u
+        ON l.uploaded_by_id = u.unique_id
+
+      WHERE l.uploaded_by_id = $1::uuid
+
       ORDER BY l.created_at DESC;
     `;
-    const result = await pool.query(query, [userId]);
 
-    const rows = result.rows.map((r) => {
-      let photos = [];
-      try {
-        photos =
-          typeof r.photos === "string"
-            ? JSON.parse(r.photos || "[]")
-            : r.photos || [];
-        photos = photos.map((p) => ({ url: p.url || p, type: "image" }));
-      } catch {}
+    const result = await pool.query(query, [String(userId)]);
 
-      return {
-        ...r,
-        photos,
-        latitude: r.latitude ? parseFloat(r.latitude) : null,
-        longitude: r.longitude ? parseFloat(r.longitude) : null,
-        agent_role: r.agent_role, // 👈 Explicitly pass top-level
-        role: r.agent_role, // 👈 Explicitly pass top-level for safety
-        agent: {
-          unique_id: r.agent_unique_id,
-          full_name: r.full_name,
-          username: r.username,
-          avatar_url: r.avatar_url,
-          bio: r.bio,
-          agency_name: r.agency_name,
-          experience: r.experience,
-          country: r.agent_country,
-          city: r.agent_city,
-          role: r.agent_role, // 👈 Included inside agent object
-        },
-      };
-    });
+    const rows = result.rows.map((row) => ({
+      ...row,
 
-    res.json(rows);
+      photos: normalizePhotosForResponse(row.photos),
+      features: safeJsonParse(row.features, []),
+      amenities: safeJsonParse(row.amenities, []),
+
+      latitude: row.latitude ? parseFloat(row.latitude) : null,
+      longitude: row.longitude ? parseFloat(row.longitude) : null,
+
+      // Frontend compatibility with older UI names
+      agent_unique_id: row.uploaded_by_id,
+      created_by: row.uploaded_by_id,
+      price_currency: row.price_currency || row.currency || "USD",
+      square_footage: row.square_footage || row.area_sqft || null,
+      zip_code: row.zip_code || row.postal_code || null,
+      payment_status: row.payment_status || "unpaid",
+
+      agent_role: row.uploader_role,
+      role: row.uploader_role,
+
+      agent: {
+        unique_id: row.uploader_unique_id,
+        name: row.uploader_name,
+        full_name: row.uploader_name,
+        email: row.uploader_email,
+        phone: row.uploader_phone,
+        role: row.uploader_role,
+        avatar_url: row.uploader_avatar_url,
+        bio: row.uploader_bio,
+        country: row.uploader_country,
+        city: row.uploader_city,
+        brokerage_name: row.uploader_brokerage_name,
+        verification_status: row.uploader_verification_status,
+        is_verified: row.uploader_is_verified,
+        is_verified_agent: row.uploader_is_verified_agent,
+      },
+    }));
+
+    return res.json(rows);
   } catch (err) {
-    console.error("[GetAgentListings] Error:", err);
-    res.status(500).json({ message: "Failed", details: err?.message });
+    console.error("[GetUserListings] Error:", err);
+
+    return res.status(500).json({
+      message: "Failed to fetch listings",
+      code: "GET_USER_LISTINGS_FAIL",
+      details: err?.message,
+    });
   }
 };
 
 /* -------------------------------------------------------
-   2. GET LISTING BY ID (Public Details Page)
-   UPDATED: Now returns 'role'
+   GET LISTING BY PRODUCT ID
 ------------------------------------------------------- */
 export const getListingByProductId = async (req, res) => {
   try {
     const { product_id } = req.params;
     const userUniqueId = req.user?.unique_id || null;
 
-    // ✅ ADDED: p.role
     const query = `
-      SELECT l.*, 
-             p.full_name, p.username, p.avatar_url, p.bio, 
+      SELECT l.*,
+             p.full_name, p.username, p.avatar_url, p.bio,
              p.agency_name, p.experience, p.country as agent_country, p.city as agent_city,
              p.email as agent_email, p.phone as agent_phone,
              p.role as agent_role
       FROM listings l
-      LEFT JOIN profiles p ON l.agent_unique_id = p.unique_id
+      LEFT JOIN profiles p ON l.created_by = p.unique_id
       WHERE l.product_id = $1;
     `;
 
@@ -1222,23 +1702,12 @@ export const getListingByProductId = async (req, res) => {
     const isPublicReady = row.status === "approved" && row.is_active === true;
 
     if (!isPublicReady && !isOwner) {
-      return res
-        .status(403)
-        .json({ message: "This listing is not currently active." });
+      return res.status(403).json({ message: "This listing is not currently active." });
     }
-
-    let photos = [];
-    try {
-      photos =
-        typeof row.photos === "string"
-          ? JSON.parse(row.photos || "[]")
-          : row.photos || [];
-      photos = photos.map((p) => ({ url: p.url || p, type: "image" }));
-    } catch {}
 
     res.json({
       ...row,
-      photos,
+      photos: normalizePhotosForResponse(row.photos),
       latitude: row.latitude ? parseFloat(row.latitude) : null,
       longitude: row.longitude ? parseFloat(row.longitude) : null,
       agent: {
@@ -1253,7 +1722,7 @@ export const getListingByProductId = async (req, res) => {
         city: row.agent_city,
         email: row.agent_email,
         phone: row.agent_phone,
-        role: row.agent_role, // ✅ Send role to frontend
+        role: row.agent_role,
       },
     });
   } catch (err) {
@@ -1263,8 +1732,7 @@ export const getListingByProductId = async (req, res) => {
 };
 
 /* -------------------------------------------------------
-   UPDATE LISTING STATUS (Admin)
-   Fixed: Checks payment_status to avoid double charging
+   UPDATE LISTING STATUS - ADMIN
 ------------------------------------------------------- */
 export const updateListingStatus = async (req, res) => {
   try {
@@ -1275,29 +1743,22 @@ export const updateListingStatus = async (req, res) => {
       return res.status(400).json({ message: "Invalid status value" });
     }
 
-    const existing = await pool.query(
-      `SELECT * FROM listings WHERE product_id=$1`,
-      [product_id],
-    );
-
+    const existing = await pool.query(`SELECT * FROM listings WHERE product_id=$1`, [product_id]);
     const listing = existing.rows[0];
+
     if (!listing) return res.status(404).json({ message: "Listing not found" });
 
     const agentId = listing.agent_unique_id;
-
-    // ✅ FIX: Logic to prevent double-paying
-    let isActiveValue = listing.is_active; // Default to current state
+    let isActiveValue = listing.is_active;
 
     if (status === "approved") {
-      // If already paid, Go LIVE immediately. If not paid, stay inactive.
       isActiveValue = listing.payment_status === "paid" ? true : false;
     } else if (status === "rejected" || status === "pending") {
-      // If rejected/pending, always turn off visibility
       isActiveValue = false;
     }
 
     const updateQuery = `
-      UPDATE listings 
+      UPDATE listings
       SET status=$1,
           is_active=$2,
           updated_at=NOW()
@@ -1305,14 +1766,9 @@ export const updateListingStatus = async (req, res) => {
       RETURNING *;
     `;
 
-    const result = await pool.query(updateQuery, [
-      status,
-      isActiveValue,
-      product_id,
-    ]);
+    const result = await pool.query(updateQuery, [status, isActiveValue, product_id]);
     const updatedListing = result.rows[0];
 
-    // Notification Logic
     let notifyMsg = `Your listing was ${status}.`;
     if (status === "approved") {
       notifyMsg += updatedListing.is_active
@@ -1352,12 +1808,11 @@ export const activateListing = async (req, res) => {
     const result = await pool.query(
       `
       UPDATE listings
-SET is_active=true,
-    payment_status='paid',
-    activated_at=NOW()
-WHERE product_id=$1
-RETURNING *;
-
+      SET is_active=true,
+          payment_status='paid',
+          activated_at=NOW()
+      WHERE product_id=$1
+      RETURNING *;
       `,
       [product_id],
     );
@@ -1373,54 +1828,45 @@ RETURNING *;
 };
 
 /* -------------------------------------------------------
-   GET ALL LISTINGS (ADMIN ONLY)
+   GET ALL LISTINGS - ADMIN
 ------------------------------------------------------- */
 export const getAllListingsAdmin = async (req, res) => {
   try {
     const query = `
-      SELECT 
+      SELECT
         l.*,
         p.full_name, p.username, p.email AS agent_email, p.phone, p.avatar_url, p.agency_name,
         p.city AS agent_city, p.country AS agent_country,
-        p.role as agent_role -- 👈 ADDED THIS
+        p.role as agent_role
       FROM listings l
-      LEFT JOIN profiles p ON l.agent_unique_id = p.unique_id
-      ORDER BY 
+      LEFT JOIN profiles p ON l.created_by = p.unique_id
+      ORDER BY
         CASE WHEN l.status = 'pending' THEN 1 ELSE 2 END,
         l.created_at DESC;
     `;
 
     const result = await pool.query(query);
 
-    const rows = result.rows.map((r) => {
-      let photos = [];
-      try {
-        photos =
-          typeof r.photos === "string" ? JSON.parse(r.photos) : r.photos || [];
-        photos = photos.map((p) => ({ url: p.url || p, type: "image" }));
-      } catch {}
-
-      return {
-        ...r,
-        photos,
-        latitude: r.latitude ? parseFloat(r.latitude) : null,
-        longitude: r.longitude ? parseFloat(r.longitude) : null,
-        role: r.agent_role, // 👈 Explicitly pass top-level
-        agent_role: r.agent_role, // 👈 Explicitly pass top-level
-        agent: {
-          unique_id: r.agent_unique_id,
-          full_name: r.full_name,
-          username: r.username,
-          avatar_url: r.avatar_url,
-          email: r.agent_email,
-          phone: r.phone,
-          agency_name: r.agency_name,
-          city: r.agent_city,
-          country: r.agent_country,
-          role: r.agent_role, // 👈 Included
-        },
-      };
-    });
+    const rows = result.rows.map((row) => ({
+      ...row,
+      photos: normalizePhotosForResponse(row.photos),
+      latitude: row.latitude ? parseFloat(row.latitude) : null,
+      longitude: row.longitude ? parseFloat(row.longitude) : null,
+      role: row.agent_role,
+      agent_role: row.agent_role,
+      agent: {
+        unique_id: row.agent_unique_id,
+        full_name: row.full_name,
+        username: row.username,
+        avatar_url: row.avatar_url,
+        email: row.agent_email,
+        phone: row.phone,
+        agency_name: row.agency_name,
+        city: row.agent_city,
+        country: row.agent_country,
+        role: row.agent_role,
+      },
+    }));
 
     res.json(rows);
   } catch (err) {
@@ -1430,7 +1876,7 @@ export const getAllListingsAdmin = async (req, res) => {
 };
 
 /* -------------------------------------------------------
-   GET PUBLIC PROFILE (Agent, Landlord, or Buyer)
+   GET PUBLIC PROFILE
 ------------------------------------------------------- */
 export const getPublicAgentProfile = async (req, res) => {
   try {
@@ -1438,11 +1884,9 @@ export const getPublicAgentProfile = async (req, res) => {
     let queryCondition = "";
     let queryValue = unique_id;
 
-    // Determine if searching by UUID or Username
-    const isUUID =
-      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        unique_id,
-      );
+    const isUUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
+      unique_id,
+    );
 
     if (isUUID) {
       queryCondition = "unique_id = $1";
@@ -1451,67 +1895,49 @@ export const getPublicAgentProfile = async (req, res) => {
       queryCondition = "(username ILIKE $1 OR full_name ILIKE $1)";
     }
 
-    // 1. Fetch Profile
     const profileQ = await pool.query(
-      `SELECT unique_id, full_name, username, avatar_url, bio, 
-              agency_name, experience, country, city, 
+      `SELECT unique_id, full_name, username, avatar_url, bio,
+              agency_name, experience, country, city,
               email, phone, social_instagram, social_twitter, social_linkedin,
-              role, 
-              verification_status AS status, 
+              role,
+              verification_status AS status,
               created_at
-       FROM profiles 
+       FROM profiles
        WHERE ${queryCondition}`,
       [queryValue],
     );
 
-    if (profileQ.rows.length === 0) {
+    if (!profileQ.rows.length) {
       return res.status(404).json({ message: "Profile not found" });
     }
 
     const agent = profileQ.rows[0];
 
-    // ✅ LOGIC FIX: BUYERS ARE ALWAYS "LIVE"
     if (agent.role === "Buyer") {
       agent.status = "verified";
     }
 
-    // ✅ LOGIC FIX: ROBUST COUNTRY CODE MAPPING
-    // Uses the imported map. If exact match found, use it.
-    // If not, fallback to NULL (Frontend will show Globe 🌍)
     agent.country_code = COUNTRY_ISO_MAP[agent.country] || null;
 
-    // 3. Fetch Listings (ONLY if NOT a buyer)
     let listings = [];
 
     if (agent.role !== "buyer") {
       const listingsQ = await pool.query(
-        `SELECT * FROM listings 
-           WHERE agent_unique_id = $1 AND status = 'approved' AND is_active = true
-           ORDER BY created_at DESC`,
+        `SELECT * FROM listings
+         WHERE agent_unique_id = $1 AND status = 'approved' AND is_active = true
+         ORDER BY created_at DESC`,
         [agent.unique_id],
       );
 
-      // Normalize photos
-      listings = listingsQ.rows.map((l) => {
-        let photos = [];
-        try {
-          photos =
-            typeof l.photos === "string"
-              ? JSON.parse(l.photos)
-              : l.photos || [];
-        } catch {}
-        return {
-          ...l,
-          photos: photos.map((p) => ({ url: p.url || p, type: "image" })),
-        };
-      });
+      listings = listingsQ.rows.map((listing) => ({
+        ...listing,
+        photos: normalizePhotosForResponse(listing.photos),
+      }));
     }
 
-    // 4. Send Response
     res.json({
       agent,
       listings,
-      // Suggest a cover image for Buyers since they don't have listings
       default_cover:
         agent.role === "Buyer"
           ? "https://images.unsplash.com/photo-1560518883-ce09059eeffa?q=80&w=1973&auto=format&fit=crop"
@@ -1524,17 +1950,14 @@ export const getPublicAgentProfile = async (req, res) => {
 };
 
 /* -------------------------------------------------------
-   SINGLE AI ANALYSIS (Admin triggers manually)
+   SINGLE AI ANALYSIS
 ------------------------------------------------------- */
 export const analyzeListing = async (req, res) => {
   try {
     const { product_id } = req.params;
     console.log(`🤖 Admin requested AI Analysis for: ${product_id}...`);
 
-    // 1. Run the Python-Powered Analysis
     const report = await performFullAnalysis(product_id);
-
-    // 2. Respond immediately with the report
     res.json(report);
   } catch (err) {
     console.error("Single Analysis Error:", err);
@@ -1543,21 +1966,18 @@ export const analyzeListing = async (req, res) => {
 };
 
 /* -------------------------------------------------------
-   ✅ BATCH AI ANALYSIS (Process All Pending)
-   - Fetches all 'pending' listings
-   - Sends them to Python AI one by one (chunked)
-   - Updates status automatically
+   BATCH AI ANALYSIS
 ------------------------------------------------------- */
 export const batchAnalyzeListings = async (req, res) => {
   try {
     console.log("🚀 Starting Batch Analysis...");
 
-    // 1. Fetch Pending Listings
     const pendingListings = await pool.query(
       `SELECT product_id, agent_unique_id, title FROM listings WHERE status = 'pending'`,
     );
 
     const total = pendingListings.rows.length;
+
     if (total === 0) {
       return res.json({
         success: true,
@@ -1566,17 +1986,16 @@ export const batchAnalyzeListings = async (req, res) => {
       });
     }
 
-    // 2. ⚡ RESPOND IMMEDIATELY (Don't make Admin wait)
     res.json({
       success: true,
       message: `Batch analysis started for ${total} listings. Check admin logs/dashboard for progress.`,
     });
 
-    // 3. ⚙️ BACKGROUND PROCESSING (Fire & Forget)
     (async () => {
       console.log(`🚀 Processing ${total} listings in background...`);
+
       const allPending = pendingListings.rows;
-      const CHUNK_SIZE = 3; // Process 3 at a time (Python is heavy)
+      const CHUNK_SIZE = 3;
 
       for (let i = 0; i < allPending.length; i += CHUNK_SIZE) {
         const chunk = allPending.slice(i, i + CHUNK_SIZE);
@@ -1584,19 +2003,16 @@ export const batchAnalyzeListings = async (req, res) => {
         await Promise.all(
           chunk.map(async (listing) => {
             try {
-              // CALL THE NEW SERVICE
               const report = await performFullAnalysis(listing.product_id);
 
               let newStatus = "pending";
               let notificationTitle = "";
               let notificationMsg = "";
-              // Join flags into a readable string
-              let adminNote =
+              const adminNote =
                 report.flags && report.flags.length > 0
                   ? report.flags.join(". ")
                   : "Verified by AI.";
 
-              // LOGIC: Auto-Approve or Auto-Reject based on Python Score
               if (report.verdict === "Safe to Approve") {
                 newStatus = "approved";
                 notificationTitle = "Listing Approved";
@@ -1606,59 +2022,51 @@ export const batchAnalyzeListings = async (req, res) => {
                 notificationTitle = "Listing Rejected";
                 notificationMsg = `Your listing "${listing.title}" was rejected. Issues: ${adminNote}`;
               } else {
-                // "Manual Review Needed" -> Stay Pending, but save notes
                 await pool.query(
                   `UPDATE listings SET admin_notes = $1 WHERE product_id = $2`,
                   [`AI Flag: ${adminNote}`, listing.product_id],
                 );
-                return; // Stop here, don't change status or notify yet
+                return;
               }
 
-              // UPDATE DB STATUS
               await pool.query(
                 `UPDATE listings SET status = $1, admin_notes = $2, updated_at = NOW() WHERE product_id = $3`,
                 [newStatus, adminNote, listing.product_id],
               );
 
-              // NOTIFY AGENT
               await pool.query(
-                `INSERT INTO notifications (receiver_id, product_id, type, title, message) VALUES ($1, $2, 'listing_status', $3, $4)`,
-                [
-                  listing.agent_unique_id,
-                  listing.product_id,
-                  notificationTitle,
-                  notificationMsg,
-                ],
+                `INSERT INTO notifications (receiver_id, product_id, type, title, message)
+                 VALUES ($1, $2, 'listing_status', $3, $4)`,
+                [listing.agent_unique_id, listing.product_id, notificationTitle, notificationMsg],
               );
 
-              // REAL-TIME SOCKET
               if (req.io) {
                 req.io.to(listing.agent_unique_id).emit("notification", {
                   title: notificationTitle,
                   message: notificationMsg,
                 });
-                req.io
-                  .to(listing.agent_unique_id)
-                  .emit("listingStatusUpdated", {
-                    product_id: listing.product_id,
-                    status: newStatus,
-                  });
+
+                req.io.to(listing.agent_unique_id).emit("listingStatusUpdated", {
+                  product_id: listing.product_id,
+                  status: newStatus,
+                });
               }
 
               console.log(`✅ Analyzed ${listing.product_id}: ${newStatus}`);
-            } catch (e) {
-              console.error(`❌ Error processing ${listing.product_id}`, e);
+            } catch (err) {
+              console.error(`❌ Error processing ${listing.product_id}`, err);
             }
           }),
         );
 
-        // Wait 2 seconds between chunks to let Python breathe
-        await new Promise((r) => setTimeout(r, 2000));
+        await sleep(2000);
       }
+
       console.log("✅ Batch Analysis Complete.");
     })();
   } catch (err) {
     console.error("Batch Error:", err);
+
     if (!res.headersSent) {
       res.status(500).json({ message: "Server Error", error: err.message });
     }
