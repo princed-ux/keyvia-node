@@ -44,15 +44,53 @@ const allowedTypes = [
   "video/quicktime",
 ];
 
+const imageTypes = [
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+];
 
-const imageTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
 const videoTypes = ["video/mp4", "video/webm", "video/quicktime"];
 
-const isPrivateResource = (resourceType) => privateResourceTypes.includes(resourceType);
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const isUuid = (value) => {
+  return typeof value === "string" && UUID_RE.test(value.trim());
+};
+
+const normalizeUuidOrNull = (value) => {
+  if (!value) return null;
+
+  const v = String(value).trim();
+
+  if (!v || v === "temp") return null;
+
+  return isUuid(v) ? v : null;
+};
+
+const normalizeProductIdOrNull = (value) => {
+  if (!value) return null;
+
+  const v = String(value).trim();
+
+  if (!v || v === "temp") return null;
+
+  return isUuid(v) ? null : v;
+};
+
+const isPrivateResource = (resourceType) => {
+  return privateResourceTypes.includes(resourceType);
+};
 
 const sanitizeExtension = (fileName = "") => {
   const ext = fileName.includes(".") ? fileName.split(".").pop() : "bin";
-  return String(ext || "bin").toLowerCase().replace(/[^a-z0-9]/g, "") || "bin";
+
+  return String(ext || "bin")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "") || "bin";
 };
 
 const buildPublicFileUrl = (key) => {
@@ -68,16 +106,17 @@ const getFolder = (resourceType) => {
   if (resourceType === "profile") return "profiles";
   if (resourceType === "document") return "private/documents";
   if (resourceType === "license") return "private/licenses";
+
   return "general";
 };
 
-const buildS3Key = ({ fileName, resourceType, resourceId }) => {
+const buildS3Key = ({ fileName, resourceType, folderId }) => {
   const uploadId = uuidv4();
   const fileExtension = sanitizeExtension(fileName);
-  const safeResourceId = resourceId || "temp";
+  const safeFolderId = folderId || "temp";
   const folder = getFolder(resourceType);
 
-  return `${folder}/${safeResourceId}/${uploadId}.${fileExtension}`;
+  return `${folder}/${safeFolderId}/${uploadId}.${fileExtension}`;
 };
 
 const getCacheControl = (fileType, privateFile) => {
@@ -90,12 +129,19 @@ const getCacheControl = (fileType, privateFile) => {
   return "public, max-age=86400";
 };
 
-const normalizeUuidOrNull = (value) => {
-  if (!value || String(value).trim() === "" || String(value).trim() === "temp") {
-    return null;
-  }
-
-  return String(value);
+const getSafeFolderId = ({
+  productId,
+  draftListingId,
+  listingUuid,
+  resourceId,
+}) => {
+  return (
+    productId ||
+    draftListingId ||
+    listingUuid ||
+    resourceId ||
+    "temp"
+  );
 };
 
 const insertUploadRecord = async ({
@@ -106,8 +152,19 @@ const insertUploadRecord = async ({
   fileType,
   resourceType,
   resourceId,
+  productId,
+  draftListingId,
+  listingUuid,
   visibility,
 }) => {
+  const normalizedResourceId = normalizeUuidOrNull(resourceId);
+  const normalizedListingUuid = normalizeUuidOrNull(listingUuid);
+
+  const normalizedProductId =
+    productId ||
+    draftListingId ||
+    normalizeProductIdOrNull(resourceId);
+
   await pool.query(
     `
     INSERT INTO s3_uploads (
@@ -118,9 +175,24 @@ const insertUploadRecord = async ({
       file_type,
       resource_type,
       resource_id,
+      product_id,
+      draft_listing_id,
+      listing_uuid,
       visibility
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    VALUES (
+      $1::uuid,
+      $2,
+      $3,
+      $4,
+      $5,
+      $6,
+      $7::uuid,
+      $8,
+      $9,
+      $10::uuid,
+      $11
+    )
     `,
     [
       userId,
@@ -129,7 +201,10 @@ const insertUploadRecord = async ({
       fileName,
       fileType,
       resourceType,
-      normalizeUuidOrNull(resourceId),
+      normalizedResourceId,
+      normalizedProductId,
+      draftListingId || normalizedProductId,
+      normalizedListingUuid,
       visibility,
     ],
   );
@@ -137,13 +212,24 @@ const insertUploadRecord = async ({
 
 router.post("/generate-presigned-url", async (req, res) => {
   try {
-    const { file_name, file_type, resource_type, resource_id } = req.body;
+    const {
+      file_name,
+      file_type,
+      resource_type,
+      resource_id,
+      product_id,
+      draft_listing_id,
+      listing_uuid,
+    } = req.body;
+
     const userId = getUserId(req);
 
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
     if (!S3_BUCKET) {
-      return res.status(500).json({ error: "AWS_S3_BUCKET is not configured" });
+      return res.status(500).json({
+        error: "AWS_S3_BUCKET is not configured",
+      });
     }
 
     if (!file_name || !file_type || !resource_type) {
@@ -164,10 +250,18 @@ router.post("/generate-presigned-url", async (req, res) => {
 
     const privateFile = isPrivateResource(resource_type);
     const visibility = privateFile ? "private" : "public";
+
+    const safeFolderId = getSafeFolderId({
+      productId: product_id,
+      draftListingId: draft_listing_id,
+      listingUuid: listing_uuid,
+      resourceId: resource_id,
+    });
+
     const s3Key = buildS3Key({
       fileName: file_name,
       resourceType: resource_type,
-      resourceId: resource_id,
+      folderId: safeFolderId,
     });
 
     const command = new PutObjectCommand({
@@ -178,7 +272,10 @@ router.post("/generate-presigned-url", async (req, res) => {
       Metadata: {
         uploaded_by: String(userId),
         resource_type: String(resource_type),
-        resource_id: String(resource_id || "temp"),
+        resource_id: String(resource_id || ""),
+        product_id: String(product_id || draft_listing_id || ""),
+        draft_listing_id: String(draft_listing_id || product_id || ""),
+        listing_uuid: String(listing_uuid || ""),
         visibility,
       },
     });
@@ -197,6 +294,9 @@ router.post("/generate-presigned-url", async (req, res) => {
       fileType: file_type,
       resourceType: resource_type,
       resourceId: resource_id,
+      productId: product_id,
+      draftListingId: draft_listing_id,
+      listingUuid: listing_uuid,
       visibility,
     });
 
@@ -212,19 +312,32 @@ router.post("/generate-presigned-url", async (req, res) => {
     });
   } catch (error) {
     console.error("S3 Presigned URL Error:", error);
-    return res.status(500).json({ error: "Failed to generate presigned URL" });
+    return res.status(500).json({
+      error: "Failed to generate presigned URL",
+      details: error?.message,
+    });
   }
 });
 
 router.post("/generate-bulk-urls", async (req, res) => {
   try {
-    const { files, resource_type, resource_id } = req.body;
+    const {
+      files,
+      resource_type,
+      resource_id,
+      product_id,
+      draft_listing_id,
+      listing_uuid,
+    } = req.body;
+
     const userId = getUserId(req);
 
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
     if (!S3_BUCKET) {
-      return res.status(500).json({ error: "AWS_S3_BUCKET is not configured" });
+      return res.status(500).json({
+        error: "AWS_S3_BUCKET is not configured",
+      });
     }
 
     if (!Array.isArray(files) || files.length === 0) {
@@ -241,6 +354,14 @@ router.post("/generate-bulk-urls", async (req, res) => {
 
     const privateFile = isPrivateResource(resource_type);
     const visibility = privateFile ? "private" : "public";
+
+    const safeFolderId = getSafeFolderId({
+      productId: product_id,
+      draftListingId: draft_listing_id,
+      listingUuid: listing_uuid,
+      resourceId: resource_id,
+    });
+
     const presignedUrls = [];
 
     for (const file of files) {
@@ -261,7 +382,7 @@ router.post("/generate-bulk-urls", async (req, res) => {
       const s3Key = buildS3Key({
         fileName: file_name,
         resourceType: resource_type,
-        resourceId: resource_id,
+        folderId: safeFolderId,
       });
 
       const command = new PutObjectCommand({
@@ -272,7 +393,10 @@ router.post("/generate-bulk-urls", async (req, res) => {
         Metadata: {
           uploaded_by: String(userId),
           resource_type: String(resource_type),
-          resource_id: String(resource_id || "temp"),
+          resource_id: String(resource_id || ""),
+          product_id: String(product_id || draft_listing_id || ""),
+          draft_listing_id: String(draft_listing_id || product_id || ""),
+          listing_uuid: String(listing_uuid || ""),
           visibility,
         },
       });
@@ -301,6 +425,9 @@ router.post("/generate-bulk-urls", async (req, res) => {
         fileType: file_type,
         resourceType: resource_type,
         resourceId: resource_id,
+        productId: product_id,
+        draftListingId: draft_listing_id,
+        listingUuid: listing_uuid,
         visibility,
       });
     }
@@ -315,20 +442,32 @@ router.post("/generate-bulk-urls", async (req, res) => {
     });
   } catch (error) {
     console.error("Bulk URL Generation Error:", error);
-    return res.status(500).json({ error: "Failed to generate bulk URLs" });
+    return res.status(500).json({
+      error: "Failed to generate bulk URLs",
+      details: error?.message,
+    });
   }
 });
 
 router.post("/confirm-upload", async (req, res) => {
   try {
-    const { s3_key, resource_type, resource_id } = req.body;
+    const {
+      s3_key,
+      resource_type,
+      resource_id,
+      product_id,
+      draft_listing_id,
+      listing_uuid,
+    } = req.body;
+
     const userId = getUserId(req);
 
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    if (!s3_key || !resource_type || !resource_id) {
+    if (!s3_key || !resource_type || (!resource_id && !product_id && !draft_listing_id)) {
       return res.status(400).json({
-        error: "Missing required fields: s3_key, resource_type, resource_id",
+        error:
+          "Missing required fields: s3_key, resource_type, and one of resource_id/product_id/draft_listing_id",
       });
     }
 
@@ -337,7 +476,7 @@ router.post("/confirm-upload", async (req, res) => {
       SELECT id, s3_url, visibility
       FROM s3_uploads
       WHERE s3_key = $1
-        AND uploader_id = $2
+        AND uploader_id = $2::uuid
       LIMIT 1
       `,
       [s3_key, userId],
@@ -349,14 +488,30 @@ router.post("/confirm-upload", async (req, res) => {
 
     const { s3_url, visibility } = uploadCheck.rows[0];
 
+    const normalizedProductId =
+      product_id ||
+      draft_listing_id ||
+      normalizeProductIdOrNull(resource_id);
+
     await pool.query(
       `
       UPDATE s3_uploads
-      SET resource_id = $1
-      WHERE s3_key = $2
-        AND uploader_id = $3
+      SET
+        resource_id = $1::uuid,
+        product_id = COALESCE($2, product_id),
+        draft_listing_id = COALESCE($3, draft_listing_id),
+        listing_uuid = COALESCE($4::uuid, listing_uuid)
+      WHERE s3_key = $5
+        AND uploader_id = $6::uuid
       `,
-      [normalizeUuidOrNull(resource_id), s3_key, userId],
+      [
+        normalizeUuidOrNull(resource_id),
+        normalizedProductId,
+        draft_listing_id || normalizedProductId,
+        normalizeUuidOrNull(listing_uuid),
+        s3_key,
+        userId,
+      ],
     );
 
     return res.json({
@@ -368,7 +523,10 @@ router.post("/confirm-upload", async (req, res) => {
     });
   } catch (error) {
     console.error("Upload Confirmation Error:", error);
-    return res.status(500).json({ error: "Failed to confirm upload" });
+    return res.status(500).json({
+      error: "Failed to confirm upload",
+      details: error?.message,
+    });
   }
 });
 
@@ -401,7 +559,7 @@ router.get("/get-presigned-url", async (req, res) => {
       WHERE s3_key = $1
       LIMIT 1
       `,
-      [normalizedKey]
+      [normalizedKey],
     );
 
     const record = uploadRecord.rows[0];
@@ -433,12 +591,6 @@ router.get("/get-presigned-url", async (req, res) => {
         });
       }
     } else {
-      /**
-       * Fallback:
-       * Older onboarding uploads saved document keys directly on users table
-       * but did not always create a row in s3_uploads.
-       * Admins should still be able to view private verification documents.
-       */
       const looksLikeVerificationDoc =
         normalizedKey.startsWith("documents/") ||
         normalizedKey.startsWith("private/documents/") ||
@@ -465,7 +617,10 @@ router.get("/get-presigned-url", async (req, res) => {
     });
   } catch (error) {
     console.error("Get Presigned URL Error:", error);
-    return res.status(500).json({ error: "Failed to generate download URL" });
+    return res.status(500).json({
+      error: "Failed to generate download URL",
+      details: error?.message,
+    });
   }
 });
 
@@ -513,7 +668,7 @@ router.delete("/delete", async (req, res) => {
       `
       DELETE FROM s3_uploads
       WHERE s3_key = $1
-        AND uploader_id = $2
+        AND uploader_id = $2::uuid
       `,
       [s3_key, userId],
     );
@@ -525,7 +680,10 @@ router.delete("/delete", async (req, res) => {
     });
   } catch (error) {
     console.error("S3 Delete Error:", error);
-    return res.status(500).json({ error: "Failed to delete file" });
+    return res.status(500).json({
+      error: "Failed to delete file",
+      details: error?.message,
+    });
   }
 });
 

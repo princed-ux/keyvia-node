@@ -9,8 +9,19 @@ import { evaluateListingRisk } from "../services/listingRiskService.js";
 import { enforceListingLimit } from "../services/subscriptionService.js";
 
 /* ----------------- helpers ----------------- */
-function generateProductId() {
-  return "PRD-" + crypto.randomUUID().split("-")[0].toUpperCase();
+async function generateUniqueProductId() {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const productId = "PRD-" + crypto.randomUUID().split("-")[0].toUpperCase();
+
+    const exists = await pool.query(
+      `SELECT 1 FROM listings WHERE product_id = $1 LIMIT 1`,
+      [productId],
+    );
+
+    if (exists.rowCount === 0) return productId;
+  }
+
+  throw new Error("Unable to generate unique product ID.");
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,10 +48,13 @@ const normalizeFeatures = (features) => {
 
   try {
     if (features) {
-      featuresArr = typeof features === "string" ? JSON.parse(features) : features;
+      featuresArr =
+        typeof features === "string" ? JSON.parse(features) : features;
 
       if (!Array.isArray(featuresArr) && typeof featuresArr === "object") {
-        featuresArr = Object.keys(featuresArr).filter((key) => featuresArr[key]);
+        featuresArr = Object.keys(featuresArr).filter(
+          (key) => featuresArr[key],
+        );
       }
     }
   } catch {
@@ -70,9 +84,15 @@ const normalizeExistingPhotos = (existing = []) => {
       return {
         url: photo.url || photo.secure_url || null,
         key: photo.key || photo.s3_key || null,
-        public_id: photo.public_id || photo.publicId || photo.key || photo.s3_key || null,
+        public_id:
+          photo.public_id ||
+          photo.publicId ||
+          photo.key ||
+          photo.s3_key ||
+          null,
         type: photo.type || "image",
-        provider: photo.provider || (photo.key || photo.s3_key ? "s3" : "legacy"),
+        provider:
+          photo.provider || (photo.key || photo.s3_key ? "s3" : "legacy"),
         bucket: photo.bucket || null,
       };
     })
@@ -90,7 +110,9 @@ const normalizePhotosForResponse = (photosValue) => {
 /* ----------------- AWS S3 MEDIA HELPERS ----------------- */
 
 const AWS_S3_BUCKET = process.env.AWS_S3_BUCKET;
-const LISTING_UPLOAD_CONCURRENCY = Number(process.env.LISTING_UPLOAD_CONCURRENCY || 3);
+const LISTING_UPLOAD_CONCURRENCY = Number(
+  process.env.LISTING_UPLOAD_CONCURRENCY || 3,
+);
 const LISTING_PHOTO_LIMITS = {
   free: 25,
   basic: 25,
@@ -112,10 +134,7 @@ const LISTING_PHOTO_LIMITS = {
 
 const getListingPhotoLimit = (user = {}) => {
   const plan = String(
-    user.subscription_plan ||
-      user.plan ||
-      user.account_plan ||
-      "free",
+    user.subscription_plan || user.plan || user.account_plan || "free",
   ).toLowerCase();
 
   return LISTING_PHOTO_LIMITS[plan] || 25;
@@ -211,7 +230,11 @@ const deleteListingAsset = async (asset) => {
   await deleteS3Asset(key);
 };
 
-const uploadPhotosWithLimit = async (photoFiles = [], listingId, photoLimit = 25) => {
+const uploadPhotosWithLimit = async (
+  photoFiles = [],
+  listingId,
+  photoLimit = 25,
+) => {
   const uploadedPhotos = [];
   const validPhotos = photoFiles.filter(Boolean).slice(0, photoLimit);
   const chunks = chunkArray(validPhotos, LISTING_UPLOAD_CONCURRENCY);
@@ -225,7 +248,10 @@ const uploadPhotosWithLimit = async (photoFiles = [], listingId, photoLimit = 25
       if (result.status === "fulfilled" && result.value) {
         uploadedPhotos.push(result.value);
       } else {
-        console.error("❌ Photo upload failed:", result.reason?.message || result.reason);
+        console.error(
+          "❌ Photo upload failed:",
+          result.reason?.message || result.reason,
+        );
       }
     }
   }
@@ -268,7 +294,9 @@ const processGeolocation = async (address, city, state, country, zip) => {
       return null;
     } catch (error) {
       if (error.response?.status === 429) {
-        console.warn(`⏳ Geocoding rate limit hit. Retrying attempt ${attempt}/3...`);
+        console.warn(
+          `⏳ Geocoding rate limit hit. Retrying attempt ${attempt}/3...`,
+        );
       } else {
         console.error("❌ Geocoding API Error:", error.message);
         if (attempt === 3) return null;
@@ -291,14 +319,22 @@ const runBackgroundProcessing = async (
   console.log(`⚙️ AWS background processing started for ${listingId}...`);
 
   try {
-    const uploadedPhotos = await uploadPhotosWithLimit(photoFiles, listingId, 25);
+    const uploadedPhotos = await uploadPhotosWithLimit(
+      photoFiles,
+      listingId,
+      25,
+    );
 
     let finalVideoUrl = null;
     let finalVideoKey = null;
 
     if (videoFile) {
       try {
-        const uploadedVideo = await uploadListingVideoToS3(videoFile, listingId, "video");
+        const uploadedVideo = await uploadListingVideoToS3(
+          videoFile,
+          listingId,
+          "video",
+        );
         finalVideoUrl = uploadedVideo?.url || null;
         finalVideoKey = uploadedVideo?.key || null;
       } catch (err) {
@@ -372,7 +408,10 @@ const runBackgroundProcessing = async (
 
     console.log(`✅ AWS media processing complete for ${listingId}.`);
   } catch (error) {
-    console.error(`❌ AWS background processing failed for ${listingId}:`, error);
+    console.error(
+      `❌ AWS background processing failed for ${listingId}:`,
+      error,
+    );
 
     try {
       await pool.query(
@@ -383,7 +422,10 @@ const runBackgroundProcessing = async (
             updated_at = NOW()
         WHERE product_id = $2
         `,
-        [`System Error: Upload failed. Please try again. (${error.message})`, listingId],
+        [
+          `System Error: Upload failed. Please try again. (${error.message})`,
+          listingId,
+        ],
       );
     } catch (dbErr) {
       console.error("❌ Failed to mark listing as draft:", dbErr.message);
@@ -405,23 +447,34 @@ const runUpdateBackgroundProcessing = async (listingId, data = {}) => {
 
   try {
     if (removeList.length > 0) {
-      Promise.allSettled(removeList.map((asset) => deleteListingAsset(asset))).catch((err) =>
+      Promise.allSettled(
+        removeList.map((asset) => deleteListingAsset(asset)),
+      ).catch((err) =>
         console.warn("⚠️ Background S3 delete failed:", err.message),
       );
     }
 
-    const uploadedPhotos = await uploadPhotosWithLimit(photoFiles, listingId, 25);
-
-    const currentRes = await pool.query("SELECT photos FROM listings WHERE product_id = $1", [
+    const uploadedPhotos = await uploadPhotosWithLimit(
+      photoFiles,
       listingId,
-    ]);
+      25,
+    );
 
-    let currentPhotos = normalizeExistingPhotos(currentRes.rows[0]?.photos || []);
+    const currentRes = await pool.query(
+      "SELECT photos FROM listings WHERE product_id = $1",
+      [listingId],
+    );
+
+    let currentPhotos = normalizeExistingPhotos(
+      currentRes.rows[0]?.photos || [],
+    );
 
     if (removeList.length > 0) {
       const removeSet = new Set(
         removeList.map((item) =>
-          typeof item === "string" ? item : item?.key || item?.s3_key || item?.public_id,
+          typeof item === "string"
+            ? item
+            : item?.key || item?.s3_key || item?.public_id,
         ),
       );
 
@@ -454,7 +507,11 @@ const runUpdateBackgroundProcessing = async (listingId, data = {}) => {
 
     if (videoFile) {
       try {
-        const uploadedVideo = await uploadListingVideoToS3(videoFile, listingId, "video");
+        const uploadedVideo = await uploadListingVideoToS3(
+          videoFile,
+          listingId,
+          "video",
+        );
         videoUpdates.video_url = uploadedVideo?.url || null;
         videoUpdates.video_public_id = uploadedVideo?.key || null;
       } catch (err) {
@@ -539,7 +596,9 @@ const runDeleteBackgroundCleanup = async (assets = []) => {
   console.log(`🗑️ Starting AWS cleanup for ${assets.length} assets...`);
 
   try {
-    const results = await Promise.allSettled(assets.map((asset) => deleteListingAsset(asset)));
+    const results = await Promise.allSettled(
+      assets.map((asset) => deleteListingAsset(asset)),
+    );
     const failed = results.filter((result) => result.status === "rejected");
 
     if (failed.length) {
@@ -551,9 +610,6 @@ const runDeleteBackgroundCleanup = async (assets = []) => {
     console.error("❌ AWS background cleanup error:", err.message);
   }
 };
-
-
-
 
 /* -------------------------------------------------------
    CREATE LISTING
@@ -667,7 +723,7 @@ export const createListing = async (req, res) => {
       });
     }
 
-    const product_id = generateProductId();
+    const product_id = await generateUniqueProductId();
 
     const safePhotos = Array.isArray(b.photos)
       ? b.photos.slice(0, photoLimit)
@@ -997,7 +1053,9 @@ export const createListing = async (req, res) => {
         JSON.stringify(safePhotos),
         JSON.stringify(Array.isArray(b.floor_plans) ? b.floor_plans : []),
         JSON.stringify(Array.isArray(b.staging_photos) ? b.staging_photos : []),
-        JSON.stringify(Array.isArray(b.panorama_photos) ? b.panorama_photos : []),
+        JSON.stringify(
+          Array.isArray(b.panorama_photos) ? b.panorama_photos : [],
+        ),
         videoUrl,
         videoKey,
         virtualUrl,
@@ -1059,10 +1117,6 @@ export const createListing = async (req, res) => {
   }
 };
 
-
-
- 
-
 /* -------------------------------------------------------
    UPDATE LISTING - DIRECT S3 / PRODUCTION STYLE
 ------------------------------------------------------- */
@@ -1079,7 +1133,7 @@ export const updateListing = async (req, res) => {
 
     const found = await pool.query(
       "SELECT * FROM listings WHERE product_id=$1",
-      [product_id]
+      [product_id],
     );
 
     const listing = found.rows[0];
@@ -1088,16 +1142,18 @@ export const updateListing = async (req, res) => {
       return res.status(404).json({ message: "Listing not found" });
     }
 
-    const listingOwnerId = listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
+    const listingOwnerId =
+      listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
 
-if (String(listingOwnerId) !== String(userId)) {
-  return res.status(403).json({ message: "Forbidden" });
-}
+    if (String(listingOwnerId) !== String(userId)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
     const b = req.body;
 
     const toNum = (value, previous) => {
-      if (value === undefined || value === null || value === "") return previous;
+      if (value === undefined || value === null || value === "")
+        return previous;
       const n = Number(value);
       return Number.isFinite(n) ? n : previous;
     };
@@ -1121,8 +1177,8 @@ if (String(listingOwnerId) !== String(userId)) {
         removeList.map((item) =>
           typeof item === "string"
             ? item
-            : item?.key || item?.s3_key || item?.public_id
-        )
+            : item?.key || item?.s3_key || item?.public_id,
+        ),
       );
 
       currentPhotos = currentPhotos.filter((photo) => {
@@ -1143,7 +1199,7 @@ if (String(listingOwnerId) !== String(userId)) {
         finalPhotos.map((photo) => [
           photo.key || photo.s3_key || photo.public_id || photo.url,
           photo,
-        ])
+        ]),
       );
 
       const reordered = [];
@@ -1171,29 +1227,28 @@ if (String(listingOwnerId) !== String(userId)) {
     }
 
     const planRes = await pool.query(
-  `
+      `
   SELECT subscription_plan, subscription_status
   FROM users
   WHERE unique_id = $1::uuid
   LIMIT 1
   `,
-  [String(userId)],
-);
+      [String(userId)],
+    );
 
-const photoLimit = getListingPhotoLimit(planRes.rows[0] || {});
+    const photoLimit = getListingPhotoLimit(planRes.rows[0] || {});
 
     finalPhotos = finalPhotos.slice(0, photoLimit);
 
     const featuresArr = normalizeFeatures(
-      b.features || b.amenities || listing.features
+      b.features || b.amenities || listing.features,
     );
 
     const newAddr = b.address ?? listing.address;
     const newCity = b.city ?? listing.city;
     const newState = b.state ?? listing.state;
     const newCountry = b.country ?? listing.country;
-    const newZip =
-      b.zip_code || b.zipCode || b.postal_code || listing.zip_code;
+    const newZip = b.zip_code || b.zipCode || b.postal_code || listing.zip_code;
 
     const latitude =
       b.latitude !== undefined && b.latitude !== null && b.latitude !== ""
@@ -1278,7 +1333,10 @@ const photoLimit = getListingPhotoLimit(planRes.rows[0] || {});
       b.title ?? listing.title,
       b.description ?? listing.description,
       toNum(b.price, listing.price),
-      b.price_currency || b.priceCurrency || b.currency || listing.price_currency,
+      b.price_currency ||
+        b.priceCurrency ||
+        b.currency ||
+        listing.price_currency,
       b.price_period ?? b.pricePeriod ?? listing.price_period,
       b.category ?? listing.category,
       b.property_type || b.propertyType || listing.property_type,
@@ -1296,7 +1354,7 @@ const photoLimit = getListingPhotoLimit(planRes.rows[0] || {});
       toNum(b.year_built || b.yearBuilt, listing.year_built),
       toNum(
         b.square_footage || b.squareFootage || b.area_sqft,
-        listing.square_footage
+        listing.square_footage,
       ),
       b.furnishing ?? listing.furnishing,
       toNum(b.lot_size || b.lotSize || b.land_area_sqft, listing.lot_size),
@@ -1331,7 +1389,6 @@ const photoLimit = getListingPhotoLimit(planRes.rows[0] || {});
   }
 };
 
-
 export const deleteListing = async (req, res) => {
   try {
     const product_id =
@@ -1348,7 +1405,7 @@ export const deleteListing = async (req, res) => {
 
     const found = await pool.query(
       "SELECT photos, video_public_id, virtual_tour_public_id, uploaded_by_id, agent_unique_id, created_by FROM listings WHERE product_id=$1",
-      [product_id]
+      [product_id],
     );
 
     const listing = found.rows[0];
@@ -1360,14 +1417,15 @@ export const deleteListing = async (req, res) => {
       });
     }
 
-    const listingOwnerId = listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
+    const listingOwnerId =
+      listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
 
-if (String(listingOwnerId) !== String(userId)) {
-  return res.status(403).json({
-    message: "Not authorized",
-    code: "FORBIDDEN",
-  });
-}
+    if (String(listingOwnerId) !== String(userId)) {
+      return res.status(403).json({
+        message: "Not authorized",
+        code: "FORBIDDEN",
+      });
+    }
 
     // ✅ collect S3 keys
     const assetsToDelete = [];
@@ -1387,7 +1445,7 @@ if (String(listingOwnerId) !== String(userId)) {
     }
 
     // ✅ delete DB first (FAST)
-    await pool.query("DELETE FROM notifications WHERE product_id=$1", [product_id]);
+    // Do not delete notifications by product_id unless the notifications table has that column.
     await pool.query("DELETE FROM listings WHERE product_id=$1", [product_id]);
 
     // ✅ respond immediately (DO NOT WAIT FOR S3)
@@ -1406,9 +1464,9 @@ if (String(listingOwnerId) !== String(userId)) {
                 new DeleteObjectCommand({
                   Bucket: process.env.AWS_S3_BUCKET,
                   Key: key,
-                })
-              )
-            )
+                }),
+              ),
+            ),
           );
           console.log("🗑️ S3 cleanup complete");
         } catch (err) {
@@ -1416,7 +1474,6 @@ if (String(listingOwnerId) !== String(userId)) {
         }
       });
     }
-
   } catch (err) {
     console.error("[DeleteListing] Error:", err);
 
@@ -1538,7 +1595,14 @@ export const getListings = async (req, res) => {
       paramCounter++;
     }
 
-    if (!polygon && minLat && maxLat && minLng && maxLng && !isNaN(Number(minLat))) {
+    if (
+      !polygon &&
+      minLat &&
+      maxLat &&
+      minLng &&
+      maxLng &&
+      !isNaN(Number(minLat))
+    ) {
       queryText += `
         AND l.latitude::numeric >= $${paramCounter}
         AND l.latitude::numeric <= $${paramCounter + 1}
@@ -1623,44 +1687,64 @@ export const getAgentListings = async (req, res) => {
 
     const result = await pool.query(query, [String(userId)]);
 
-    const rows = result.rows.map((row) => ({
-      ...row,
+    const rows = result.rows.map((row) => {
+      // Calculate display_status based on status and is_active
+      let display_status = "draft";
+      if (row.status === "draft") {
+        display_status = "draft";
+      } else if (row.status === "pending") {
+        display_status = "pending";
+      } else if (row.status === "rejected") {
+        display_status = "rejected";
+      } else if (row.status === "approved") {
+        display_status = row.is_active ? "live" : "approved";
+      }
 
-      photos: normalizePhotosForResponse(row.photos),
-      features: safeJsonParse(row.features, []),
-      amenities: safeJsonParse(row.amenities, []),
+      return {
+        ...row,
 
-      latitude: row.latitude ? parseFloat(row.latitude) : null,
-      longitude: row.longitude ? parseFloat(row.longitude) : null,
+        photos: normalizePhotosForResponse(row.photos),
+        features: safeJsonParse(row.features, []),
+        amenities: safeJsonParse(row.amenities, []),
 
-      // Frontend compatibility with older UI names
-      agent_unique_id: row.uploaded_by_id,
-      created_by: row.uploaded_by_id,
-      price_currency: row.price_currency || row.currency || "USD",
-      square_footage: row.square_footage || row.area_sqft || null,
-      zip_code: row.zip_code || row.postal_code || null,
-      payment_status: row.payment_status || "unpaid",
+        latitude: row.latitude ? parseFloat(row.latitude) : null,
+        longitude: row.longitude ? parseFloat(row.longitude) : null,
 
-      agent_role: row.uploader_role,
-      role: row.uploader_role,
+        // Frontend compatibility with older UI names
+        agent_unique_id: row.uploaded_by_id,
+        created_by: row.uploaded_by_id,
+        price_currency: row.price_currency || row.currency || "USD",
+        square_footage: row.square_footage || row.area_sqft || null,
+        zip_code: row.zip_code || row.postal_code || null,
+        payment_status: row.payment_status || "unpaid",
 
-      agent: {
-        unique_id: row.uploader_unique_id,
-        name: row.uploader_name,
-        full_name: row.uploader_name,
-        email: row.uploader_email,
-        phone: row.uploader_phone,
+        agent_role: row.uploader_role,
         role: row.uploader_role,
-        avatar_url: row.uploader_avatar_url,
-        bio: row.uploader_bio,
-        country: row.uploader_country,
-        city: row.uploader_city,
-        brokerage_name: row.uploader_brokerage_name,
-        verification_status: row.uploader_verification_status,
-        is_verified: row.uploader_is_verified,
-        is_verified_agent: row.uploader_is_verified_agent,
-      },
-    }));
+
+        // Normalized fields for frontend
+        display_status,
+        is_draft: row.status === "draft",
+        current_step: row.current_step || null,
+        autosaved_at: row.autosaved_at || null,
+
+        agent: {
+          unique_id: row.uploader_unique_id,
+          name: row.uploader_name,
+          full_name: row.uploader_name,
+          email: row.uploader_email,
+          phone: row.uploader_phone,
+          role: row.uploader_role,
+          avatar_url: row.uploader_avatar_url,
+          bio: row.uploader_bio,
+          country: row.uploader_country,
+          city: row.uploader_city,
+          brokerage_name: row.uploader_brokerage_name,
+          verification_status: row.uploader_verification_status,
+          is_verified: row.uploader_is_verified,
+          is_verified_agent: row.uploader_is_verified_agent,
+        },
+      };
+    });
 
     return res.json(rows);
   } catch (err) {
@@ -1702,7 +1786,9 @@ export const getListingByProductId = async (req, res) => {
     const isPublicReady = row.status === "approved" && row.is_active === true;
 
     if (!isPublicReady && !isOwner) {
-      return res.status(403).json({ message: "This listing is not currently active." });
+      return res
+        .status(403)
+        .json({ message: "This listing is not currently active." });
     }
 
     res.json({
@@ -1743,7 +1829,10 @@ export const updateListingStatus = async (req, res) => {
       return res.status(400).json({ message: "Invalid status value" });
     }
 
-    const existing = await pool.query(`SELECT * FROM listings WHERE product_id=$1`, [product_id]);
+    const existing = await pool.query(
+      `SELECT * FROM listings WHERE product_id=$1`,
+      [product_id],
+    );
     const listing = existing.rows[0];
 
     if (!listing) return res.status(404).json({ message: "Listing not found" });
@@ -1766,7 +1855,11 @@ export const updateListingStatus = async (req, res) => {
       RETURNING *;
     `;
 
-    const result = await pool.query(updateQuery, [status, isActiveValue, product_id]);
+    const result = await pool.query(updateQuery, [
+      status,
+      isActiveValue,
+      product_id,
+    ]);
     const updatedListing = result.rows[0];
 
     let notifyMsg = `Your listing was ${status}.`;
@@ -1884,9 +1977,10 @@ export const getPublicAgentProfile = async (req, res) => {
     let queryCondition = "";
     let queryValue = unique_id;
 
-    const isUUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-      unique_id,
-    );
+    const isUUID =
+      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
+        unique_id,
+      );
 
     if (isUUID) {
       queryCondition = "unique_id = $1";
@@ -2037,7 +2131,12 @@ export const batchAnalyzeListings = async (req, res) => {
               await pool.query(
                 `INSERT INTO notifications (receiver_id, product_id, type, title, message)
                  VALUES ($1, $2, 'listing_status', $3, $4)`,
-                [listing.agent_unique_id, listing.product_id, notificationTitle, notificationMsg],
+                [
+                  listing.agent_unique_id,
+                  listing.product_id,
+                  notificationTitle,
+                  notificationMsg,
+                ],
               );
 
               if (req.io) {
@@ -2046,10 +2145,12 @@ export const batchAnalyzeListings = async (req, res) => {
                   message: notificationMsg,
                 });
 
-                req.io.to(listing.agent_unique_id).emit("listingStatusUpdated", {
-                  product_id: listing.product_id,
-                  status: newStatus,
-                });
+                req.io
+                  .to(listing.agent_unique_id)
+                  .emit("listingStatusUpdated", {
+                    product_id: listing.product_id,
+                    status: newStatus,
+                  });
               }
 
               console.log(`✅ Analyzed ${listing.product_id}: ${newStatus}`);
@@ -2070,5 +2171,425 @@ export const batchAnalyzeListings = async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({ message: "Server Error", error: err.message });
     }
+  }
+};
+
+export const createListingDraft = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const b = req.body;
+
+    if (!b.title || !b.listing_type || !b.property_type || !b.price) {
+      return res.status(400).json({
+        message: "Complete the listing basics before saving draft.",
+        code: "DRAFT_BASICS_REQUIRED",
+      });
+    }
+
+    const product_id = await generateUniqueProductId();
+
+    const price = toNumberOrNull(b.price);
+
+    if (!price || price <= 0) {
+      return res.status(400).json({
+        message: "Invalid listing price.",
+        code: "INVALID_PRICE",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO listings (
+        product_id,
+        draft_listing_id,
+        uploaded_by_id,
+        created_by,
+        agent_unique_id,
+
+        title,
+        property_type,
+        property_subtype,
+        listing_type,
+        category,
+
+        price,
+        currency,
+        price_currency,
+        price_period,
+
+        country,
+        state,
+        city,
+
+        status,
+        moderation_status,
+        is_active,
+        payment_status,
+        current_step,
+        draft_data,
+        autosaved_at,
+        last_updated_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $1,
+        $2::uuid,
+        $2::uuid,
+        $2::uuid,
+
+        $3,
+        $4,
+        $5,
+        $6,
+        $6,
+
+        $7,
+        $8,
+        $8,
+        $9,
+
+        $10,
+        $11,
+        $12,
+
+        'draft',
+        'draft',
+        false,
+        'unpaid',
+        $13,
+        $14::jsonb,
+        NOW(),
+        NOW(),
+        NOW(),
+        NOW()
+      )
+      RETURNING *;
+      `,
+      [
+        product_id,
+        String(userId),
+
+        b.title,
+        b.property_type || b.propertyType,
+        b.property_subtype || b.propertySubtype || null,
+        b.listing_type || b.listingType,
+
+        price,
+        b.currency || b.price_currency || b.priceCurrency || "USD",
+        b.price_period || b.pricePeriod || null,
+
+        b.country || null,
+        b.state || null,
+        b.city || null,
+
+        b.current_step || "location",
+        JSON.stringify(b.draft_data || b),
+      ],
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: "Draft created.",
+      listing: result.rows[0],
+    });
+  } catch (err) {
+    console.error("[CreateListingDraft] Error:", err);
+
+    return res.status(500).json({
+      message: "Failed to create listing draft.",
+      code: "CREATE_DRAFT_FAIL",
+      details: err?.message,
+    });
+  }
+};
+
+export const updateListingDraft = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+    const { product_id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const existing = await pool.query(
+      `
+      SELECT product_id
+      FROM listings
+      WHERE product_id = $1
+      AND uploaded_by_id = $2::uuid
+      AND status = 'draft'
+      LIMIT 1;
+      `,
+      [product_id, String(userId)],
+    );
+
+    if (!existing.rows[0]) {
+      return res.status(404).json({
+        message: "Draft not found.",
+        code: "DRAFT_NOT_FOUND",
+      });
+    }
+
+    const b = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE listings
+      SET
+        title = COALESCE($1, title),
+        description = COALESCE($2, description),
+
+        property_type = COALESCE($3, property_type),
+        property_subtype = COALESCE($4, property_subtype),
+        listing_type = COALESCE($5, listing_type),
+        category = COALESCE($5, category),
+
+        price = COALESCE($6, price),
+        currency = COALESCE($7, currency),
+        price_currency = COALESCE($7, price_currency),
+        price_period = COALESCE($8, price_period),
+
+        address = COALESCE($9, address),
+        city = COALESCE($10, city),
+        state = COALESCE($11, state),
+        country = COALESCE($12, country),
+        zip_code = COALESCE($13, zip_code),
+        postal_code = COALESCE($13, postal_code),
+        latitude = COALESCE($14, latitude),
+        longitude = COALESCE($15, longitude),
+
+        bedrooms = COALESCE($16, bedrooms),
+        bathrooms = COALESCE($17, bathrooms),
+        total_rooms = COALESCE($18, total_rooms),
+        year_built = COALESCE($19, year_built),
+        property_condition = COALESCE($20, property_condition),
+        construction_status = COALESCE($21, construction_status),
+        ownership_type = COALESCE($22, ownership_type),
+
+        draft_data = $23::jsonb,
+        current_step = COALESCE($24, current_step),
+        autosaved_at = NOW(),
+        last_updated_at = NOW(),
+        updated_at = NOW()
+      WHERE product_id = $25
+      AND uploaded_by_id = $26::uuid
+      AND status = 'draft'
+      RETURNING *;
+      `,
+      [
+        b.title || null,
+        b.description || null,
+
+        b.property_type || b.propertyType || null,
+        b.property_subtype || b.propertySubtype || null,
+        b.listing_type || b.listingType || null,
+
+        b.price ? Number(b.price) : null,
+        b.currency || b.price_currency || b.priceCurrency || null,
+        b.price_period || b.pricePeriod || null,
+
+        b.address || null,
+        b.city || null,
+        b.state || null,
+        b.country || null,
+        b.zip_code || b.zipCode || b.postal_code || null,
+        b.latitude ? Number(b.latitude) : null,
+        b.longitude ? Number(b.longitude) : null,
+
+        b.bedrooms ? Number(b.bedrooms) : null,
+        b.bathrooms ? Number(b.bathrooms) : null,
+        b.total_rooms ? Number(b.total_rooms) : null,
+        b.year_built ? Number(b.year_built) : null,
+        b.property_condition || null,
+        b.construction_status || null,
+        b.ownership_type || null,
+
+        JSON.stringify(b.draft_data || b),
+        b.current_step || null,
+
+        product_id,
+        String(userId),
+      ],
+    );
+
+    return res.json({
+      success: true,
+      message: "Draft saved.",
+      listing: result.rows[0],
+    });
+  } catch (err) {
+    console.error("[UpdateListingDraft] Error:", err);
+
+    return res.status(500).json({
+      message: "Failed to save draft.",
+      code: "UPDATE_DRAFT_FAIL",
+      details: err?.message,
+    });
+  }
+};
+
+export const getMyListingDrafts = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        product_id,
+        title,
+        property_type,
+        property_subtype,
+        listing_type,
+        price,
+        price_currency,
+        city,
+        state,
+        country,
+        current_step,
+        draft_data,
+        photos,
+        autosaved_at,
+        updated_at,
+        created_at
+      FROM listings
+      WHERE uploaded_by_id = $1::uuid
+      AND status = 'draft'
+      ORDER BY updated_at DESC;
+      `,
+      [String(userId)],
+    );
+
+    return res.json({
+      success: true,
+      drafts: result.rows,
+    });
+  } catch (err) {
+    console.error("[GetMyListingDrafts] Error:", err);
+
+    return res.status(500).json({
+      message: "Failed to fetch drafts.",
+      code: "GET_DRAFTS_FAIL",
+      details: err?.message,
+    });
+  }
+};
+
+export const getListingDraftByProductId = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+    const { product_id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM listings
+      WHERE product_id = $1
+      AND uploaded_by_id = $2::uuid
+      AND status = 'draft'
+      LIMIT 1;
+      `,
+      [product_id, String(userId)],
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        message: "Draft not found.",
+        code: "DRAFT_NOT_FOUND",
+      });
+    }
+
+    return res.json({
+      success: true,
+      draft: result.rows[0],
+    });
+  } catch (err) {
+    console.error("[GetListingDraftByProductId] Error:", err);
+
+    return res.status(500).json({
+      message: "Failed to fetch draft.",
+      code: "GET_DRAFT_FAIL",
+      details: err?.message,
+    });
+  }
+};
+
+export const submitListingDraft = async (req, res) => {
+  try {
+    const userId = req.user?.unique_id;
+    const { product_id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE listings
+      SET
+        status = 'pending',
+        moderation_status = 'pending',
+        is_active = false,
+        listed_at = NOW(),
+        last_updated_at = NOW(),
+        updated_at = NOW()
+      WHERE product_id = $1
+      AND uploaded_by_id = $2::uuid
+      AND status = 'draft'
+      RETURNING *;
+      `,
+      [product_id, String(userId)],
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        message: "Draft not found.",
+        code: "DRAFT_NOT_FOUND",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Listing submitted for review.",
+      listing: result.rows[0],
+    });
+  } catch (err) {
+    console.error("[SubmitListingDraft] Error:", err);
+
+    return res.status(500).json({
+      message: "Failed to submit listing.",
+      code: "SUBMIT_DRAFT_FAIL",
+      details: err?.message,
+    });
   }
 };

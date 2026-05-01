@@ -1,18 +1,24 @@
 import express from "express";
 
 import {
-  getListings,
-  getListingByProductId,
-  getAgentListings,
-  getAllListingsAdmin,
   createListing,
   updateListing,
   deleteListing,
+  getListings,
+  getAgentListings,
+  getListingByProductId,
   updateListingStatus,
-  getPublicAgentProfile,
   activateListing,
+  getAllListingsAdmin,
+  getPublicAgentProfile,
   analyzeListing,
   batchAnalyzeListings,
+
+  createListingDraft,
+  updateListingDraft,
+  getMyListingDrafts,
+  getListingDraftByProductId,
+  submitListingDraft,
 } from "../controllers/listingsController.js";
 
 import {
@@ -30,7 +36,7 @@ const router = express.Router();
    Direct-to-S3 flow:
    - Frontend uploads media directly to S3 first
    - Frontend sends JSON metadata to these routes
-   - No multer needed here
+   - Draft routes support autosave/resume flow
 ============================================================ */
 
 /* ============================================================
@@ -48,6 +54,38 @@ router.get("/agent", authenticateToken, getAgentListings);
 // Public agent / owner / brokerage profile
 router.get("/public/agent/:unique_id", getPublicAgentProfile);
 
+/* ============================================================
+   2. DRAFT / AUTOSAVE ROUTES
+   Keep these BEFORE "/:product_id"
+   Do NOT use validateListingInput here because drafts are incomplete
+============================================================ */
+
+router.post("/drafts", authenticateToken, createListingDraft);
+
+router.get("/drafts/mine", authenticateToken, getMyListingDrafts);
+
+router.get(
+  "/drafts/:product_id",
+  authenticateToken,
+  getListingDraftByProductId,
+);
+
+router.patch(
+  "/drafts/:product_id",
+  authenticateToken,
+  updateListingDraft,
+);
+
+router.post(
+  "/drafts/:product_id/submit",
+  authenticateToken,
+  submitListingDraft,
+);
+
+/* ============================================================
+   3. ADMIN ROUTES
+============================================================ */
+
 // Admin listing dashboard
 router.get("/admin/all", authenticateToken, verifyAdmin, getAllListingsAdmin);
 
@@ -60,7 +98,7 @@ router.post(
 );
 
 /* ============================================================
-   2. CREATE LISTING
+   4. CREATE FINAL LISTING
 ============================================================ */
 
 // Create listing after direct S3 upload metadata is ready
@@ -72,7 +110,7 @@ router.post(
 );
 
 /* ============================================================
-   3. LISTING ACTION ROUTES
+   5. LISTING ACTION ROUTES
    Put action routes before "/:product_id" for safety
 ============================================================ */
 
@@ -122,7 +160,7 @@ router.put(
 );
 
 /* ============================================================
-   4. SINGLE LISTING CRUD
+   6. SINGLE LISTING CRUD
    Keep these near the bottom because "/:product_id" is dynamic
 ============================================================ */
 

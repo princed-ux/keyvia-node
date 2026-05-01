@@ -1423,15 +1423,20 @@ const docColumn =
     await client.query("COMMIT");
 
     return res.json({
-      success: true,
-      message: "Profile and documents submitted for review.",
-      special_id: specialId,
-      role: normalizedRole,
-      verification_status: "pending",
-      avatar_url: avatarUrl,
-      linked_agency_id: linkedAgencyId,
-      is_solo_agent: isSoloAgent,
-    });
+  success: true,
+  message: "Profile and documents submitted for review.",
+  special_id: specialId,
+  role: normalizedRole,
+  verification_status: "pending",
+  avatar_url: avatarUrl,
+  linked_agency_id: linkedAgencyId,
+  is_solo_agent: isSoloAgent,
+
+  country: country || null,
+  city: city || null,
+  phone: normalizedPhoneValue || null,
+  username: username?.trim() || null,
+});
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[FinishOnboarding] Error:", err);
