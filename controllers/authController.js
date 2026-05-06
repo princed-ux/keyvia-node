@@ -129,10 +129,19 @@ export const register = async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     await pool.query(
-      `INSERT INTO users (name, email, password, role, is_verified, verification_status) 
-       VALUES ($1, $2, $3, 'pending', false, 'pending')`,
-      [name, cleanEmail, hashedPassword]
-    );
+  `
+  INSERT INTO users (
+    name,
+    email,
+    password,
+    role,
+    is_verified,
+    verification_status
+  ) 
+  VALUES ($1, $2, $3, 'pending', false, 'new')
+  `,
+  [name, cleanEmail, hashedPassword]
+);
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const codeHash = await bcrypt.hash(code, 10);
@@ -193,9 +202,15 @@ export const verifySignupOtp = async (req, res) => {
     const cleanEmail = normalizeEmail(email);
 
     const otpRes = await pool.query(
-      `SELECT * FROM email_otps
-       WHERE email=$1 AND used=false AND purpose='signup'
-       ORDER BY created_at DESC LIMIT 1`,
+      `
+      SELECT *
+      FROM email_otps
+      WHERE email = $1
+        AND used = false
+        AND purpose = 'signup'
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
       [cleanEmail]
     );
 
@@ -210,17 +225,25 @@ export const verifySignupOtp = async (req, res) => {
     }
 
     const valid = await bcrypt.compare(code, otp.code_hash);
+
     if (!valid) {
       return res.status(400).json({ message: "Invalid code." });
     }
 
-    await pool.query("UPDATE email_otps SET used=true WHERE id=$1", [otp.id]);
+    await pool.query("UPDATE email_otps SET used = true WHERE id = $1", [
+      otp.id,
+    ]);
 
+    // IMPORTANT:
+    // Do NOT set users.is_verified = true here.
+    // Email OTP verification is not identity/KYC verification.
     const userRes = await pool.query(
-      `UPDATE users
-       SET is_verified=true
-       WHERE email=$1
-       RETURNING unique_id`,
+      `
+      SELECT unique_id
+      FROM users
+      WHERE email = $1
+      LIMIT 1
+      `,
       [cleanEmail]
     );
 
@@ -332,7 +355,7 @@ export const socialAuth = async (req, res) => {
           name, email, password, role, is_verified, verification_status,
           avatar_url, unique_id, auth_provider
         ) 
-        VALUES ($1, $2, $3, 'pending', true, 'new', $4, $5, 'social')
+        VALUES ($1, $2, $3, 'pending', false, 'new', $4, $5, 'social')
         RETURNING *`,
         [name || "User", cleanEmail, hashedPassword, picture, newUniqueId]
       );
@@ -407,20 +430,7 @@ export const setRole = async (req, res) => {
     return res.status(400).json({ message: "Invalid role selected." });
   }
 
-  if (role === "agent") {
-    if (!agent_type || !["solo", "brokerage"].includes(agent_type)) {
-      return res.status(400).json({
-        message: "Invalid agent type. Must be 'solo' or 'brokerage'.",
-      });
-    }
-
-    if (agent_type === "brokerage" && !team_code) {
-      return res.status(400).json({
-        message: "Team code required for brokerage agents.",
-      });
-    }
-  }
-
+  
   let unique_id;
 
   try {
@@ -515,46 +525,11 @@ export const setRole = async (req, res) => {
       }
 
       if (role === "agent") {
-        isSoloAgent = agent_type === "solo";
-
-        if (agent_type === "brokerage") {
-          const normalizedCode = normalizeTeamCode(team_code);
-
-          let brokerageLookup = await client.query(
-            `
-            SELECT unique_id AS owner_id, team_code
-            FROM brokerage_profiles
-            WHERE UPPER(TRIM(team_code)) = UPPER(TRIM($1))
-            LIMIT 1
-            `,
-            [normalizedCode]
-          );
-
-          if (!brokerageLookup.rows.length) {
-            brokerageLookup = await client.query(
-              `
-              SELECT unique_id AS owner_id, team_code
-              FROM users
-              WHERE UPPER(TRIM(team_code)) = UPPER(TRIM($1))
-                AND LOWER(role::TEXT) IN ('brokerage_owner', 'brokerage')
-              LIMIT 1
-              `,
-              [normalizedCode]
-            );
-          }
-
-          if (!brokerageLookup.rows.length) {
-            await client.query("ROLLBACK");
-            return res.status(400).json({
-              message: "Invalid team code. Brokerage not found.",
-            });
-          }
-
-          linkedAgencyId = brokerageLookup.rows[0].owner_id;
-        } else {
-          linkedAgencyId = null;
-        }
-      }
+  // Agent type is selected later during onboarding.
+  // Do not set solo/agency/team-code data during role selection.
+  isSoloAgent = null;
+  linkedAgencyId = null;
+}
 
       if (role === "owner") {
         linkedAgencyId = null;
@@ -654,7 +629,7 @@ export const setRole = async (req, res) => {
         is_solo_agent: updatedUser.is_solo_agent,
         special_id: updatedUser.special_id,
         is_super_admin: updatedUser.is_super_admin,
-        agent_type: role === "agent" ? agent_type : null,
+        agent_type: null,
       },
     });
   } catch (err) {

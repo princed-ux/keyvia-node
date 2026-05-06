@@ -6,6 +6,7 @@ import http from "http";
 import path from "path";
 import { Server } from "socket.io";
 import morgan from "morgan";
+
 import { pool } from "./db.js";
 import { globalErrorHandler } from "./middleware/globalErrorHandler.js";
 import { rateLimiters } from "./middleware/rateLimiter.js";
@@ -13,15 +14,20 @@ import {
   metricsMiddleware,
   metricsEndpoint,
 } from "./services/metricsService.js";
-import apmService from "./services/apmService.js";
 import logger from "./utils/logger.js";
 import { registerSocketHandlers } from "./socket/registerSocketHandlers.js";
 import { startSubscriptionRenewalJob } from "./jobs/subscriptionRenewalJob.js";
 
-// 1. Load Environment Variables
+// =====================================================
+// 1. LOAD ENVIRONMENT VARIABLES
+// =====================================================
+
 dotenv.config();
 
-// 2. Import Routes
+// =====================================================
+// 2. IMPORT ROUTES
+// =====================================================
+
 import authRoutes from "./routes/auth.js";
 import listingsRoutes from "./routes/listings.js";
 import uploadsRoutes from "./routes/uploads.js";
@@ -36,139 +42,279 @@ import ownerRoutes from "./routes/ownerRoutes.js";
 import favoriteRoutes from "./routes/favorites.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import superAdminRoutes from "./routes/superAdminRoutes.js";
-import applicationRoutes from "./routes/applicationRoutes.js"; // ✅ Correct Import
-import brokerageRoutes from "./routes/brokerageRoutes.js"; // ✅ Brokerage Routes
-import badgeRoutes from "./routes/badgeRoutes.js"; // ✅ Badge Routes
-import onboardingRoutes from "./routes/onboardingRoutes.js"; // ✅ Onboarding Routes
-import rekognitionRoutes from "./routes/rekognitionRoutes.js"; // ✅ AWS Rekognition (Face Detection)
-import brokerageManagementRoutes from "./routes/brokerageManagement.js"; // ✅ Brokerage Team Code Management
-import followersRoutes from "./routes/followersRoutes.js"; // ✅ Followers System
-import s3UploadRoutes from "./routes/s3Upload.js"; // ✅ S3 Presigned URLs
-import ivsRoutes from "./routes/ivsRoutes.js"; // ✅ AWS IVS Live Tours
-import teamRoutes from "./routes/teamRoutes.js"; // ✅ Brokerage Team Management
-import monitoringRoutes from "./routes/monitoringRoutes.js"; // ✅ Admin Monitoring & Metrics
+import applicationRoutes from "./routes/applicationRoutes.js";
+import brokerageRoutes from "./routes/brokerageRoutes.js";
+import badgeRoutes from "./routes/badgeRoutes.js";
+import onboardingRoutes from "./routes/onboardingRoutes.js";
+import rekognitionRoutes from "./routes/rekognitionRoutes.js";
+import brokerageManagementRoutes from "./routes/brokerageManagement.js";
+import followersRoutes from "./routes/followersRoutes.js";
+import s3UploadRoutes from "./routes/s3Upload.js";
+import ivsRoutes from "./routes/ivsRoutes.js";
+import teamRoutes from "./routes/teamRoutes.js";
+import monitoringRoutes from "./routes/monitoringRoutes.js";
 import subscriptionRoutes from "./routes/subscriptions.js";
 import mediaProcessingRoutes from "./routes/mediaProcessingRoutes.js";
-// import s3UploadRoutes from "./routes/s3Upload.js";
+
+// =====================================================
+// 3. APP CONFIG
+// =====================================================
 
 const app = express();
+
 const PORT = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
+const NODE_ENV = process.env.NODE_ENV || "development";
 
-// =======================================================================
-// 3. INITIALIZE SERVER & SOCKET.IO
-// =======================================================================
+const DISABLE_RATE_LIMIT =
+  NODE_ENV === "development" &&
+  String(process.env.DISABLE_RATE_LIMIT || "").toLowerCase() === "true";
+
+// Important if you later deploy behind Render / Nginx / proxy.
+// It also helps express-rate-limit read the correct client IP.
+app.set("trust proxy", 1);
+
+// =====================================================
+// 4. INITIALIZE SERVER & SOCKET.IO
+// =====================================================
+
 const server = http.createServer(app);
+
 const io = new Server(server, {
+  path: "/socket.io",
   cors: {
     origin: CLIENT_URL,
     credentials: true,
+    methods: ["GET", "POST"],
+  },
+
+  // More stable in dev and slow networks.
+  pingInterval: 25000,
+  pingTimeout: 60000,
+
+  // Keep both transports. Polling is useful before websocket upgrade.
+  transports: ["websocket", "polling"],
+
+  // Helps temporary reconnects recover instead of hard-resetting everything.
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000,
+    skipMiddlewares: true,
   },
 });
 
-// =======================================================================
-// 4. MIDDLEWARE
-// =======================================================================
+// =====================================================
+// 5. HELPERS
+// =====================================================
+
+const normalizePath = (req) => {
+  return String(req.originalUrl || req.url || "").split("?")[0];
+};
+
+const isSocketRequest = (req) => {
+  const pathName = normalizePath(req);
+  return pathName.startsWith("/socket.io");
+};
+
+const isSafeReadRequest = (req) => {
+  const method = String(req.method || "").toUpperCase();
+  const pathName = normalizePath(req);
+
+  if (method === "OPTIONS") return true;
+
+  // Never rate-limit Socket.IO handshake / polling / websocket traffic here.
+  if (isSocketRequest(req)) return true;
+
+  if (method !== "GET") return false;
+
+  const safeReadPrefixes = [
+    "/api/profile",
+    "/api/subscriptions/me",
+    "/api/notifications/counts",
+    "/api/notifications",
+    "/api/listings/public",
+    "/api/listings/agent",
+    "/api/favorites",
+    "/api/messages",
+    "/api/applications",
+    "/api/onboarding",
+    "/api/brokerage/stats",
+    "/api/brokerage/agents",
+    "/api/brokerage/manage",
+    "/api/team",
+    "/api/badges",
+    "/api/followers",
+  ];
+
+  return safeReadPrefixes.some((prefix) => pathName.startsWith(prefix));
+};
+
+const shouldSkipDynamicRateLimit = (req) => {
+  if (DISABLE_RATE_LIMIT) return true;
+
+  if (isSocketRequest(req)) return true;
+
+  return isSafeReadRequest(req);
+};
+
+const dynamicRateLimitWrapper = (req, res, next) => {
+  if (shouldSkipDynamicRateLimit(req)) {
+    return next();
+  }
+
+  return rateLimiters.dynamic(req, res, next);
+};
+
+const metricsWrapper = (req, res, next) => {
+  if (isSocketRequest(req)) {
+    return next();
+  }
+
+  return metricsMiddleware(req, res, next);
+};
+
+const morganWrapper = morgan("combined", {
+  skip: (req) => isSocketRequest(req),
+  stream: {
+    write: (msg) => logger.info(msg.trim()),
+  },
+});
+
+// =====================================================
+// 6. CORE MIDDLEWARE
+// =====================================================
+
 app.use(
   cors({
     origin: CLIENT_URL,
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], // Added PATCH
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "x-client-theme"],
   }),
 );
+
 app.use(cookieParser());
+
 app.use(express.json({ limit: "10mb" }));
+
 app.use(express.urlencoded({ extended: true }));
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
-// ✅ PRODUCTION MONITORING MIDDLEWARE
-app.use(
-  morgan("combined", { stream: { write: (msg) => logger.info(msg.trim()) } }),
-); // HTTP request logging
-app.use(metricsMiddleware); // Prometheus metrics tracking
-app.use(rateLimiters.dynamic); // Dynamic rate limiting based on user tier
+// =====================================================
+// 7. LOGGING, METRICS & RATE LIMITING
+// =====================================================
 
-// // Debug Logger
-// app.use((req, res, next) => {
-//   console.log(`📢 ${req.method} ${req.url}`);
-//   // 👇 ADD THIS LINE to see exactly what token is arriving
-//   console.log(`   🔑 Header: ${req.headers.authorization || "NONE"}`);
-//   next();
-// });
+// Do not log/track/rate-limit Socket.IO as normal API traffic.
+app.use(morganWrapper);
 
-// Attach Socket.IO to Request
+app.use(metricsWrapper);
+
+app.use(dynamicRateLimitWrapper);
+
+// =====================================================
+// 8. ATTACH SOCKET.IO TO REQUEST
+// =====================================================
+
 app.use((req, res, next) => {
   req.io = io;
   next();
 });
 
-// =======================================================================
-// 5. REGISTER ROUTES
-// =======================================================================
+// =====================================================
+// 9. REGISTER ROUTES
+// =====================================================
+
 app.use("/api/auth", authRoutes);
+
 app.use("/api/listings", listingsRoutes);
+
 app.use("/api/uploads", uploadsRoutes);
+
 app.use("/api/messages", messagesRoutes);
+
 app.use("/api/notifications", notificationsRoutes);
+
 app.use("/api/profile", profileRoutes);
+
 app.use("/users", usersRoutes);
+
 app.use("/api/payments", paymentsRoutes);
+
 app.use("/api/wallet", walletRoutes);
+
 app.use("/agents", agentRoutes);
+
 app.use("/owners", ownerRoutes);
+
 app.use("/api/favorites", favoriteRoutes);
+
 app.use("/api/admin", adminRoutes);
+
 app.use("/api/super-admin", superAdminRoutes);
+
 app.use("/api/subscriptions", subscriptionRoutes);
+
 app.use("/api/media-processing", mediaProcessingRoutes);
+
 app.use("/api/media", s3UploadRoutes);
 
-// ✅ Applications Route (One unified route for Agents, Owners, and Buyers)
 app.use("/api/applications", applicationRoutes);
 
-// ✅ Brokerage Route (Brokerage dashboard, agents, projects, payments)
 app.use("/api/brokerage", brokerageRoutes);
 
-// ✅ Badge Routes (Verified badge system)
 app.use("/api/badges", badgeRoutes);
 
-// ✅ Onboarding Routes (Track user onboarding progress)
 app.use("/api/onboarding", onboardingRoutes);
 
-// ✅ AWS Rekognition Routes (Face detection for KYC)
 app.use("/api/rekognition", rekognitionRoutes);
 
-// ✅ Brokerage Management Routes (Team codes, agent management)
 app.use("/api/brokerage/manage", brokerageManagementRoutes);
 
-// ✅ Followers Routes (Follow/unfollow system)
 app.use("/api/followers", followersRoutes);
 
-// ✅ S3 Upload Routes (Presigned URLs for direct uploads)
-// app.use("/api/s3", s3UploadRoutes); 
-
-// ✅ AWS IVS Live Tours (Go live, viewer access, paywall)
 app.use("/api/ivs", ivsRoutes);
 
-// ✅ Brokerage Team Management (Team chat, remove agent)
 app.use("/api/team", teamRoutes);
 
-// ✅ ADMIN MONITORING ROUTES (Real-time system metrics & God Mode Dashboard)
 app.use("/api/monitoring", monitoringRoutes);
 
-// ✅ PROMETHEUS METRICS ENDPOINT (For external monitoring tools)
 app.get("/metrics", metricsEndpoint);
 
-// Root Route
 app.get("/", (req, res) => {
   res.send("✅ Keyvia backend running with Socket.io 🚀");
 });
 
+// =====================================================
+// 10. SOCKET HANDLERS
+// =====================================================
 
-// ✅ Register handlers
 registerSocketHandlers(io);
+
+// =====================================================
+// 11. 404 HANDLER
+// =====================================================
+
+app.use((req, res, next) => {
+  // Do not let Express 404 handler interfere with socket traffic.
+  if (isSocketRequest(req)) {
+    return next();
+  }
+
+  return res.status(404).json({
+    success: false,
+    message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// =====================================================
+// 12. GLOBAL ERROR HANDLER
+// =====================================================
+
+app.use(globalErrorHandler);
+
+// =====================================================
+// 13. START SERVER
+// =====================================================
 
 pool
   .connect()
@@ -179,7 +325,12 @@ pool
     server.listen(PORT, () => {
       console.log(`🚀 Server + Socket.IO running on http://localhost:${PORT}`);
 
-      // ✅ START AUTO-RENEW SYSTEM HERE
+      if (DISABLE_RATE_LIMIT) {
+        console.log("⚠️ Rate limiting is disabled in development mode.");
+      } else {
+        console.log("🛡️ Dynamic rate limiter enabled with socket-safe bypasses.");
+      }
+
       startSubscriptionRenewalJob();
       console.log("🔁 Subscription renewal job started");
     });

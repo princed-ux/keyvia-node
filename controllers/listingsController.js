@@ -1760,62 +1760,721 @@ export const getAgentListings = async (req, res) => {
 
 /* -------------------------------------------------------
    GET LISTING BY PRODUCT ID
+   Route: GET /api/listings/:product_id
+
+   Public + owner/admin-safe:
+   - Public can view only approved + active listings
+   - Owner/admin can view inactive/pending/draft/rejected listing
+   - Uses uploaded_by_id, not old created_by profile join
+   - Does NOT depend on profiles.agency_name
+   - Hides private/legal document files from public viewers
 ------------------------------------------------------- */
 export const getListingByProductId = async (req, res) => {
   try {
     const { product_id } = req.params;
-    const userUniqueId = req.user?.unique_id || null;
+    const viewerId = req.user?.unique_id || null;
+    const viewerRole = String(req.user?.role || "").toLowerCase();
 
-    const query = `
-      SELECT l.*,
-             p.full_name, p.username, p.avatar_url, p.bio,
-             p.agency_name, p.experience, p.country as agent_country, p.city as agent_city,
-             p.email as agent_email, p.phone as agent_phone,
-             p.role as agent_role
-      FROM listings l
-      LEFT JOIN profiles p ON l.created_by = p.unique_id
-      WHERE l.product_id = $1;
-    `;
-
-    const result = await pool.query(query, [product_id]);
-    const row = result.rows[0];
-
-    if (!row) return res.status(404).json({ message: "Listing not found" });
-
-    const isOwner = row.agent_unique_id === userUniqueId;
-    const isPublicReady = row.status === "approved" && row.is_active === true;
-
-    if (!isPublicReady && !isOwner) {
-      return res
-        .status(403)
-        .json({ message: "This listing is not currently active." });
+    if (!product_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Listing product ID is required.",
+        code: "MISSING_PRODUCT_ID",
+      });
     }
 
-    res.json({
+    const parseAnyJson = (value, fallback = null) => {
+      if (value === undefined || value === null || value === "") return fallback;
+      if (Array.isArray(value)) return value;
+      if (typeof value === "object") return value;
+
+      try {
+        return JSON.parse(value);
+      } catch {
+        return fallback;
+      }
+    };
+
+    const pick = (...values) => {
+      for (const value of values) {
+        if (value !== undefined && value !== null && value !== "") {
+          return value;
+        }
+      }
+
+      return null;
+    };
+
+    const toBool = (value) => {
+      return value === true || value === "true";
+    };
+
+    const getRoleLabel = (role, isSoloAgent) => {
+      const r = String(role || "").toLowerCase();
+
+      if (r === "agent") {
+        return isSoloAgent === false ? "Agency Agent" : "Real Estate Agent";
+      }
+
+      if (r === "agency_agent") return "Agency Agent";
+      if (r === "brokerage_agent") return "Brokerage Agent";
+      if (r === "brokerage" || r === "brokerage_owner") return "Brokerage Company";
+      if (r === "owner" || r === "landlord") return "Property Owner";
+      if (r === "admin" || r === "super_admin") return "Admin";
+
+      return role || "Keyvia Member";
+    };
+
+    const result = await pool.query(
+      `
+      SELECT
+        l.*,
+
+        u.unique_id AS uploader_unique_id,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        u.phone AS user_phone,
+        u.role AS user_role,
+        u.avatar_url AS user_avatar_url,
+        u.bio AS user_bio,
+        u.country AS user_country,
+        u.city AS user_city,
+        u.brokerage_name AS user_brokerage_name,
+        u.is_solo_agent AS user_is_solo_agent,
+        u.verification_status AS user_verification_status,
+        u.is_verified AS user_is_verified,
+        u.is_verified_agent AS user_is_verified_agent,
+        u.subscription_plan AS user_subscription_plan,
+        u.subscription_status AS user_subscription_status,
+        u.created_at AS user_created_at,
+
+        p.full_name AS profile_full_name,
+        p.username AS profile_username,
+        p.avatar_url AS profile_avatar_url,
+        p.bio AS profile_bio,
+        p.email AS profile_email,
+        p.phone AS profile_phone,
+        p.country AS profile_country,
+        p.city AS profile_city,
+
+        ap.experience_years AS agent_experience_years,
+
+        bp.company_name AS brokerage_company_name,
+
+        CASE
+          WHEN $2::uuid IS NOT NULL AND f.product_id IS NOT NULL THEN true
+          ELSE false
+        END AS is_favorited
+
+      FROM listings l
+
+      LEFT JOIN users u
+        ON l.uploaded_by_id::text = u.unique_id::text
+
+      LEFT JOIN profiles p
+        ON p.unique_id::text = u.unique_id::text
+
+      LEFT JOIN agent_profiles ap
+        ON ap.unique_id::text = u.unique_id::text
+
+      LEFT JOIN brokerage_profiles bp
+        ON bp.unique_id::text = u.unique_id::text
+
+      LEFT JOIN favorites f
+        ON f.product_id = l.product_id
+        AND $2::uuid IS NOT NULL
+        AND f.user_id = $2::uuid
+
+      WHERE l.product_id = $1
+      LIMIT 1;
+      `,
+      [product_id, viewerId ? String(viewerId) : null],
+    );
+
+    const row = result.rows[0];
+
+    if (!row) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing not found.",
+        code: "LISTING_NOT_FOUND",
+      });
+    }
+
+    const ownerId = pick(row.uploaded_by_id, row.agent_unique_id, row.created_by);
+
+    const isOwner =
+      viewerId && ownerId && String(ownerId) === String(viewerId);
+
+    const isAdmin =
+      viewerRole === "admin" ||
+      viewerRole === "super_admin" ||
+      req.user?.is_admin === true;
+
+    const isPublicReady = row.status === "approved" && row.is_active === true;
+
+    if (!isPublicReady && !isOwner && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: "This listing is not currently active.",
+        code: "LISTING_NOT_ACTIVE",
+      });
+    }
+
+    const canViewPrivateAdminFields = isOwner || isAdmin;
+
+    const draftData = parseAnyJson(row.draft_data, {}) || {};
+
+    const photos = normalizePhotosForResponse(
+      pick(row.photos, draftData.photos, []),
+    );
+
+    const floorPlans = parseAnyJson(
+      pick(row.floor_plans, draftData.floorPlans, draftData.floor_plans),
+      [],
+    );
+
+    const stagingPhotos = parseAnyJson(
+      pick(
+        row.staging_photos,
+        draftData.stagingPhotos,
+        draftData.staging_photos,
+      ),
+      [],
+    );
+
+    const panoramaPhotos = parseAnyJson(
+      pick(
+        row.panorama_photos,
+        draftData.panoramaPhotos,
+        draftData.panorama_photos,
+      ),
+      [],
+    );
+
+    const features = parseAnyJson(
+      pick(row.features, draftData.features, draftData.amenities),
+      [],
+    );
+
+    const amenities = parseAnyJson(
+      pick(row.amenities, draftData.amenities, draftData.features),
+      [],
+    );
+
+    const paymentOptions = parseAnyJson(
+      pick(row.payment_options, draftData.paymentOptions, draftData.payment_options),
+      [],
+    );
+
+    const preferredTourDays = parseAnyJson(
+      pick(
+        row.preferred_tour_days,
+        draftData.preferredTourDays,
+        draftData.preferred_tour_days,
+      ),
+      [],
+    );
+
+    const finalRole = row.user_role;
+
+    const verificationStatus = String(
+      row.user_verification_status || "",
+    ).toLowerCase();
+
+    const isVerified =
+      row.user_is_verified === true ||
+      row.user_is_verified_agent === true ||
+      verificationStatus === "approved" ||
+      verificationStatus === "verified";
+
+    const subscriptionPlan = String(
+      row.user_subscription_plan || "free",
+    ).toLowerCase();
+
+    const subscriptionStatus = String(
+      row.user_subscription_status || "",
+    ).toLowerCase();
+
+    const hasActiveSubscription = subscriptionStatus === "active";
+
+    let publicBadge = null;
+
+    if (
+      isVerified &&
+      hasActiveSubscription &&
+      ["elite_agent", "elite_owner", "elite_brokerage", "enterprise"].includes(
+        subscriptionPlan,
+      )
+    ) {
+      publicBadge = "elite_verified";
+    } else if (
+      isVerified &&
+      hasActiveSubscription &&
+      ["pro_agent", "pro_owner", "pro_brokerage"].includes(subscriptionPlan)
+    ) {
+      publicBadge = "pro_verified";
+    } else if (isVerified) {
+      publicBadge = "verified";
+    }
+
+    const agentName = pick(
+      row.profile_full_name,
+      row.user_name,
+      row.contact_name,
+      "Keyvia User",
+    );
+
+    const agentAvatar = pick(row.profile_avatar_url, row.user_avatar_url);
+
+    const companyName = pick(
+      row.brokerage_company_name,
+      row.user_brokerage_name,
+      draftData.companyName,
+      draftData.company_name,
+      draftData.agencyName,
+      draftData.agency_name,
+    );
+
+    const latitude = pick(row.latitude, draftData.latitude);
+    const longitude = pick(row.longitude, draftData.longitude);
+
+    const legalPayload = canViewPrivateAdminFields
+      ? {
+          title_document_file: parseAnyJson(
+            pick(
+              row.title_document_file,
+              draftData.titleDocumentFile,
+              draftData.title_document_file,
+            ),
+            null,
+          ),
+        }
+      : {
+          // Public users only get trust signals, not private files.
+          title_document_file: null,
+        };
+
+    const response = {
       ...row,
-      photos: normalizePhotosForResponse(row.photos),
-      latitude: row.latitude ? parseFloat(row.latitude) : null,
-      longitude: row.longitude ? parseFloat(row.longitude) : null,
+
+      success: true,
+
+      draft_data: canViewPrivateAdminFields ? draftData : undefined,
+
+      photos,
+      floor_plans: Array.isArray(floorPlans) ? floorPlans : [],
+      staging_photos: Array.isArray(stagingPhotos) ? stagingPhotos : [],
+      panorama_photos: Array.isArray(panoramaPhotos) ? panoramaPhotos : [],
+      features,
+      amenities,
+      payment_options: paymentOptions,
+      preferred_tour_days: preferredTourDays,
+
+      latitude:
+        latitude !== null && latitude !== undefined && latitude !== ""
+          ? parseFloat(latitude)
+          : null,
+
+      longitude:
+        longitude !== null && longitude !== undefined && longitude !== ""
+          ? parseFloat(longitude)
+          : null,
+
+      agent_unique_id: pick(row.agent_unique_id, row.uploaded_by_id),
+      created_by: pick(row.created_by, row.uploaded_by_id),
+      uploaded_by_id: row.uploaded_by_id,
+
+      price_currency: pick(
+        row.price_currency,
+        row.currency,
+        draftData.priceCurrency,
+        draftData.price_currency,
+        "USD",
+      ),
+
+      currency: pick(
+        row.currency,
+        row.price_currency,
+        draftData.priceCurrency,
+        draftData.price_currency,
+        "USD",
+      ),
+
+      price_period: pick(row.price_period, draftData.pricePeriod),
+
+      property_type: pick(row.property_type, draftData.propertyType),
+      property_subtype: pick(row.property_subtype, draftData.propertySubtype),
+      listing_type: pick(row.listing_type, draftData.listingType),
+      category: pick(row.category, row.listing_type, draftData.listingType),
+
+      square_footage: pick(
+        row.square_footage,
+        row.area_sqft,
+        row.building_area_sqft,
+        draftData.squareFootage,
+        draftData.buildingAreaSqft,
+      ),
+
+      area_sqft: pick(
+        row.area_sqft,
+        row.square_footage,
+        row.building_area_sqft,
+        draftData.buildingAreaSqft,
+      ),
+
+      building_area_sqft: pick(
+        row.building_area_sqft,
+        row.area_sqft,
+        row.square_footage,
+        draftData.buildingAreaSqft,
+        draftData.building_area_sqft,
+      ),
+
+      land_area_sqft: pick(
+        row.land_area_sqft,
+        row.lot_size,
+        draftData.landAreaSqft,
+        draftData.land_area_sqft,
+      ),
+
+      lot_size: pick(
+        row.lot_size,
+        row.land_area_sqft,
+        draftData.landAreaSqft,
+        draftData.lotSize,
+      ),
+
+      building_area_unit: pick(
+        row.building_area_unit,
+        draftData.buildingAreaUnit,
+        "sqft",
+      ),
+
+      land_area_unit: pick(
+        row.land_area_unit,
+        draftData.landAreaUnit,
+        "sqft",
+      ),
+
+      zip_code: pick(row.zip_code, row.postal_code, draftData.zipCode),
+      postal_code: pick(row.postal_code, row.zip_code, draftData.zipCode),
+
+      neighborhood: pick(row.neighborhood, draftData.neighborhood),
+      estate_name: pick(row.estate_name, draftData.estateName),
+      landmark: pick(row.landmark, draftData.landmark),
+      road_access: pick(row.road_access, draftData.roadAccess),
+
+      total_rooms: pick(row.total_rooms, draftData.totalRooms),
+      floors: pick(row.floors, draftData.floors),
+      floor_number: pick(row.floor_number, draftData.floorNumber),
+      total_floors: pick(row.total_floors, draftData.totalFloors),
+      garage_spaces: pick(row.garage_spaces, draftData.garageSpaces),
+
+      property_condition: pick(
+        row.property_condition,
+        draftData.propertyCondition,
+      ),
+
+      construction_status: pick(
+        row.construction_status,
+        draftData.constructionStatus,
+      ),
+
+      ownership_type: pick(row.ownership_type, draftData.ownershipType),
+
+      power_supply: pick(row.power_supply, draftData.powerSupply),
+      water_supply: pick(row.water_supply, draftData.waterSupply),
+      internet_available:
+        row.internet_available !== null && row.internet_available !== undefined
+          ? row.internet_available
+          : toBool(draftData.internetAvailable),
+
+      drainage: pick(row.drainage, draftData.drainage),
+      security_type: pick(row.security_type, draftData.securityType),
+
+      generator_available:
+        row.generator_available !== null && row.generator_available !== undefined
+          ? row.generator_available
+          : toBool(draftData.generatorAvailable),
+
+      borehole:
+        row.borehole !== null && row.borehole !== undefined
+          ? row.borehole
+          : toBool(draftData.borehole),
+
+      prepaid_meter:
+        row.prepaid_meter !== null && row.prepaid_meter !== undefined
+          ? row.prepaid_meter
+          : toBool(draftData.prepaidMeter),
+
+      waste_disposal: pick(row.waste_disposal, draftData.wasteDisposal),
+
+      service_charge: pick(row.service_charge, draftData.serviceCharge),
+      caution_fee: pick(row.caution_fee, draftData.cautionFee),
+      agency_fee: pick(row.agency_fee, draftData.agencyFee),
+      legal_fee: pick(row.legal_fee, draftData.legalFee),
+      refundable_deposit: pick(
+        row.refundable_deposit,
+        draftData.refundableDeposit,
+      ),
+
+      minimum_rent_duration: pick(
+        row.minimum_rent_duration,
+        draftData.minimumRentDuration,
+      ),
+
+      rent_payment_frequency: pick(
+        row.rent_payment_frequency,
+        draftData.rentPaymentFrequency,
+      ),
+
+      pets_policy: pick(row.pets_policy, draftData.petsPolicy),
+      smoking_policy: pick(row.smoking_policy, draftData.smokingPolicy),
+      guest_policy: pick(row.guest_policy, draftData.guestPolicy),
+
+      mortgage_available:
+        row.mortgage_available !== null && row.mortgage_available !== undefined
+          ? row.mortgage_available
+          : toBool(draftData.mortgageAvailable),
+
+      installment_available:
+        row.installment_available !== null &&
+        row.installment_available !== undefined
+          ? row.installment_available
+          : toBool(draftData.installmentAvailable),
+
+      rent_to_own_available:
+        row.rent_to_own_available !== null &&
+        row.rent_to_own_available !== undefined
+          ? row.rent_to_own_available
+          : toBool(draftData.rentToOwnAvailable),
+
+      estimated_monthly_payment: pick(
+        row.estimated_monthly_payment,
+        draftData.estimatedMonthlyPayment,
+      ),
+
+      down_payment_percent: pick(
+        row.down_payment_percent,
+        draftData.downPaymentPercent,
+      ),
+
+      interest_rate_estimate: pick(
+        row.interest_rate_estimate,
+        draftData.interestRateEstimate,
+      ),
+
+      hoa_fee: pick(row.hoa_fee, draftData.hoaFee),
+
+      property_tax_estimate: pick(
+        row.property_tax_estimate,
+        draftData.propertyTaxEstimate,
+      ),
+
+      insurance_estimate: pick(
+        row.insurance_estimate,
+        draftData.insuranceEstimate,
+      ),
+
+      price_per_sqft: pick(row.price_per_sqft, draftData.pricePerSqft),
+
+      price_negotiable:
+        row.price_negotiable !== null && row.price_negotiable !== undefined
+          ? row.price_negotiable
+          : toBool(draftData.priceNegotiable),
+
+      closing_cost_estimate: pick(
+        row.closing_cost_estimate,
+        draftData.closingCostEstimate,
+      ),
+
+      title_document_type: pick(
+        row.title_document_type,
+        draftData.titleDocumentType,
+      ),
+
+      title_verified:
+        row.title_verified !== null && row.title_verified !== undefined
+          ? row.title_verified
+          : toBool(draftData.titleVerified),
+
+      survey_available:
+        row.survey_available !== null && row.survey_available !== undefined
+          ? row.survey_available
+          : toBool(draftData.surveyAvailable),
+
+      building_approval_available:
+        row.building_approval_available !== null &&
+        row.building_approval_available !== undefined
+          ? row.building_approval_available
+          : toBool(draftData.buildingApprovalAvailable),
+
+      ...legalPayload,
+
+      video_url: pick(row.video_url, draftData.video?.url),
+      video_public_id: pick(
+        row.video_public_id,
+        draftData.video?.key,
+        draftData.video?.public_id,
+      ),
+
+      virtual_tour_url: pick(
+        row.virtual_tour_url,
+        draftData.virtualTourUrl,
+        draftData.virtual_tour_url,
+        draftData.virtualTourFile?.url,
+        draftData.virtual_tour_file?.url,
+      ),
+
+      virtual_tour_public_id: pick(
+        row.virtual_tour_public_id,
+        draftData.virtualTourFile?.key,
+        draftData.virtual_tour_file?.key,
+      ),
+
+      virtual_tour_file: canViewPrivateAdminFields
+        ? parseAnyJson(
+            pick(
+              row.virtual_tour_file,
+              draftData.virtualTourFile,
+              draftData.virtual_tour_file,
+            ),
+            null,
+          )
+        : null,
+
+      three_d_home_url: pick(row.three_d_home_url, draftData.threeDHomeUrl),
+
+      allow_tour_requests:
+        row.allow_tour_requests !== null && row.allow_tour_requests !== undefined
+          ? row.allow_tour_requests
+          : draftData.allowTourRequests !== false,
+
+      allow_video_tour:
+        row.allow_video_tour !== null && row.allow_video_tour !== undefined
+          ? row.allow_video_tour
+          : draftData.allowVideoTour !== false,
+
+      allow_in_person_tour:
+        row.allow_in_person_tour !== null &&
+        row.allow_in_person_tour !== undefined
+          ? row.allow_in_person_tour
+          : draftData.allowInPersonTour !== false,
+
+      preferred_tour_times: pick(
+        row.preferred_tour_times,
+        draftData.preferredTourTimes,
+      ),
+
+      minimum_notice_hours: pick(
+        row.minimum_notice_hours,
+        draftData.minimumNoticeHours,
+      ),
+
+      contact_name: pick(row.contact_name, draftData.contactName, agentName),
+
+      // Public contact behavior:
+      // - Email is okay if listing chose email/platform contact.
+      // - Phone only returns if show_contact_phone is true, unless owner/admin.
+      contact_email: pick(row.contact_email, draftData.contactEmail, row.user_email),
+
+      contact_phone:
+        canViewPrivateAdminFields ||
+        row.show_contact_phone === true ||
+        draftData.showContactPhone === true
+          ? pick(row.contact_phone, draftData.contactPhone)
+          : null,
+
+      contact_method: pick(row.contact_method, draftData.contactMethod),
+
+      show_contact_phone:
+        row.show_contact_phone !== null && row.show_contact_phone !== undefined
+          ? row.show_contact_phone
+          : toBool(draftData.showContactPhone),
+
+      availability_status: pick(
+        row.availability_status,
+        draftData.availabilityStatus,
+        "available_now",
+      ),
+
+      available_from: pick(row.available_from, draftData.availableFrom),
+
+      payment_status: pick(row.payment_status, "unpaid"),
+
+      is_favorited: row.is_favorited === true,
+
+      agent_role: finalRole,
+      role: finalRole,
+
       agent: {
-        unique_id: row.agent_unique_id,
-        full_name: row.full_name,
-        username: row.username,
-        avatar_url: row.avatar_url,
-        bio: row.bio,
-        agency_name: row.agency_name,
-        experience: row.experience,
-        country: row.agent_country,
-        city: row.agent_city,
-        email: row.agent_email,
-        phone: row.agent_phone,
-        role: row.agent_role,
+        unique_id: pick(row.uploader_unique_id, row.uploaded_by_id),
+        name: agentName,
+        full_name: agentName,
+        username: pick(row.profile_username, row.user_username),
+        avatar_url: agentAvatar,
+        avatar: agentAvatar,
+        bio: pick(row.profile_bio, row.user_bio),
+        country: pick(row.profile_country, row.user_country),
+        city: pick(row.profile_city, row.user_city),
+
+        // Keep public-safe contact. Do not expose phone unless permitted.
+        email: pick(row.profile_email, row.user_email),
+        phone:
+          canViewPrivateAdminFields ||
+          row.show_contact_phone === true ||
+          draftData.showContactPhone === true
+            ? pick(row.profile_phone, row.user_phone, row.contact_phone)
+            : null,
+
+        role: finalRole,
+        role_label: getRoleLabel(finalRole, row.user_is_solo_agent),
+        is_solo_agent: row.user_is_solo_agent,
+
+        company_name: companyName,
+        agency_name:
+          String(finalRole || "").toLowerCase() === "agent" &&
+          row.user_is_solo_agent === false
+            ? companyName
+            : null,
+        brokerage_name:
+          ["brokerage", "brokerage_owner"].includes(
+            String(finalRole || "").toLowerCase(),
+          )
+            ? companyName
+            : null,
+
+        experience_years: row.agent_experience_years || null,
+
+        verification_status: isVerified
+          ? "verified"
+          : row.user_verification_status || "unverified",
+
+        is_verified: isVerified,
+        is_verified_agent: row.user_is_verified_agent === true,
+        public_badge: publicBadge,
+        created_at: row.user_created_at,
       },
-    });
+    };
+
+    return res.json(response);
   } catch (err) {
     console.error("[GetListingByProductId] Error:", err);
-    res.status(500).json({ message: "Failed", details: err?.message });
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch listing.",
+      code: "GET_LISTING_BY_PRODUCT_ID_FAILED",
+      details: err?.message,
+    });
   }
 };
+
+
+
+
 
 /* -------------------------------------------------------
    UPDATE LISTING STATUS - ADMIN
@@ -1920,126 +2579,925 @@ export const activateListing = async (req, res) => {
   }
 };
 
+
+
+
 /* -------------------------------------------------------
    GET ALL LISTINGS - ADMIN
+   Admin-safe full listing payload:
+   - Shows all listings: pending, approved, live, rejected, draft
+   - Pulls profile image/name from profiles first, then users
+   - Supports solo agents, agency agents, owners, brokerages
+   - Does NOT depend on profiles.agency_name
+   - Includes optional fields and draft_data fallback
+   - Includes legal/title document metadata for admins
+   - Returns array directly for current admin UI compatibility
 ------------------------------------------------------- */
 export const getAllListingsAdmin = async (req, res) => {
   try {
-    const query = `
+    const parseAnyJson = (value, fallback = null) => {
+      if (value === undefined || value === null || value === "") return fallback;
+      if (Array.isArray(value)) return value;
+      if (typeof value === "object") return value;
+
+      try {
+        return JSON.parse(value);
+      } catch {
+        return fallback;
+      }
+    };
+
+    const pick = (...values) => {
+      for (const value of values) {
+        if (value !== undefined && value !== null && value !== "") {
+          return value;
+        }
+      }
+
+      return null;
+    };
+
+    const toBool = (value) => {
+      return value === true || value === "true";
+    };
+
+    const getRoleLabel = (role, isSoloAgent) => {
+      const r = String(role || "").toLowerCase();
+
+      if (r === "agent") {
+        return isSoloAgent === false ? "Agency Agent" : "Solo Agent";
+      }
+
+      if (r === "agency_agent") return "Agency Agent";
+      if (r === "brokerage_agent") return "Brokerage Agent";
+      if (r === "brokerage" || r === "brokerage_owner") return "Brokerage";
+      if (r === "owner" || r === "landlord") return "Owner / Landlord";
+      if (r === "admin" || r === "super_admin") return "Admin";
+
+      return role || "User";
+    };
+
+    const result = await pool.query(
+      `
       SELECT
         l.*,
-        p.full_name, p.username, p.email AS agent_email, p.phone, p.avatar_url, p.agency_name,
-        p.city AS agent_city, p.country AS agent_country,
-        p.role as agent_role
+
+        u.unique_id AS uploader_unique_id,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        u.phone AS user_phone,
+        u.role AS user_role,
+        u.avatar_url AS user_avatar_url,
+        u.bio AS user_bio,
+        u.country AS user_country,
+        u.city AS user_city,
+        u.brokerage_name AS user_brokerage_name,
+        u.is_solo_agent AS user_is_solo_agent,
+        u.verification_status AS user_verification_status,
+        u.is_verified AS user_is_verified,
+        u.is_verified_agent AS user_is_verified_agent,
+        u.subscription_plan AS user_subscription_plan,
+        u.subscription_status AS user_subscription_status,
+
+        p.full_name AS profile_full_name,
+        p.username AS profile_username,
+        p.avatar_url AS profile_avatar_url,
+        p.bio AS profile_bio,
+        p.email AS profile_email,
+        p.phone AS profile_phone,
+        p.country AS profile_country,
+        p.city AS profile_city,
+
+        ap.experience_years AS agent_experience_years,
+
+        bp.company_name AS brokerage_company_name
+
       FROM listings l
-      LEFT JOIN profiles p ON l.created_by = p.unique_id
+
+      LEFT JOIN users u
+        ON l.uploaded_by_id::text = u.unique_id::text
+
+      LEFT JOIN profiles p
+        ON p.unique_id::text = u.unique_id::text
+
+      LEFT JOIN agent_profiles ap
+        ON ap.unique_id::text = u.unique_id::text
+
+      LEFT JOIN brokerage_profiles bp
+        ON bp.unique_id::text = u.unique_id::text
+
       ORDER BY
-        CASE WHEN l.status = 'pending' THEN 1 ELSE 2 END,
-        l.created_at DESC;
-    `;
+        CASE
+          WHEN l.status = 'pending' THEN 1
+          WHEN l.moderation_status = 'pending' THEN 2
+          WHEN l.status = 'rejected' THEN 3
+          WHEN l.status = 'approved' AND COALESCE(l.is_active, false) = false THEN 4
+          WHEN l.status = 'approved' AND COALESCE(l.is_active, false) = true THEN 5
+          WHEN l.status = 'draft' THEN 6
+          ELSE 7
+        END,
+        COALESCE(l.updated_at, l.created_at) DESC;
+      `,
+    );
 
-    const result = await pool.query(query);
+    const listings = result.rows.map((row) => {
+      const draftData = parseAnyJson(row.draft_data, {}) || {};
 
-    const rows = result.rows.map((row) => ({
-      ...row,
-      photos: normalizePhotosForResponse(row.photos),
-      latitude: row.latitude ? parseFloat(row.latitude) : null,
-      longitude: row.longitude ? parseFloat(row.longitude) : null,
-      role: row.agent_role,
-      agent_role: row.agent_role,
-      agent: {
-        unique_id: row.agent_unique_id,
-        full_name: row.full_name,
-        username: row.username,
-        avatar_url: row.avatar_url,
-        email: row.agent_email,
-        phone: row.phone,
-        agency_name: row.agency_name,
-        city: row.agent_city,
-        country: row.agent_country,
-        role: row.agent_role,
-      },
-    }));
+      const photos = normalizePhotosForResponse(
+        pick(row.photos, draftData.photos, []),
+      );
 
-    res.json(rows);
+      const floorPlans = parseAnyJson(
+        pick(row.floor_plans, draftData.floorPlans, draftData.floor_plans),
+        [],
+      );
+
+      const stagingPhotos = parseAnyJson(
+        pick(
+          row.staging_photos,
+          draftData.stagingPhotos,
+          draftData.staging_photos,
+        ),
+        [],
+      );
+
+      const panoramaPhotos = parseAnyJson(
+        pick(
+          row.panorama_photos,
+          draftData.panoramaPhotos,
+          draftData.panorama_photos,
+        ),
+        [],
+      );
+
+      const features = parseAnyJson(
+        pick(row.features, draftData.features, draftData.amenities),
+        [],
+      );
+
+      const amenities = parseAnyJson(
+        pick(row.amenities, draftData.amenities, draftData.features),
+        [],
+      );
+
+      const paymentOptions = parseAnyJson(
+        pick(row.payment_options, draftData.paymentOptions, draftData.payment_options),
+        [],
+      );
+
+      const preferredTourDays = parseAnyJson(
+        pick(
+          row.preferred_tour_days,
+          draftData.preferredTourDays,
+          draftData.preferred_tour_days,
+        ),
+        [],
+      );
+
+      const titleDocumentFile = parseAnyJson(
+        pick(
+          row.title_document_file,
+          draftData.titleDocumentFile,
+          draftData.title_document_file,
+        ),
+        null,
+      );
+
+      const virtualTourFile = parseAnyJson(
+        pick(
+          row.virtual_tour_file,
+          draftData.virtualTourFile,
+          draftData.virtual_tour_file,
+        ),
+        null,
+      );
+
+      const finalRole = row.user_role;
+
+      const isVerified =
+        row.user_is_verified === true ||
+        row.user_is_verified_agent === true ||
+        ["approved", "verified"].includes(
+          String(row.user_verification_status || "").toLowerCase(),
+        );
+
+      const agentName = pick(
+        row.profile_full_name,
+        row.user_name,
+        row.contact_name,
+        "Keyvia User",
+      );
+
+      const agentAvatar = pick(row.profile_avatar_url, row.user_avatar_url);
+
+      const companyName = pick(
+        row.brokerage_company_name,
+        row.user_brokerage_name,
+        draftData.companyName,
+        draftData.company_name,
+        draftData.agencyName,
+        draftData.agency_name,
+      );
+
+      const latitude = pick(row.latitude, draftData.latitude);
+      const longitude = pick(row.longitude, draftData.longitude);
+
+      return {
+        ...row,
+
+        // Parsed payloads
+        draft_data: draftData,
+        photos,
+        floor_plans: Array.isArray(floorPlans) ? floorPlans : [],
+        staging_photos: Array.isArray(stagingPhotos) ? stagingPhotos : [],
+        panorama_photos: Array.isArray(panoramaPhotos) ? panoramaPhotos : [],
+        features,
+        amenities,
+        payment_options: paymentOptions,
+        preferred_tour_days: preferredTourDays,
+
+        // Normalized coordinates
+        latitude:
+          latitude !== null && latitude !== undefined && latitude !== ""
+            ? parseFloat(latitude)
+            : null,
+
+        longitude:
+          longitude !== null && longitude !== undefined && longitude !== ""
+            ? parseFloat(longitude)
+            : null,
+
+        // Compatibility / normalized listing fields
+        agent_unique_id: pick(row.agent_unique_id, row.uploaded_by_id),
+        created_by: pick(row.created_by, row.uploaded_by_id),
+        uploaded_by_id: row.uploaded_by_id,
+
+        price_currency: pick(
+          row.price_currency,
+          row.currency,
+          draftData.priceCurrency,
+          draftData.price_currency,
+          "USD",
+        ),
+
+        currency: pick(
+          row.currency,
+          row.price_currency,
+          draftData.priceCurrency,
+          draftData.price_currency,
+          "USD",
+        ),
+
+        price_period: pick(row.price_period, draftData.pricePeriod),
+
+        property_type: pick(row.property_type, draftData.propertyType),
+        property_subtype: pick(row.property_subtype, draftData.propertySubtype),
+        listing_type: pick(row.listing_type, draftData.listingType),
+        category: pick(row.category, row.listing_type, draftData.listingType),
+
+        square_footage: pick(
+          row.square_footage,
+          row.area_sqft,
+          row.building_area_sqft,
+          draftData.squareFootage,
+          draftData.buildingAreaSqft,
+        ),
+
+        area_sqft: pick(
+          row.area_sqft,
+          row.square_footage,
+          row.building_area_sqft,
+          draftData.buildingAreaSqft,
+        ),
+
+        building_area_sqft: pick(
+          row.building_area_sqft,
+          row.area_sqft,
+          row.square_footage,
+          draftData.buildingAreaSqft,
+          draftData.building_area_sqft,
+        ),
+
+        land_area_sqft: pick(
+          row.land_area_sqft,
+          row.lot_size,
+          draftData.landAreaSqft,
+          draftData.land_area_sqft,
+        ),
+
+        lot_size: pick(
+          row.lot_size,
+          row.land_area_sqft,
+          draftData.landAreaSqft,
+          draftData.lotSize,
+        ),
+
+        building_area_unit: pick(
+          row.building_area_unit,
+          draftData.buildingAreaUnit,
+          "sqft",
+        ),
+
+        land_area_unit: pick(
+          row.land_area_unit,
+          draftData.landAreaUnit,
+          "sqft",
+        ),
+
+        zip_code: pick(row.zip_code, row.postal_code, draftData.zipCode),
+        postal_code: pick(row.postal_code, row.zip_code, draftData.zipCode),
+
+        neighborhood: pick(row.neighborhood, draftData.neighborhood),
+        estate_name: pick(row.estate_name, draftData.estateName),
+        landmark: pick(row.landmark, draftData.landmark),
+        road_access: pick(row.road_access, draftData.roadAccess),
+
+        total_rooms: pick(row.total_rooms, draftData.totalRooms),
+        floors: pick(row.floors, draftData.floors),
+        floor_number: pick(row.floor_number, draftData.floorNumber),
+        total_floors: pick(row.total_floors, draftData.totalFloors),
+        garage_spaces: pick(row.garage_spaces, draftData.garageSpaces),
+
+        property_condition: pick(
+          row.property_condition,
+          draftData.propertyCondition,
+        ),
+
+        construction_status: pick(
+          row.construction_status,
+          draftData.constructionStatus,
+        ),
+
+        ownership_type: pick(row.ownership_type, draftData.ownershipType),
+
+        power_supply: pick(row.power_supply, draftData.powerSupply),
+        water_supply: pick(row.water_supply, draftData.waterSupply),
+        internet_available:
+          row.internet_available !== null && row.internet_available !== undefined
+            ? row.internet_available
+            : toBool(draftData.internetAvailable),
+
+        drainage: pick(row.drainage, draftData.drainage),
+        security_type: pick(row.security_type, draftData.securityType),
+
+        generator_available:
+          row.generator_available !== null &&
+          row.generator_available !== undefined
+            ? row.generator_available
+            : toBool(draftData.generatorAvailable),
+
+        borehole:
+          row.borehole !== null && row.borehole !== undefined
+            ? row.borehole
+            : toBool(draftData.borehole),
+
+        prepaid_meter:
+          row.prepaid_meter !== null && row.prepaid_meter !== undefined
+            ? row.prepaid_meter
+            : toBool(draftData.prepaidMeter),
+
+        waste_disposal: pick(row.waste_disposal, draftData.wasteDisposal),
+
+        service_charge: pick(row.service_charge, draftData.serviceCharge),
+        caution_fee: pick(row.caution_fee, draftData.cautionFee),
+        agency_fee: pick(row.agency_fee, draftData.agencyFee),
+        legal_fee: pick(row.legal_fee, draftData.legalFee),
+        refundable_deposit: pick(
+          row.refundable_deposit,
+          draftData.refundableDeposit,
+        ),
+
+        minimum_rent_duration: pick(
+          row.minimum_rent_duration,
+          draftData.minimumRentDuration,
+        ),
+
+        rent_payment_frequency: pick(
+          row.rent_payment_frequency,
+          draftData.rentPaymentFrequency,
+        ),
+
+        pets_policy: pick(row.pets_policy, draftData.petsPolicy),
+        smoking_policy: pick(row.smoking_policy, draftData.smokingPolicy),
+        guest_policy: pick(row.guest_policy, draftData.guestPolicy),
+
+        mortgage_available:
+          row.mortgage_available !== null &&
+          row.mortgage_available !== undefined
+            ? row.mortgage_available
+            : toBool(draftData.mortgageAvailable),
+
+        installment_available:
+          row.installment_available !== null &&
+          row.installment_available !== undefined
+            ? row.installment_available
+            : toBool(draftData.installmentAvailable),
+
+        rent_to_own_available:
+          row.rent_to_own_available !== null &&
+          row.rent_to_own_available !== undefined
+            ? row.rent_to_own_available
+            : toBool(draftData.rentToOwnAvailable),
+
+        estimated_monthly_payment: pick(
+          row.estimated_monthly_payment,
+          draftData.estimatedMonthlyPayment,
+        ),
+
+        down_payment_percent: pick(
+          row.down_payment_percent,
+          draftData.downPaymentPercent,
+        ),
+
+        interest_rate_estimate: pick(
+          row.interest_rate_estimate,
+          draftData.interestRateEstimate,
+        ),
+
+        hoa_fee: pick(row.hoa_fee, draftData.hoaFee),
+
+        property_tax_estimate: pick(
+          row.property_tax_estimate,
+          draftData.propertyTaxEstimate,
+        ),
+
+        insurance_estimate: pick(
+          row.insurance_estimate,
+          draftData.insuranceEstimate,
+        ),
+
+        price_per_sqft: pick(row.price_per_sqft, draftData.pricePerSqft),
+
+        price_negotiable:
+          row.price_negotiable !== null && row.price_negotiable !== undefined
+            ? row.price_negotiable
+            : toBool(draftData.priceNegotiable),
+
+        closing_cost_estimate: pick(
+          row.closing_cost_estimate,
+          draftData.closingCostEstimate,
+        ),
+
+        title_document_type: pick(
+          row.title_document_type,
+          draftData.titleDocumentType,
+        ),
+
+        title_verified:
+          row.title_verified !== null && row.title_verified !== undefined
+            ? row.title_verified
+            : toBool(draftData.titleVerified),
+
+        survey_available:
+          row.survey_available !== null && row.survey_available !== undefined
+            ? row.survey_available
+            : toBool(draftData.surveyAvailable),
+
+        building_approval_available:
+          row.building_approval_available !== null &&
+          row.building_approval_available !== undefined
+            ? row.building_approval_available
+            : toBool(draftData.buildingApprovalAvailable),
+
+        // Admin-only file metadata. This can include public URL if available.
+        // For truly private S3 docs, later we should return a signed admin URL here.
+        title_document_file: titleDocumentFile,
+        virtual_tour_file: virtualTourFile,
+
+        video_url: pick(row.video_url, draftData.video?.url),
+        video_public_id: pick(
+          row.video_public_id,
+          draftData.video?.key,
+          draftData.video?.public_id,
+        ),
+
+        virtual_tour_url: pick(
+          row.virtual_tour_url,
+          draftData.virtualTourUrl,
+          draftData.virtual_tour_url,
+          draftData.virtualTourFile?.url,
+          draftData.virtual_tour_file?.url,
+        ),
+
+        virtual_tour_public_id: pick(
+          row.virtual_tour_public_id,
+          draftData.virtualTourFile?.key,
+          draftData.virtual_tour_file?.key,
+        ),
+
+        three_d_home_url: pick(row.three_d_home_url, draftData.threeDHomeUrl),
+
+        allow_tour_requests:
+          row.allow_tour_requests !== null &&
+          row.allow_tour_requests !== undefined
+            ? row.allow_tour_requests
+            : draftData.allowTourRequests !== false,
+
+        allow_video_tour:
+          row.allow_video_tour !== null && row.allow_video_tour !== undefined
+            ? row.allow_video_tour
+            : draftData.allowVideoTour !== false,
+
+        allow_in_person_tour:
+          row.allow_in_person_tour !== null &&
+          row.allow_in_person_tour !== undefined
+            ? row.allow_in_person_tour
+            : draftData.allowInPersonTour !== false,
+
+        preferred_tour_times: pick(
+          row.preferred_tour_times,
+          draftData.preferredTourTimes,
+        ),
+
+        minimum_notice_hours: pick(
+          row.minimum_notice_hours,
+          draftData.minimumNoticeHours,
+        ),
+
+        contact_name: pick(row.contact_name, draftData.contactName, agentName),
+        contact_email: pick(row.contact_email, draftData.contactEmail, row.user_email),
+        contact_phone: pick(row.contact_phone, draftData.contactPhone),
+        contact_method: pick(row.contact_method, draftData.contactMethod),
+
+        show_contact_phone:
+          row.show_contact_phone !== null && row.show_contact_phone !== undefined
+            ? row.show_contact_phone
+            : toBool(draftData.showContactPhone),
+
+        availability_status: pick(
+          row.availability_status,
+          draftData.availabilityStatus,
+          "available_now",
+        ),
+
+        available_from: pick(row.available_from, draftData.availableFrom),
+
+        payment_status: pick(row.payment_status, "unpaid"),
+
+        agent_role: finalRole,
+        role: finalRole,
+
+        agent: {
+          unique_id: pick(row.uploader_unique_id, row.uploaded_by_id),
+          name: agentName,
+          full_name: agentName,
+          username: pick(row.profile_username, row.user_username),
+          avatar_url: agentAvatar,
+          avatar: agentAvatar,
+          email: pick(row.profile_email, row.user_email),
+          phone: pick(row.profile_phone, row.user_phone),
+          bio: pick(row.profile_bio, row.user_bio),
+          country: pick(row.profile_country, row.user_country),
+          city: pick(row.profile_city, row.user_city),
+          role: finalRole,
+          role_label: getRoleLabel(finalRole, row.user_is_solo_agent),
+          is_solo_agent: row.user_is_solo_agent,
+          company_name: companyName,
+          brokerage_name:
+            ["brokerage", "brokerage_owner"].includes(
+              String(finalRole || "").toLowerCase(),
+            )
+              ? companyName
+              : null,
+          agency_name:
+            String(finalRole || "").toLowerCase() === "agent" &&
+            row.user_is_solo_agent === false
+              ? companyName
+              : null,
+          experience_years: row.agent_experience_years || null,
+          verification_status: row.user_verification_status || null,
+          is_verified: isVerified,
+          is_verified_agent: row.user_is_verified_agent === true,
+          subscription_plan: row.user_subscription_plan || null,
+          subscription_status: row.user_subscription_status || null,
+        },
+      };
+    });
+
+    return res.json(listings);
   } catch (err) {
     console.error("[GetAllListingsAdmin] Error:", err);
-    res.status(500).json({ message: "Failed to fetch admin listings" });
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch admin listings.",
+      code: "ADMIN_LISTINGS_FETCH_FAILED",
+      details: err?.message,
+    });
   }
 };
 
 /* -------------------------------------------------------
    GET PUBLIC PROFILE
+   Route: GET /api/listings/public/agent/:unique_id
+   Safe public profile for agents, owners, brokerages, and buyers.
+   Does NOT expose license number, legal docs, team code, linked agency ID,
+   registration number, private email, or private phone.
 ------------------------------------------------------- */
 export const getPublicAgentProfile = async (req, res) => {
   try {
     let { unique_id } = req.params;
-    let queryCondition = "";
-    let queryValue = unique_id;
+
+    if (!unique_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Profile identifier is required.",
+      });
+    }
+
+    let queryValue = String(unique_id).trim();
+
+    if (queryValue.startsWith("@")) {
+      queryValue = queryValue.substring(1);
+    }
 
     const isUUID =
       /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        unique_id,
+        queryValue,
       );
 
-    if (isUUID) {
-      queryCondition = "unique_id = $1";
-    } else {
-      if (queryValue.startsWith("@")) queryValue = queryValue.substring(1);
-      queryCondition = "(username ILIKE $1 OR full_name ILIKE $1)";
-    }
+    const profileWhere = isUUID
+      ? `u.unique_id::text = $1::text`
+      : `
+        (
+          LOWER(u.username) = LOWER($1)
+          OR LOWER(p.username) = LOWER($1)
+          OR LOWER(REPLACE(COALESCE(u.name, ''), ' ', '_')) = LOWER($1)
+          OR LOWER(REPLACE(COALESCE(p.full_name, ''), ' ', '_')) = LOWER($1)
+          OR LOWER(COALESCE(u.name, '')) = LOWER($1)
+          OR LOWER(COALESCE(p.full_name, '')) = LOWER($1)
+        )
+      `;
 
     const profileQ = await pool.query(
-      `SELECT unique_id, full_name, username, avatar_url, bio,
-              agency_name, experience, country, city,
-              email, phone, social_instagram, social_twitter, social_linkedin,
-              role,
-              verification_status AS status,
-              created_at
-       FROM profiles
-       WHERE ${queryCondition}`,
+      `
+      SELECT
+        u.unique_id,
+        COALESCE(p.full_name, u.name, 'Keyvia User') AS full_name,
+        COALESCE(p.username, u.username) AS username,
+        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
+        COALESCE(p.bio, u.bio) AS bio,
+        COALESCE(p.country, u.country) AS country,
+        COALESCE(p.city, u.city) AS city,
+
+        u.role,
+        u.is_solo_agent,
+        u.verification_status,
+        u.is_verified,
+        u.subscription_plan,
+        u.subscription_status,
+        u.created_at,
+
+        ap.experience_years,
+
+        bp.company_name AS brokerage_company_name,
+
+        COALESCE(bp.company_name, u.brokerage_name) AS public_company_name,
+
+        p.social_instagram,
+        p.social_facebook,
+        p.social_twitter,
+        p.social_linkedin,
+        p.social_tiktok
+
+      FROM users u
+
+      LEFT JOIN profiles p
+        ON p.unique_id::text = u.unique_id::text
+
+      LEFT JOIN agent_profiles ap
+        ON ap.unique_id::text = u.unique_id::text
+
+      LEFT JOIN brokerage_profiles bp
+        ON bp.unique_id::text = u.unique_id::text
+
+      WHERE ${profileWhere}
+      LIMIT 1
+      `,
       [queryValue],
     );
 
     if (!profileQ.rows.length) {
-      return res.status(404).json({ message: "Profile not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Profile not found.",
+      });
     }
 
-    const agent = profileQ.rows[0];
+    const rawProfile = profileQ.rows[0];
 
-    if (agent.role === "Buyer") {
-      agent.status = "verified";
+    const role = String(rawProfile.role || "").toLowerCase();
+
+    const verificationStatus = String(
+      rawProfile.verification_status || "",
+    ).toLowerCase();
+
+    const isIdentityVerified =
+      rawProfile.is_verified === true ||
+      verificationStatus === "verified" ||
+      verificationStatus === "approved";
+
+    const subscriptionPlan = String(
+      rawProfile.subscription_plan || "free",
+    ).toLowerCase();
+
+    const subscriptionStatus = String(
+      rawProfile.subscription_status || "",
+    ).toLowerCase();
+
+    const hasActiveSubscription = subscriptionStatus === "active";
+
+    const isElitePlan =
+      hasActiveSubscription &&
+      [
+        "elite_agent",
+        "elite_owner",
+        "elite_brokerage",
+        "enterprise",
+      ].includes(subscriptionPlan);
+
+    const isProPlan =
+      hasActiveSubscription &&
+      ["pro_agent", "pro_owner", "pro_brokerage"].includes(subscriptionPlan);
+
+    let publicBadge = null;
+
+    if (isIdentityVerified && isElitePlan) {
+      publicBadge = "elite_verified";
+    } else if (isIdentityVerified && isProPlan) {
+      publicBadge = "pro_verified";
+    } else if (isIdentityVerified) {
+      publicBadge = "verified";
     }
 
-    agent.country_code = COUNTRY_ISO_MAP[agent.country] || null;
+    let roleLabel = "Keyvia Member";
+
+    if (role === "agent") {
+      roleLabel =
+        rawProfile.is_solo_agent === false
+          ? "Agency Agent"
+          : "Real Estate Agent";
+    } else if (role === "owner" || role === "landlord") {
+      roleLabel = "Property Owner";
+    } else if (role === "brokerage" || role === "brokerage_owner") {
+      roleLabel = "Brokerage Company";
+    } else if (role === "buyer") {
+      roleLabel = "Buyer";
+    }
+
+    const countryCode = COUNTRY_ISO_MAP?.[rawProfile.country] || null;
+
+    const agent = {
+      unique_id: rawProfile.unique_id,
+      full_name: rawProfile.full_name,
+      username: rawProfile.username,
+      avatar_url: rawProfile.avatar_url,
+      bio: rawProfile.bio,
+      country: rawProfile.country,
+      country_code: countryCode,
+      city: rawProfile.city,
+
+      role,
+      role_label: roleLabel,
+      is_solo_agent: rawProfile.is_solo_agent,
+
+      verification_status: isIdentityVerified
+        ? "verified"
+        : verificationStatus || "unverified",
+      is_verified: isIdentityVerified,
+
+      // Public display badge only.
+      // Do not expose subscription_plan to frontend users.
+      public_badge: publicBadge,
+
+      experience_years: rawProfile.experience_years || null,
+
+      company_name: rawProfile.public_company_name || null,
+      agency_name:
+        role === "agent" && rawProfile.is_solo_agent === false
+          ? rawProfile.public_company_name || null
+          : null,
+      brokerage_name:
+        role === "brokerage" || role === "brokerage_owner"
+          ? rawProfile.public_company_name || null
+          : null,
+
+      created_at: rawProfile.created_at,
+
+      social_instagram: rawProfile.social_instagram || null,
+      social_facebook: rawProfile.social_facebook || null,
+      social_twitter: rawProfile.social_twitter || null,
+      social_linkedin: rawProfile.social_linkedin || null,
+      social_tiktok: rawProfile.social_tiktok || null,
+    };
 
     let listings = [];
 
-    if (agent.role !== "buyer") {
+    if (role !== "buyer") {
       const listingsQ = await pool.query(
-        `SELECT * FROM listings
-         WHERE agent_unique_id = $1 AND status = 'approved' AND is_active = true
-         ORDER BY created_at DESC`,
-        [agent.unique_id],
+        `
+        SELECT
+          product_id,
+          title,
+          description,
+
+          property_type,
+          property_subtype,
+          listing_type,
+          category,
+
+          price,
+          currency,
+          price_currency,
+          price_period,
+
+          bedrooms,
+          bathrooms,
+          square_footage,
+          area_sqft,
+          lot_size,
+          year_built,
+
+          address,
+          city,
+          state,
+          country,
+          neighborhood,
+          estate_name,
+          landmark,
+
+          latitude,
+          longitude,
+
+          photos,
+          features,
+          amenities,
+
+          views_count,
+          saves_count,
+          shares_count,
+
+          created_at,
+          listed_at,
+          activated_at,
+          updated_at
+
+        FROM listings
+        WHERE
+          (
+            uploaded_by_id::text = $1::text
+            OR agent_unique_id::text = $1::text
+            OR created_by::text = $1::text
+          )
+          AND status = 'approved'
+          AND is_active = true
+        ORDER BY COALESCE(activated_at, listed_at, created_at) DESC
+        LIMIT 100
+        `,
+        [String(agent.unique_id)],
       );
 
       listings = listingsQ.rows.map((listing) => ({
         ...listing,
         photos: normalizePhotosForResponse(listing.photos),
+        features: safeJsonParse(listing.features, []),
+        amenities: safeJsonParse(listing.amenities, []),
+        latitude: listing.latitude ? parseFloat(listing.latitude) : null,
+        longitude: listing.longitude ? parseFloat(listing.longitude) : null,
+        price_currency: listing.price_currency || listing.currency || "USD",
+        square_footage: listing.square_footage || listing.area_sqft || null,
       }));
     }
 
-    res.json({
+    const profileViews = 0;
+
+    const listingViews = listings.reduce(
+      (sum, listing) => sum + Number(listing.views_count || 0),
+      0,
+    );
+
+    return res.json({
+      success: true,
       agent,
       listings,
+      analytics: {
+        profile_views: profileViews,
+        listing_views: listingViews,
+      },
       default_cover:
-        agent.role === "Buyer"
+        role === "buyer"
           ? "https://images.unsplash.com/photo-1560518883-ce09059eeffa?q=80&w=1973&auto=format&fit=crop"
           : null,
     });
   } catch (err) {
     console.error("[GetPublicProfile] Error:", err);
-    res.status(500).json({ message: "Server Error" });
+
+    return res.status(500).json({
+      success: false,
+      message: "Server Error",
+      details: err.message,
+    });
   }
 };
 
@@ -2060,119 +3518,252 @@ export const analyzeListing = async (req, res) => {
 };
 
 /* -------------------------------------------------------
-   BATCH AI ANALYSIS
+   BATCH AI ANALYSIS - LISTINGS
+   Route: POST /api/listings/admin/analyze-all
+
+   Scans all pending listings and applies verdicts:
+   - Safe to Approve / Auto-Approve / approved => approved + live
+   - Rejected / Auto-Reject => rejected
+   - Needs Review / warning => stays pending with admin_notes
 ------------------------------------------------------- */
 export const batchAnalyzeListings = async (req, res) => {
   try {
-    console.log("🚀 Starting Batch Analysis...");
+    console.log("🚀 Starting listing batch AI analysis...");
 
-    const pendingListings = await pool.query(
-      `SELECT product_id, agent_unique_id, title FROM listings WHERE status = 'pending'`,
+    const pendingQ = await pool.query(
+      `
+      SELECT
+        product_id,
+        uploaded_by_id,
+        agent_unique_id,
+        created_by,
+        title,
+        status,
+        is_active
+      FROM listings
+      WHERE status = 'pending'
+      OR moderation_status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT 100;
+      `,
     );
 
-    const total = pendingListings.rows.length;
+    const pendingListings = pendingQ.rows;
 
-    if (total === 0) {
+    if (!pendingListings.length) {
       return res.json({
         success: true,
         message: "No pending listings to analyze.",
-        stats: { approved: 0, rejected: 0, failed: 0 },
+        approved: 0,
+        rejected: 0,
+        remaining: 0,
+        failed: 0,
+        results: [],
       });
     }
 
-    res.json({
-      success: true,
-      message: `Batch analysis started for ${total} listings. Check admin logs/dashboard for progress.`,
-    });
+    let approved = 0;
+    let rejected = 0;
+    let remaining = 0;
+    let failed = 0;
 
-    (async () => {
-      console.log(`🚀 Processing ${total} listings in background...`);
+    const results = [];
 
-      const allPending = pendingListings.rows;
-      const CHUNK_SIZE = 3;
+    for (const listing of pendingListings) {
+      try {
+        const report = await performFullAnalysis(listing.product_id);
 
-      for (let i = 0; i < allPending.length; i += CHUNK_SIZE) {
-        const chunk = allPending.slice(i, i + CHUNK_SIZE);
+        const score = Number(report?.score || 0);
+        const verdict = String(report?.verdict || "").toLowerCase();
+        const flags = Array.isArray(report?.flags) ? report.flags : [];
 
-        await Promise.all(
-          chunk.map(async (listing) => {
-            try {
-              const report = await performFullAnalysis(listing.product_id);
+        const reason =
+          flags.length > 0
+            ? flags.join(" | ")
+            : report?.reason ||
+              report?.message ||
+              report?.verdict ||
+              "AI analysis completed.";
 
-              let newStatus = "pending";
-              let notificationTitle = "";
-              let notificationMsg = "";
-              const adminNote =
-                report.flags && report.flags.length > 0
-                  ? report.flags.join(". ")
-                  : "Verified by AI.";
+        let newStatus = "pending";
+        let moderationStatus = "pending";
+        let isActive = false;
 
-              if (report.verdict === "Safe to Approve") {
-                newStatus = "approved";
-                notificationTitle = "Listing Approved";
-                notificationMsg = `Your listing "${listing.title}" passed AI verification.`;
-              } else if (report.verdict === "Rejected") {
-                newStatus = "rejected";
-                notificationTitle = "Listing Rejected";
-                notificationMsg = `Your listing "${listing.title}" was rejected. Issues: ${adminNote}`;
-              } else {
-                await pool.query(
-                  `UPDATE listings SET admin_notes = $1 WHERE product_id = $2`,
-                  [`AI Flag: ${adminNote}`, listing.product_id],
-                );
-                return;
-              }
+        const safeVerdicts = [
+          "safe to approve",
+          "approved",
+          "auto-approve",
+          "auto approved",
+          "safe",
+          "pass",
+          "passed",
+        ];
 
-              await pool.query(
-                `UPDATE listings SET status = $1, admin_notes = $2, updated_at = NOW() WHERE product_id = $3`,
-                [newStatus, adminNote, listing.product_id],
-              );
+        const rejectVerdicts = [
+          "rejected",
+          "auto-reject",
+          "auto rejected",
+          "reject",
+          "failed",
+          "unsafe",
+        ];
 
-              await pool.query(
-                `INSERT INTO notifications (receiver_id, product_id, type, title, message)
-                 VALUES ($1, $2, 'listing_status', $3, $4)`,
-                [
-                  listing.agent_unique_id,
-                  listing.product_id,
-                  notificationTitle,
-                  notificationMsg,
-                ],
-              );
+        if (safeVerdicts.includes(verdict) || score >= 80) {
+          newStatus = "approved";
+          moderationStatus = "approved";
+          isActive = true;
+          approved += 1;
+        } else if (rejectVerdicts.includes(verdict) || score <= 35) {
+          newStatus = "rejected";
+          moderationStatus = "rejected";
+          isActive = false;
+          rejected += 1;
+        } else {
+          newStatus = "pending";
+          moderationStatus = "pending";
+          isActive = false;
+          remaining += 1;
+        }
 
-              if (req.io) {
-                req.io.to(listing.agent_unique_id).emit("notification", {
-                  title: notificationTitle,
-                  message: notificationMsg,
-                });
-
-                req.io
-                  .to(listing.agent_unique_id)
-                  .emit("listingStatusUpdated", {
-                    product_id: listing.product_id,
-                    status: newStatus,
-                  });
-              }
-
-              console.log(`✅ Analyzed ${listing.product_id}: ${newStatus}`);
-            } catch (err) {
-              console.error(`❌ Error processing ${listing.product_id}`, err);
-            }
-          }),
+        const updateQ = await pool.query(
+          `
+          UPDATE listings
+          SET
+            status = $1,
+            moderation_status = $2,
+            is_active = $3,
+            risk_score = COALESCE($4, risk_score),
+            listing_score = COALESCE($5, listing_score),
+            moderation_reason = $6,
+            admin_notes = $7,
+            reviewed_by = $8::uuid,
+            reviewed_at = NOW(),
+            updated_at = NOW(),
+            activated_at = CASE
+              WHEN $1 = 'approved' AND $3 = true
+              THEN COALESCE(activated_at, NOW())
+              ELSE activated_at
+            END
+          WHERE product_id = $9
+          RETURNING *;
+          `,
+          [
+            newStatus,
+            moderationStatus,
+            isActive,
+            Number.isFinite(score) ? Math.max(0, 100 - score) : null,
+            Number.isFinite(score) ? score : null,
+            reason,
+            `AI Listing Review: ${reason}`,
+            req.user?.unique_id || null,
+            listing.product_id,
+          ],
         );
 
-        await sleep(2000);
+        const updatedListing = updateQ.rows[0];
+
+        const receiverId =
+          listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
+
+        if (receiverId) {
+          let notificationTitle = "Listing Review Update";
+          let notificationMsg = `Your listing "${listing.title}" was reviewed.`;
+
+          if (newStatus === "approved") {
+            notificationTitle = "Listing Approved";
+            notificationMsg = `Your listing "${listing.title}" passed review and is now live.`;
+          } else if (newStatus === "rejected") {
+            notificationTitle = "Listing Rejected";
+            notificationMsg = `Your listing "${listing.title}" was rejected. Reason: ${reason}`;
+          } else {
+            notificationTitle = "Listing Needs Manual Review";
+            notificationMsg = `Your listing "${listing.title}" still needs manual review. Reason: ${reason}`;
+          }
+
+          try {
+            await pool.query(
+              `
+              INSERT INTO notifications (
+                receiver_id,
+                product_id,
+                type,
+                title,
+                message,
+                created_at
+              )
+              VALUES ($1::uuid, $2, 'listing_status', $3, $4, NOW())
+              `,
+              [String(receiverId), listing.product_id, notificationTitle, notificationMsg],
+            );
+          } catch (notifyErr) {
+            console.warn(
+              "[BatchAnalyzeListings] Notification failed:",
+              notifyErr?.message,
+            );
+          }
+
+          if (req.io) {
+            req.io.to(String(receiverId)).emit("listingStatusUpdated", {
+              product_id: listing.product_id,
+              status: newStatus,
+              is_active: isActive,
+            });
+          }
+        }
+
+        results.push({
+          product_id: listing.product_id,
+          title: listing.title,
+          status: newStatus,
+          moderation_status: moderationStatus,
+          is_active: isActive,
+          score,
+          verdict: report?.verdict || null,
+          reason,
+          listing: updatedListing,
+        });
+
+        console.log(`✅ ${listing.product_id}: ${newStatus}`);
+      } catch (itemErr) {
+        failed += 1;
+
+        console.error(
+          `❌ AI failed for listing ${listing.product_id}:`,
+          itemErr?.message,
+        );
+
+        results.push({
+          product_id: listing.product_id,
+          title: listing.title,
+          status: "failed",
+          error: itemErr?.message,
+        });
       }
-
-      console.log("✅ Batch Analysis Complete.");
-    })();
-  } catch (err) {
-    console.error("Batch Error:", err);
-
-    if (!res.headersSent) {
-      res.status(500).json({ message: "Server Error", error: err.message });
     }
+
+    return res.json({
+      success: true,
+      message: `AI scan completed. Approved: ${approved}, Rejected: ${rejected}, Remaining: ${remaining}, Failed: ${failed}.`,
+      approved,
+      rejected,
+      remaining,
+      failed,
+      total: pendingListings.length,
+      results,
+    });
+  } catch (err) {
+    console.error("[BatchAnalyzeListings] Error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Listing batch AI analysis failed.",
+      details: err?.message,
+    });
   }
 };
+
+
+
 
 export const createListingDraft = async (req, res) => {
   try {
@@ -2541,54 +4132,671 @@ export const getListingDraftByProductId = async (req, res) => {
   }
 };
 
+
+
+
+/* -------------------------------------------------------
+   SUBMIT LISTING DRAFT
+   Flow:
+   - Save final form/media payload into listing row
+   - Evaluate risk
+   - Verified + low-risk listing => approved + active immediately
+   - Risky listing => pending review
+------------------------------------------------------- */
 export const submitListingDraft = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
     const { product_id } = req.params;
+    const b = req.body || {};
 
     if (!userId) {
       return res.status(401).json({
-        message: "Unauthorized",
+        success: false,
+        message: "Unauthorized.",
         code: "UNAUTHORIZED",
       });
     }
 
-    const result = await pool.query(
+    if (!product_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing listing product ID.",
+        code: "MISSING_PRODUCT_ID",
+      });
+    }
+
+    const userRes = await pool.query(
       `
-      UPDATE listings
-      SET
-        status = 'pending',
-        moderation_status = 'pending',
-        is_active = false,
-        listed_at = NOW(),
-        last_updated_at = NOW(),
-        updated_at = NOW()
+      SELECT
+        unique_id,
+        email,
+        name,
+        role,
+        verification_status,
+        is_verified,
+        is_verified_agent,
+        is_banned,
+        subscription_plan,
+        subscription_status
+      FROM users
+      WHERE unique_id = $1::uuid
+      LIMIT 1;
+      `,
+      [String(userId)],
+    );
+
+    const currentUser = userRes.rows[0];
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "User account not found.",
+        code: "USER_NOT_FOUND",
+      });
+    }
+
+    if (currentUser.is_banned) {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is restricted from submitting listings.",
+        code: "ACCOUNT_RESTRICTED",
+      });
+    }
+
+    const existingRes = await pool.query(
+      `
+      SELECT *
+      FROM listings
       WHERE product_id = $1
       AND uploaded_by_id = $2::uuid
-      AND status = 'draft'
-      RETURNING *;
+      LIMIT 1;
       `,
       [product_id, String(userId)],
     );
 
-    if (!result.rows[0]) {
+    const existing = existingRes.rows[0];
+
+    if (!existing) {
       return res.status(404).json({
-        message: "Draft not found.",
+        success: false,
+        message: "Draft listing not found.",
         code: "DRAFT_NOT_FOUND",
+      });
+    }
+
+    if (existing.status !== "draft") {
+      return res.status(400).json({
+        success: false,
+        message: "This listing has already been submitted.",
+        code: "ALREADY_SUBMITTED",
+        listing: {
+          ...existing,
+          photos: normalizePhotosForResponse(existing.photos),
+        },
+      });
+    }
+
+    const verificationStatus = String(
+      currentUser.verification_status || "",
+    ).toLowerCase();
+
+    const userIsVerified =
+      currentUser.is_verified === true ||
+      currentUser.is_verified_agent === true ||
+      verificationStatus === "approved" ||
+      verificationStatus === "verified";
+
+    if (!userIsVerified) {
+      return res.status(403).json({
+        success: false,
+        message: "You must complete verification before submitting listings.",
+        code: "VERIFICATION_REQUIRED",
+      });
+    }
+
+    const blockedVerificationStatuses = new Set([
+      "rejected",
+      "declined",
+      "failed",
+    ]);
+
+    if (blockedVerificationStatuses.has(verificationStatus)) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Your verification was not approved. Please resolve verification before submitting listings.",
+        code: "VERIFICATION_REJECTED",
+      });
+    }
+
+    const safePhotos = Array.isArray(b.photos)
+      ? b.photos
+      : safeJsonParse(b.photos, safeJsonParse(existing.photos, []));
+
+    const safeFloorPlans = Array.isArray(b.floor_plans)
+      ? b.floor_plans
+      : safeJsonParse(b.floor_plans, safeJsonParse(existing.floor_plans, []));
+
+    const safeStagingPhotos = Array.isArray(b.staging_photos)
+      ? b.staging_photos
+      : safeJsonParse(
+          b.staging_photos,
+          safeJsonParse(existing.staging_photos, []),
+        );
+
+    const safePanoramaPhotos = Array.isArray(b.panorama_photos)
+      ? b.panorama_photos
+      : safeJsonParse(
+          b.panorama_photos,
+          safeJsonParse(existing.panorama_photos, []),
+        );
+
+    const finalTitle = b.title ?? existing.title;
+    const finalDescription = b.description ?? existing.description;
+    const finalAddress = b.address ?? existing.address;
+    const finalCity = b.city ?? existing.city;
+    const finalState = b.state ?? existing.state;
+    const finalCountry = b.country ?? existing.country;
+    const finalZipCode =
+      b.zip_code ?? b.zipCode ?? b.postal_code ?? existing.zip_code;
+
+    const finalPrice = toNumberOrNull(b.price ?? existing.price);
+    let finalLatitude = toNumberOrNull(b.latitude ?? existing.latitude);
+    let finalLongitude = toNumberOrNull(b.longitude ?? existing.longitude);
+
+    /*
+      If coordinates are missing, try one backend geocode before judging risk.
+      This keeps typed addresses from always going to review.
+    */
+    if (
+      (finalLatitude === null || finalLongitude === null) &&
+      finalAddress &&
+      finalCity &&
+      finalCountry
+    ) {
+      try {
+        const geo = await processGeolocation(
+          finalAddress,
+          finalCity,
+          finalState,
+          finalCountry,
+          finalZipCode,
+        );
+
+        if (geo?.lat && geo?.lng) {
+          finalLatitude = geo.lat;
+          finalLongitude = geo.lng;
+        }
+      } catch (geoErr) {
+        console.warn(
+          "[SubmitListingDraft] Backend geocode failed:",
+          geoErr?.message,
+        );
+      }
+    }
+
+    const featuresArr = normalizeFeatures(b.features ?? existing.features);
+    const amenitiesArr = Array.isArray(b.amenities)
+      ? b.amenities
+      : normalizeFeatures(b.amenities ?? existing.amenities);
+
+    const paymentOptions = Array.isArray(b.payment_options)
+      ? b.payment_options
+      : safeJsonParse(
+          b.payment_options,
+          safeJsonParse(existing.payment_options, []),
+        );
+
+    const preferredTourDays = Array.isArray(b.preferred_tour_days)
+      ? b.preferred_tour_days
+      : safeJsonParse(
+          b.preferred_tour_days,
+          safeJsonParse(existing.preferred_tour_days, []),
+        );
+
+    const risk = evaluateListingRisk({
+      listing: {
+        title: finalTitle,
+        address: finalAddress,
+        country: finalCountry,
+        city: finalCity,
+        latitude: finalLatitude,
+        longitude: finalLongitude,
+        price: finalPrice,
+        photos: safePhotos,
+        description: finalDescription,
+      },
+      user: currentUser,
+    });
+
+    /*
+      Final publishing rule:
+      - verified user
+      - low risk
+      - valid photos
+      - valid coordinates
+      => live immediately
+    */
+    const hasPhotos = Array.isArray(safePhotos) && safePhotos.length > 0;
+
+    const hasValidCoordinates =
+      finalLatitude !== null &&
+      finalLongitude !== null &&
+      finalLatitude >= -90 &&
+      finalLatitude <= 90 &&
+      finalLongitude >= -180 &&
+      finalLongitude <= 180;
+
+    const shouldAutoPublish =
+      userIsVerified &&
+      risk.risk_level === "low" &&
+      risk.score < 25 &&
+      hasPhotos &&
+      hasValidCoordinates;
+
+    const finalStatus = shouldAutoPublish ? "approved" : "pending";
+    const finalModerationStatus = shouldAutoPublish ? "approved" : "pending";
+    const finalIsActive = shouldAutoPublish;
+
+    const moderationReason = risk.flags?.length
+      ? risk.flags.join(" | ")
+      : shouldAutoPublish
+        ? "Auto-approved: verified user and low-risk listing."
+        : "Submitted for admin review.";
+
+    const updateRes = await pool.query(
+      `
+      UPDATE listings
+      SET
+        title = COALESCE($1, title),
+        description = COALESCE($2, description),
+
+        listing_type = COALESCE($3, listing_type),
+        property_type = COALESCE($4, property_type),
+        property_subtype = COALESCE($5, property_subtype),
+
+        price = COALESCE($6, price),
+        currency = COALESCE($7, currency),
+        price_currency = COALESCE($7, price_currency),
+        price_period = COALESCE($8, price_period),
+
+        address = COALESCE($9, address),
+        city = COALESCE($10, city),
+        state = COALESCE($11, state),
+        country = COALESCE($12, country),
+        zip_code = COALESCE($13, zip_code),
+        postal_code = COALESCE($13, postal_code),
+        latitude = COALESCE($14, latitude),
+        longitude = COALESCE($15, longitude),
+
+        neighborhood = COALESCE($16, neighborhood),
+        estate_name = COALESCE($17, estate_name),
+        landmark = COALESCE($18, landmark),
+        road_access = COALESCE($19, road_access),
+
+        bedrooms = COALESCE($20, bedrooms),
+        bathrooms = COALESCE($21, bathrooms),
+        total_rooms = COALESCE($22, total_rooms),
+        floors = COALESCE($23, floors),
+        floor_number = COALESCE($24, floor_number),
+        total_floors = COALESCE($25, total_floors),
+        garage_spaces = COALESCE($26, garage_spaces),
+        year_built = COALESCE($27, year_built),
+        parking = COALESCE($28, parking),
+
+        building_area_sqft = COALESCE($29, building_area_sqft),
+        land_area_sqft = COALESCE($30, land_area_sqft),
+        building_area_unit = COALESCE($31, building_area_unit),
+        land_area_unit = COALESCE($32, land_area_unit),
+
+        furnishing = COALESCE($33, furnishing),
+        property_condition = COALESCE($34, property_condition),
+        construction_status = COALESCE($35, construction_status),
+        ownership_type = COALESCE($36, ownership_type),
+
+        power_supply = COALESCE($37, power_supply),
+        water_supply = COALESCE($38, water_supply),
+        internet_available = COALESCE($39, internet_available),
+        drainage = COALESCE($40, drainage),
+        security_type = COALESCE($41, security_type),
+        generator_available = COALESCE($42, generator_available),
+        borehole = COALESCE($43, borehole),
+        prepaid_meter = COALESCE($44, prepaid_meter),
+        waste_disposal = COALESCE($45, waste_disposal),
+
+        caution_fee = COALESCE($46, caution_fee),
+        agency_fee = COALESCE($47, agency_fee),
+        legal_fee = COALESCE($48, legal_fee),
+        service_charge = COALESCE($49, service_charge),
+        refundable_deposit = COALESCE($50, refundable_deposit),
+        minimum_rent_duration = COALESCE($51, minimum_rent_duration),
+        rent_payment_frequency = COALESCE($52, rent_payment_frequency),
+        pets_policy = COALESCE($53, pets_policy),
+        smoking_policy = COALESCE($54, smoking_policy),
+        guest_policy = COALESCE($55, guest_policy),
+
+        mortgage_available = COALESCE($56, mortgage_available),
+        installment_available = COALESCE($57, installment_available),
+        rent_to_own_available = COALESCE($58, rent_to_own_available),
+        estimated_monthly_payment = COALESCE($59, estimated_monthly_payment),
+        down_payment_percent = COALESCE($60, down_payment_percent),
+        interest_rate_estimate = COALESCE($61, interest_rate_estimate),
+        hoa_fee = COALESCE($62, hoa_fee),
+        property_tax_estimate = COALESCE($63, property_tax_estimate),
+        insurance_estimate = COALESCE($64, insurance_estimate),
+        price_per_sqft = COALESCE($65, price_per_sqft),
+        price_negotiable = COALESCE($66, price_negotiable),
+        closing_cost_estimate = COALESCE($67, closing_cost_estimate),
+
+        title_document_type = COALESCE($68, title_document_type),
+        title_verified = COALESCE($69, title_verified),
+        survey_available = COALESCE($70, survey_available),
+        building_approval_available = COALESCE($71, building_approval_available),
+
+        photos = $72::jsonb,
+        floor_plans = $73::jsonb,
+        staging_photos = $74::jsonb,
+        panorama_photos = $75::jsonb,
+
+        video_url = COALESCE($76, video_url),
+        video_public_id = COALESCE($77, video_public_id),
+        virtual_tour_url = COALESCE($78, virtual_tour_url),
+        virtual_tour_public_id = COALESCE($79, virtual_tour_public_id),
+        virtual_tour_file = COALESCE($80::jsonb, virtual_tour_file),
+        three_d_home_url = COALESCE($81, three_d_home_url),
+        title_document_file = COALESCE($82::jsonb, title_document_file),
+
+        features = $83::jsonb,
+        amenities = $84::jsonb,
+        payment_options = $85::jsonb,
+        preferred_tour_days = $86::jsonb,
+
+        allow_tour_requests = COALESCE($87, allow_tour_requests),
+        allow_video_tour = COALESCE($88, allow_video_tour),
+        allow_in_person_tour = COALESCE($89, allow_in_person_tour),
+        preferred_tour_times = COALESCE($90, preferred_tour_times),
+        minimum_notice_hours = COALESCE($91, minimum_notice_hours),
+
+        contact_name = COALESCE($92, contact_name),
+        contact_email = COALESCE($93, contact_email),
+        contact_phone = COALESCE($94, contact_phone),
+        contact_method = COALESCE($95, contact_method),
+        show_contact_phone = COALESCE($96, show_contact_phone),
+
+        availability_status = COALESCE($97, availability_status),
+        available_from = COALESCE($98, available_from),
+
+        risk_score = $99,
+        listing_score = $100,
+        risk_level = $101,
+        moderation_status = $102,
+        moderation_reason = $103,
+        admin_notes = NULL,
+
+        status = $104,
+        is_active = $105,
+        listed_at = COALESCE(listed_at, NOW()),
+        last_updated_at = NOW(),
+        updated_at = NOW()
+
+      WHERE product_id = $106
+      AND uploaded_by_id = $107::uuid
+      AND status = 'draft'
+      RETURNING *;
+      `,
+      [
+        finalTitle || null,
+        finalDescription || null,
+
+        b.listing_type || b.listingType || null,
+        b.property_type || b.propertyType || null,
+        b.property_subtype || b.propertySubtype || null,
+
+        finalPrice,
+        b.currency || b.price_currency || b.priceCurrency || null,
+        b.price_period || b.pricePeriod || null,
+
+        finalAddress || null,
+        finalCity || null,
+        finalState || null,
+        finalCountry || null,
+        finalZipCode || null,
+        finalLatitude,
+        finalLongitude,
+
+        b.neighborhood || null,
+        b.estate_name || b.estateName || null,
+        b.landmark || null,
+        b.road_access || b.roadAccess || null,
+
+        toNumberOrNull(b.bedrooms),
+        toNumberOrNull(b.bathrooms),
+        toNumberOrNull(b.total_rooms || b.totalRooms),
+        toNumberOrNull(b.floors),
+        toNumberOrNull(b.floor_number || b.floorNumber),
+        toNumberOrNull(b.total_floors || b.totalFloors),
+        toNumberOrNull(b.garage_spaces || b.garageSpaces),
+        toNumberOrNull(b.year_built || b.yearBuilt),
+        b.parking || null,
+
+        toNumberOrNull(b.building_area_sqft || b.buildingAreaSqft),
+        toNumberOrNull(b.land_area_sqft || b.landAreaSqft),
+        b.building_area_unit || b.buildingAreaUnit || null,
+        b.land_area_unit || b.landAreaUnit || null,
+
+        b.furnishing || null,
+        b.property_condition || b.propertyCondition || null,
+        b.construction_status || b.constructionStatus || null,
+        b.ownership_type || b.ownershipType || null,
+
+        b.power_supply || b.powerSupply || null,
+        b.water_supply || b.waterSupply || null,
+        typeof b.internet_available === "boolean"
+          ? b.internet_available
+          : typeof b.internetAvailable === "boolean"
+            ? b.internetAvailable
+            : null,
+        b.drainage || null,
+        b.security_type || b.securityType || null,
+        typeof b.generator_available === "boolean"
+          ? b.generator_available
+          : typeof b.generatorAvailable === "boolean"
+            ? b.generatorAvailable
+            : null,
+        typeof b.borehole === "boolean" ? b.borehole : null,
+        typeof b.prepaid_meter === "boolean"
+          ? b.prepaid_meter
+          : typeof b.prepaidMeter === "boolean"
+            ? b.prepaidMeter
+            : null,
+        b.waste_disposal || b.wasteDisposal || null,
+
+        toNumberOrNull(b.caution_fee || b.cautionFee),
+        toNumberOrNull(b.agency_fee || b.agencyFee),
+        toNumberOrNull(b.legal_fee || b.legalFee),
+        toNumberOrNull(b.service_charge || b.serviceCharge),
+        toNumberOrNull(b.refundable_deposit || b.refundableDeposit),
+        b.minimum_rent_duration || b.minimumRentDuration || null,
+        b.rent_payment_frequency || b.rentPaymentFrequency || null,
+        b.pets_policy || b.petsPolicy || null,
+        b.smoking_policy || b.smokingPolicy || null,
+        b.guest_policy || b.guestPolicy || null,
+
+        typeof b.mortgage_available === "boolean"
+          ? b.mortgage_available
+          : typeof b.mortgageAvailable === "boolean"
+            ? b.mortgageAvailable
+            : null,
+        typeof b.installment_available === "boolean"
+          ? b.installment_available
+          : typeof b.installmentAvailable === "boolean"
+            ? b.installmentAvailable
+            : null,
+        typeof b.rent_to_own_available === "boolean"
+          ? b.rent_to_own_available
+          : typeof b.rentToOwnAvailable === "boolean"
+            ? b.rentToOwnAvailable
+            : null,
+
+        toNumberOrNull(
+          b.estimated_monthly_payment || b.estimatedMonthlyPayment,
+        ),
+        toNumberOrNull(b.down_payment_percent || b.downPaymentPercent),
+        toNumberOrNull(b.interest_rate_estimate || b.interestRateEstimate),
+        toNumberOrNull(b.hoa_fee || b.hoaFee),
+        toNumberOrNull(
+          b.property_tax_estimate || b.propertyTaxEstimate,
+        ),
+        toNumberOrNull(b.insurance_estimate || b.insuranceEstimate),
+        toNumberOrNull(b.price_per_sqft || b.pricePerSqft),
+        typeof b.price_negotiable === "boolean"
+          ? b.price_negotiable
+          : typeof b.priceNegotiable === "boolean"
+            ? b.priceNegotiable
+            : null,
+        toNumberOrNull(b.closing_cost_estimate || b.closingCostEstimate),
+
+        b.title_document_type || b.titleDocumentType || null,
+        typeof b.title_verified === "boolean"
+          ? b.title_verified
+          : typeof b.titleVerified === "boolean"
+            ? b.titleVerified
+            : null,
+        typeof b.survey_available === "boolean"
+          ? b.survey_available
+          : typeof b.surveyAvailable === "boolean"
+            ? b.surveyAvailable
+            : null,
+        typeof b.building_approval_available === "boolean"
+          ? b.building_approval_available
+          : typeof b.buildingApprovalAvailable === "boolean"
+            ? b.buildingApprovalAvailable
+            : null,
+
+        JSON.stringify(safePhotos),
+        JSON.stringify(safeFloorPlans),
+        JSON.stringify(safeStagingPhotos),
+        JSON.stringify(safePanoramaPhotos),
+
+        b.video?.url || b.video_url || existing.video_url || null,
+        b.video?.key ||
+          b.video?.public_id ||
+          b.video_public_id ||
+          existing.video_public_id ||
+          null,
+
+        b.virtual_tour_file?.url ||
+          b.virtual_tour_url ||
+          b.virtualTourUrl ||
+          existing.virtual_tour_url ||
+          null,
+
+        b.virtual_tour_file?.key ||
+          b.virtual_tour_file?.public_id ||
+          b.virtual_tour_public_id ||
+          existing.virtual_tour_public_id ||
+          null,
+
+        b.virtual_tour_file
+          ? JSON.stringify(b.virtual_tour_file)
+          : null,
+
+        b.three_d_home_url || b.threeDHomeUrl || null,
+
+        b.title_document_file
+          ? JSON.stringify(b.title_document_file)
+          : null,
+
+        JSON.stringify(featuresArr),
+        JSON.stringify(amenitiesArr),
+        JSON.stringify(paymentOptions),
+        JSON.stringify(preferredTourDays),
+
+        typeof b.allow_tour_requests === "boolean"
+          ? b.allow_tour_requests
+          : typeof b.allowTourRequests === "boolean"
+            ? b.allowTourRequests
+            : null,
+        typeof b.allow_video_tour === "boolean"
+          ? b.allow_video_tour
+          : typeof b.allowVideoTour === "boolean"
+            ? b.allowVideoTour
+            : null,
+        typeof b.allow_in_person_tour === "boolean"
+          ? b.allow_in_person_tour
+          : typeof b.allowInPersonTour === "boolean"
+            ? b.allowInPersonTour
+            : null,
+        b.preferred_tour_times || b.preferredTourTimes || null,
+        toNumberOrNull(b.minimum_notice_hours || b.minimumNoticeHours),
+
+        b.contact_name || b.contactName || null,
+        b.contact_email || b.contactEmail || null,
+        b.contact_phone || b.contactPhone || null,
+        b.contact_method || b.contactMethod || null,
+        typeof b.show_contact_phone === "boolean"
+          ? b.show_contact_phone
+          : typeof b.showContactPhone === "boolean"
+            ? b.showContactPhone
+            : null,
+
+        b.availability_status || b.availabilityStatus || null,
+        b.available_from || b.availableFrom || null,
+
+        risk.score,
+        Math.max(0, 100 - risk.score),
+        risk.risk_level,
+        finalModerationStatus,
+        moderationReason,
+
+        finalStatus,
+        finalIsActive,
+
+        product_id,
+        String(userId),
+      ],
+    );
+
+    const listing = updateRes.rows[0];
+
+    if (!listing) {
+      return res.status(404).json({
+        success: false,
+        message: "Draft could not be submitted.",
+        code: "SUBMIT_DRAFT_NOT_UPDATED",
       });
     }
 
     return res.json({
       success: true,
-      message: "Listing submitted for review.",
-      listing: result.rows[0],
+      outcome: shouldAutoPublish ? "auto_approved" : "pending_review",
+      message: shouldAutoPublish
+        ? "Your listing passed our checks and is now live."
+        : "Your listing has been submitted for admin review.",
+      risk,
+      listing: {
+        ...listing,
+        photos: normalizePhotosForResponse(listing.photos),
+        floor_plans: safeJsonParse(listing.floor_plans, []),
+        staging_photos: safeJsonParse(listing.staging_photos, []),
+        panorama_photos: safeJsonParse(listing.panorama_photos, []),
+        latitude:
+          listing.latitude !== null && listing.latitude !== undefined
+            ? parseFloat(listing.latitude)
+            : null,
+        longitude:
+          listing.longitude !== null && listing.longitude !== undefined
+            ? parseFloat(listing.longitude)
+            : null,
+      },
     });
   } catch (err) {
     console.error("[SubmitListingDraft] Error:", err);
 
     return res.status(500).json({
+      success: false,
       message: "Failed to submit listing.",
-      code: "SUBMIT_DRAFT_FAIL",
+      code: "SUBMIT_DRAFT_FAILED",
       details: err?.message,
     });
   }

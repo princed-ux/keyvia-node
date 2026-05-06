@@ -4,39 +4,332 @@ import { pool } from "../db.js";
 
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
-const AGENT_PLANS = {
-  pro_agent: {
-    name: "Pro Agent",
-    amount: 15000,
-    currency: "NGN",
-    durationDays: 30,
+const SUPPORTED_PROVIDERS = new Set(["paystack", "flutterwave", "korapay"]);
+
+// =====================================================
+// PLAN CATALOG
+// Nigeria users are charged in NGN.
+// International users are charged in USD.
+// =====================================================
+
+const PLAN_CATALOG = {
+  agent: {
+    free: {
+      name: "Free Agent",
+      durationDays: null,
+      prices: {
+        NGN: 0,
+        USD: 0,
+      },
+      limits: {
+        activeListings: 1,
+        photoLimit: 25,
+        analytics: false,
+        advancedAnalytics: false,
+        aiChecks: false,
+        badge: "identity_only",
+        priorityReview: false,
+        prioritySupport: false,
+        featuredAgent: false,
+        teamSeats: 0,
+      },
+    },
+
+    pro_agent: {
+      name: "Pro Agent",
+      durationDays: 30,
+      prices: {
+        NGN: 12000,
+        USD: 9,
+      },
+      limits: {
+        activeListings: 25,
+        photoLimit: 65,
+        analytics: true,
+        advancedAnalytics: false,
+        aiChecks: true,
+        badge: "standard_verified",
+        priorityReview: true,
+        prioritySupport: false,
+        featuredAgent: false,
+        teamSeats: 0,
+      },
+    },
+
+    elite_agent: {
+      name: "Elite Agent",
+      durationDays: 30,
+      prices: {
+        NGN: 25000,
+        USD: 19,
+      },
+      limits: {
+        activeListings: 100,
+        photoLimit: 100,
+        analytics: true,
+        advancedAnalytics: true,
+        aiChecks: true,
+        badge: "elite_verified",
+        priorityReview: true,
+        prioritySupport: true,
+        featuredAgent: true,
+        teamSeats: 0,
+      },
+    },
   },
-  elite_agent: {
-    name: "Elite Agent",
-    amount: 30000,
-    currency: "NGN",
-    durationDays: 30,
+
+  owner: {
+    free: {
+      name: "Free Owner",
+      durationDays: null,
+      prices: {
+        NGN: 0,
+        USD: 0,
+      },
+      limits: {
+        activeListings: 1,
+        photoLimit: 25,
+        analytics: false,
+        advancedAnalytics: false,
+        aiChecks: false,
+        badge: "identity_only",
+        priorityReview: false,
+        prioritySupport: false,
+        featuredOwner: false,
+        teamSeats: 0,
+      },
+    },
+
+    pro_owner: {
+      name: "Pro Owner",
+      durationDays: 30,
+      prices: {
+        NGN: 12000,
+        USD: 9,
+      },
+      limits: {
+        activeListings: 25,
+        photoLimit: 65,
+        analytics: true,
+        advancedAnalytics: false,
+        aiChecks: true,
+        badge: "standard_verified",
+        priorityReview: true,
+        prioritySupport: false,
+        featuredOwner: false,
+        teamSeats: 0,
+      },
+    },
+
+    elite_owner: {
+      name: "Elite Owner",
+      durationDays: 30,
+      prices: {
+        NGN: 25000,
+        USD: 19,
+      },
+      limits: {
+        activeListings: 100,
+        photoLimit: 100,
+        analytics: true,
+        advancedAnalytics: true,
+        aiChecks: true,
+        badge: "elite_verified",
+        priorityReview: true,
+        prioritySupport: true,
+        featuredOwner: true,
+        teamSeats: 0,
+      },
+    },
   },
+
+  brokerage: {
+    free: {
+      name: "Free Brokerage",
+      durationDays: null,
+      prices: {
+        NGN: 0,
+        USD: 0,
+      },
+      limits: {
+        activeListings: 3,
+        photoLimit: 25,
+        analytics: false,
+        advancedAnalytics: false,
+        aiChecks: false,
+        badge: "identity_only",
+        priorityReview: false,
+        prioritySupport: false,
+        featuredBrokerage: false,
+        teamSeats: 2,
+      },
+    },
+
+    pro_brokerage: {
+      name: "Pro Brokerage",
+      durationDays: 30,
+      prices: {
+        NGN: 35000,
+        USD: 29,
+      },
+      limits: {
+        activeListings: 150,
+        photoLimit: 100,
+        analytics: true,
+        advancedAnalytics: false,
+        aiChecks: true,
+        badge: "brokerage_verified",
+        priorityReview: true,
+        prioritySupport: false,
+        featuredBrokerage: false,
+        teamSeats: 15,
+      },
+    },
+
+    elite_brokerage: {
+      name: "Elite Brokerage",
+      durationDays: 30,
+      prices: {
+        NGN: 65000,
+        USD: 49,
+      },
+      limits: {
+        activeListings: 300,
+        photoLimit: 120,
+        analytics: true,
+        advancedAnalytics: true,
+        aiChecks: true,
+        badge: "elite_brokerage",
+        priorityReview: true,
+        prioritySupport: true,
+        featuredBrokerage: true,
+        teamSeats: 50,
+      },
+    },
+  },
+};
+
+// =====================================================
+// HELPERS
+// =====================================================
+
+const normalizeRole = (role) => {
+  const value = String(role || "").toLowerCase().trim();
+
+  if (value === "brokerage_owner") return "brokerage";
+  if (value === "super_admin") return "superadmin";
+  if (value === "landlord") return "owner";
+
+  return value;
+};
+
+const normalizeCountry = (country) => {
+  return String(country || "")
+    .trim()
+    .toLowerCase();
+};
+
+const getCurrencyForCountry = (country) => {
+  const cleanCountry = normalizeCountry(country);
+
+  if (
+    cleanCountry === "nigeria" ||
+    cleanCountry === "ng" ||
+    cleanCountry === "nga"
+  ) {
+    return "NGN";
+  }
+
+  return "USD";
+};
+
+const isIdentityVerified = (user = {}) => {
+  const status = String(user.verification_status || "")
+    .toLowerCase()
+    .trim();
+
+  return status === "verified" || status === "approved";
+};
+
+const getPlan = ({ role, planId, currency }) => {
+  const normalizedRole = normalizeRole(role);
+  const rolePlans = PLAN_CATALOG[normalizedRole];
+
+  if (!rolePlans) return null;
+
+  const plan = rolePlans[planId];
+
+  if (!plan) return null;
+
+  const selectedCurrency = currency || "USD";
+  const amount = plan.prices[selectedCurrency];
+
+  if (typeof amount === "undefined") return null;
+
+  return {
+    id: planId,
+    role: normalizedRole,
+    name: plan.name,
+    amount,
+    currency: selectedCurrency,
+    durationDays: plan.durationDays,
+    limits: plan.limits,
+  };
+};
+
+const getDefaultFreePlan = ({ role, currency }) => {
+  return getPlan({
+    role,
+    planId: "free",
+    currency,
+  });
 };
 
 const generateReference = (provider) => {
-  return `KEYVIA-${provider.toUpperCase()}-${crypto.randomUUID().split("-")[0].toUpperCase()}`;
+  return `KEYVIA-${provider.toUpperCase()}-${crypto
+    .randomUUID()
+    .split("-")[0]
+    .toUpperCase()}`;
 };
 
-const getPlan = (role, planId) => {
-  if (role === "agent") return AGENT_PLANS[planId] || null;
-  return null;
+const getSubscriptionPath = (role) => {
+  const normalizedRole = normalizeRole(role);
+
+  if (normalizedRole === "brokerage") return "/brokerage/subscription";
+  if (normalizedRole === "owner") return "/owner/subscription";
+
+  return "/dashboard/subscription";
 };
 
-const getUserEmail = async (userId) => {
+const getUserForSubscription = async (userId) => {
   const result = await pool.query(
     `
-    SELECT 
+    SELECT
+      u.unique_id,
       u.email,
-      COALESCE(p.full_name, u.name, 'Keyvia User') AS name
+      u.name,
+      u.role,
+      u.country,
+      u.city,
+      u.verification_status,
+      u.subscription_plan,
+      u.subscription_status,
+      u.subscription_expires_at,
+      u.current_period_end,
+      u.next_billing_at,
+      u.cancel_at_period_end,
+      u.provider_subscription_id,
+      u.provider_customer_id,
+      u.billing_email,
+      u.payment_authorization,
+      u.linked_agency_id,
+      u.is_solo_agent,
+      COALESCE(p.full_name, u.name, 'Keyvia User') AS display_name,
+      COALESCE(p.country, u.country) AS profile_country
     FROM users u
-    LEFT JOIN profiles p ON p.unique_id::text = u.unique_id::text
-    WHERE u.unique_id = $1
+    LEFT JOIN profiles p
+      ON p.unique_id::text = u.unique_id::text
+    WHERE u.unique_id::text = $1::text
     LIMIT 1
     `,
     [userId],
@@ -45,7 +338,84 @@ const getUserEmail = async (userId) => {
   return result.rows[0] || null;
 };
 
-const createPaystackCheckout = async ({ email, amount, currency, reference, metadata }) => {
+const getBrokerageSubscriptionForAgent = async (agentUser = {}) => {
+  if (!agentUser?.linked_agency_id) return null;
+
+  const result = await pool.query(
+    `
+    SELECT
+      unique_id,
+      name,
+      email,
+      role,
+      subscription_plan,
+      subscription_status,
+      subscription_expires_at,
+      current_period_end,
+      next_billing_at,
+      cancel_at_period_end,
+      country,
+      verification_status
+    FROM users
+    WHERE unique_id::text = $1::text
+    LIMIT 1
+    `,
+    [agentUser.linked_agency_id],
+  );
+
+  const brokerage = result.rows[0];
+
+  if (!brokerage) return null;
+
+  const status = String(brokerage.subscription_status || "").toLowerCase();
+  const periodEnd =
+    brokerage.current_period_end || brokerage.subscription_expires_at || null;
+
+  const stillActive =
+    status === "active" &&
+    (!periodEnd || new Date(periodEnd).getTime() > Date.now());
+
+  if (!stillActive) {
+    return {
+      inherited: false,
+      brokerage,
+      message: "Your brokerage does not currently have an active subscription.",
+    };
+  }
+
+  const currency = getCurrencyForCountry(brokerage.country);
+  const brokeragePlan = getPlan({
+    role: "brokerage",
+    planId: brokerage.subscription_plan || "free",
+    currency,
+  });
+
+  return {
+    inherited: true,
+    brokerage,
+    effective_plan: brokerage.subscription_plan,
+    effective_role: "brokerage",
+    effective_plan_details: brokeragePlan,
+    message: "Your subscription access is covered by your brokerage.",
+  };
+};
+
+const sanitizeProviderMetadata = (metadata = {}) => {
+  return JSON.parse(JSON.stringify(metadata || {}));
+};
+
+// =====================================================
+// PROVIDER CHECKOUTS
+// =====================================================
+
+const createPaystackCheckout = async ({
+  email,
+  amount,
+  currency,
+  reference,
+  metadata,
+  callbackPath,
+}) => {
   const secret = process.env.PAYSTACK_SECRET_KEY;
 
   if (!secret) {
@@ -59,8 +429,8 @@ const createPaystackCheckout = async ({ email, amount, currency, reference, meta
       amount: Math.round(Number(amount) * 100),
       currency,
       reference,
-      callback_url: `${FRONTEND_URL}/dashboard/subscription?payment=success&provider=paystack&reference=${reference}`,
-      metadata,
+      callback_url: `${FRONTEND_URL}${callbackPath}?payment=success&provider=paystack&reference=${reference}`,
+      metadata: sanitizeProviderMetadata(metadata),
     },
     {
       headers: {
@@ -83,6 +453,7 @@ const createFlutterwaveCheckout = async ({
   currency,
   reference,
   metadata,
+  callbackPath,
 }) => {
   const secret = process.env.FLUTTERWAVE_SECRET_KEY;
 
@@ -96,7 +467,7 @@ const createFlutterwaveCheckout = async ({
       tx_ref: reference,
       amount,
       currency,
-      redirect_url: `${FRONTEND_URL}/dashboard/subscription?payment=success&provider=flutterwave&reference=${reference}`,
+      redirect_url: `${FRONTEND_URL}${callbackPath}?payment=success&provider=flutterwave&reference=${reference}`,
       customer: {
         email,
         name,
@@ -105,7 +476,7 @@ const createFlutterwaveCheckout = async ({
         title: "Keyvia Subscription",
         description: metadata.description,
       },
-      meta: metadata,
+      meta: sanitizeProviderMetadata(metadata),
     },
     {
       headers: {
@@ -128,6 +499,7 @@ const createKorapayCheckout = async ({
   currency,
   reference,
   metadata,
+  callbackPath,
 }) => {
   const secret = process.env.KORAPAY_SECRET_KEY;
 
@@ -141,12 +513,12 @@ const createKorapayCheckout = async ({
       reference,
       amount,
       currency,
-      redirect_url: `${FRONTEND_URL}/dashboard/subscription?payment=success&provider=korapay&reference=${reference}`,
+      redirect_url: `${FRONTEND_URL}${callbackPath}?payment=success&provider=korapay&reference=${reference}`,
       customer: {
         name,
         email,
       },
-      metadata,
+      metadata: sanitizeProviderMetadata(metadata),
     },
     {
       headers: {
@@ -165,91 +537,152 @@ const createKorapayCheckout = async ({
   };
 };
 
+// =====================================================
+// CREATE CHECKOUT
+// =====================================================
+
 export const createSubscriptionCheckout = async (req, res) => {
   const client = await pool.connect();
 
   try {
     const userId = req.user?.unique_id;
-    const { plan, provider, role } = req.body;
+    const { plan, provider } = req.body;
 
     if (!userId) {
-      return res.status(401).json({ message: "Unauthorized" });
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
     }
 
-    const isVerified =
-  req.user?.is_verified === true ||
-  req.user?.verification_status === "approved" ||
-  req.user?.verification_status === "verified";
-
-if (!isVerified) {
-  return res.status(403).json({
-    message: "You must verify your account before subscribing.",
-    code: "VERIFICATION_REQUIRED",
-  });
-}
-
-    if (!["paystack", "flutterwave", "korapay"].includes(provider)) {
-      return res.status(400).json({ message: "Invalid payment provider" });
+    if (!SUPPORTED_PROVIDERS.has(provider)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment provider.",
+      });
     }
 
-    const selectedPlan = getPlan(role, plan);
+    const user = await getUserForSubscription(userId);
 
-    if (!selectedPlan) {
-      return res.status(400).json({ message: "Invalid subscription plan" });
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
     }
 
-    const profile = await getUserEmail(userId);
+    const role = normalizeRole(user.role);
 
-    if (!profile?.email) {
-      return res.status(400).json({ message: "User email not found" });
+    if (!["agent", "owner", "brokerage"].includes(role)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account role cannot subscribe.",
+        code: "ROLE_NOT_ALLOWED",
+      });
+    }
+
+    if (!isIdentityVerified(user)) {
+      return res.status(403).json({
+        success: false,
+        message: "You must verify your identity before subscribing.",
+        code: "VERIFICATION_REQUIRED",
+      });
+    }
+
+    const isAgencyAgent =
+      role === "agent" &&
+      user.is_solo_agent === false &&
+      Boolean(user.linked_agency_id);
+
+    if (isAgencyAgent) {
+      const inherited = await getBrokerageSubscriptionForAgent(user);
+
+      if (inherited?.inherited) {
+        return res.status(409).json({
+          success: false,
+          code: "BROKERAGE_SUBSCRIPTION_ACTIVE",
+          message:
+            "Your brokerage already has an active subscription covering your account.",
+          inherited_subscription: inherited,
+        });
+      }
+    }
+
+    const currency = getCurrencyForCountry(user.profile_country || user.country);
+    const selectedPlan = getPlan({
+      role,
+      planId: plan,
+      currency,
+    });
+
+    if (!selectedPlan || selectedPlan.amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid subscription plan.",
+      });
+    }
+
+    if (!user.email) {
+      return res.status(400).json({
+        success: false,
+        message: "User email not found.",
+      });
     }
 
     const reference = generateReference(provider);
+    const callbackPath = getSubscriptionPath(role);
 
     const metadata = {
       user_id: userId,
       role,
       plan,
       provider,
+      currency,
+      country: user.profile_country || user.country || null,
       description: `${selectedPlan.name} subscription`,
+      limits: selectedPlan.limits,
     };
 
-    let checkout;
+    let checkout = null;
 
     if (provider === "paystack") {
       checkout = await createPaystackCheckout({
-        email: profile.email,
+        email: user.email,
         amount: selectedPlan.amount,
         currency: selectedPlan.currency,
         reference,
         metadata,
+        callbackPath,
       });
     }
 
     if (provider === "flutterwave") {
       checkout = await createFlutterwaveCheckout({
-        email: profile.email,
-        name: profile.name,
+        email: user.email,
+        name: user.display_name,
         amount: selectedPlan.amount,
         currency: selectedPlan.currency,
         reference,
         metadata,
+        callbackPath,
       });
     }
 
     if (provider === "korapay") {
       checkout = await createKorapayCheckout({
-        email: profile.email,
-        name: profile.name,
+        email: user.email,
+        name: user.display_name,
         amount: selectedPlan.amount,
         currency: selectedPlan.currency,
         reference,
         metadata,
+        callbackPath,
       });
     }
 
     if (!checkout?.checkout_url) {
       return res.status(502).json({
+        success: false,
         message: "Payment provider did not return a checkout URL.",
         provider_response: checkout?.raw || null,
       });
@@ -271,7 +704,7 @@ if (!isVerified) {
         checkout_url,
         provider_response
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9::jsonb)
       `,
       [
         userId,
@@ -292,27 +725,40 @@ if (!isVerified) {
       success: true,
       provider,
       reference,
+      plan,
+      role,
+      amount: selectedPlan.amount,
+      currency: selectedPlan.currency,
       checkout_url: checkout.checkout_url,
       authorization_url: checkout.checkout_url,
       payment_url: checkout.checkout_url,
+      limits: selectedPlan.limits,
     });
   } catch (err) {
     await client.query("ROLLBACK");
 
-    console.error("Create subscription checkout error:", err?.response?.data || err);
+    console.error(
+      "Create subscription checkout error:",
+      err?.response?.data || err,
+    );
 
     return res.status(500).json({
-  message:
-    err?.response?.data?.message ||
-    "Failed to create subscription checkout",
-  code: err?.response?.data?.code || "CHECKOUT_FAILED",
-  provider_error: err?.response?.data || null,
-});
+      success: false,
+      message:
+        err?.response?.data?.message ||
+        err.message ||
+        "Failed to create subscription checkout.",
+      code: err?.response?.data?.code || "CHECKOUT_FAILED",
+      provider_error: err?.response?.data || null,
+    });
   } finally {
     client.release();
   }
 };
 
+// =====================================================
+// ACTIVATE SUBSCRIPTION
+// =====================================================
 
 const activateSubscription = async ({ reference, providerData }) => {
   const client = await pool.connect();
@@ -333,86 +779,137 @@ const activateSubscription = async ({ reference, providerData }) => {
     const payment = paymentRes.rows[0];
 
     if (!payment) {
-      throw new Error("Payment record not found");
+      throw new Error("Payment record not found.");
     }
 
     if (payment.status === "paid") {
       await client.query("COMMIT");
-      return payment;
+
+      return {
+        ...payment,
+        subscription_expires_at: payment.subscription_expires_at || null,
+      };
     }
 
-    const plan = getPlan(payment.role, payment.plan);
+    const plan = getPlan({
+      role: payment.role,
+      planId: payment.plan,
+      currency: payment.currency,
+    });
 
+    if (!plan || !plan.durationDays) {
+      throw new Error("Invalid paid subscription plan.");
+    }
+
+    const userRes = await client.query(
+      `
+      SELECT
+        unique_id,
+        role,
+        country,
+        subscription_plan,
+        subscription_status,
+        current_period_end,
+        subscription_expires_at
+      FROM users
+      WHERE unique_id::text = $1::text
+      LIMIT 1
+      `,
+      [payment.user_id],
+    );
+
+    const user = userRes.rows[0];
+
+    if (!user) {
+      throw new Error("Subscription user not found.");
+    }
+
+    const now = new Date();
+
+    const currentEnd =
+      user.current_period_end || user.subscription_expires_at || null;
+
+    const shouldExtendExisting =
+      user.subscription_status === "active" &&
+      currentEnd &&
+      new Date(currentEnd).getTime() > now.getTime();
+
+    const periodStart = shouldExtendExisting ? new Date(currentEnd) : now;
+    const periodEnd = new Date(periodStart);
+    periodEnd.setDate(periodEnd.getDate() + plan.durationDays);
 
     const paystackAuth = providerData?.data?.authorization || null;
-const paystackCustomer = providerData?.data?.customer || null;
+    const paystackCustomer = providerData?.data?.customer || null;
 
-const reusableAuth =
-  payment.provider === "paystack" &&
-  paystackAuth?.reusable === true &&
-  paystackAuth?.authorization_code
-    ? paystackAuth
-    : null;
+    const reusableAuth =
+      payment.provider === "paystack" &&
+      paystackAuth?.reusable === true &&
+      paystackAuth?.authorization_code
+        ? paystackAuth
+        : null;
 
-const billingEmail =
-  providerData?.data?.customer?.email ||
-  paystackCustomer?.email ||
-  null;
+    const billingEmail =
+      providerData?.data?.customer?.email || paystackCustomer?.email || null;
 
-const providerCustomerId =
-  paystackCustomer?.customer_code ||
-  paystackCustomer?.id ||
-  null;
+    const providerCustomerId =
+      paystackCustomer?.customer_code || paystackCustomer?.id || null;
 
-const providerSubscriptionId =
-  reusableAuth?.authorization_code || null;
+    const providerSubscriptionId = reusableAuth?.authorization_code || null;
 
-    if (!plan) {
-      throw new Error("Invalid plan");
-    }
+    await client.query(
+      `
+      UPDATE users
+      SET
+        subscription_plan = $1,
+        subscription_status = 'active',
+        subscription_started_at = COALESCE(subscription_started_at, $2),
+        current_period_start = $3,
+        current_period_end = $4,
+        next_billing_at = $4,
+        subscription_expires_at = $4,
+        cancel_at_period_end = FALSE,
+        provider_subscription_id = COALESCE($5, provider_subscription_id),
+        provider_customer_id = COALESCE($6, provider_customer_id),
+        billing_email = COALESCE($7, billing_email),
+        payment_authorization = COALESCE($8, payment_authorization),
+        updated_at = NOW()
+      WHERE unique_id::text = $9::text
+      `,
+      [
+        payment.plan,
+        now,
+        periodStart,
+        periodEnd,
+        providerSubscriptionId,
+        providerCustomerId,
+        billingEmail,
+        reusableAuth ? JSON.stringify(reusableAuth) : null,
+        payment.user_id,
+      ],
+    );
 
-   const now = new Date();
-const periodStart = new Date(now);
-const periodEnd = new Date(now);
-periodEnd.setDate(periodEnd.getDate() + plan.durationDays);
-
-await client.query(
-  `
-  UPDATE users
-  SET subscription_plan = $1,
-      subscription_status = 'active',
-      subscription_started_at = COALESCE(subscription_started_at, $2),
-      current_period_start = $3,
-      current_period_end = $4,
-      next_billing_at = $4,
-      subscription_expires_at = $4,
-      cancel_at_period_end = FALSE,
-      provider_subscription_id = COALESCE($5, provider_subscription_id),
-      provider_customer_id = COALESCE($6, provider_customer_id),
-      billing_email = COALESCE($7, billing_email),
-      payment_authorization = COALESCE($8, payment_authorization)
-  WHERE unique_id = $9
-  `,
-  [
-    payment.plan,
-    now,
-    periodStart,
-    periodEnd,
-    providerSubscriptionId,
-    providerCustomerId,
-    billingEmail,
-    reusableAuth ? JSON.stringify(reusableAuth) : null,
-    payment.user_id,
-  ],
-);
+    const paidPaymentRes = await client.query(
+      `
+      UPDATE subscription_payments
+      SET
+        status = 'paid',
+        paid_at = NOW(),
+        provider_response = $1::jsonb
+      WHERE reference = $2
+      RETURNING *
+      `,
+      [JSON.stringify(providerData || {}), reference],
+    );
 
     await client.query("COMMIT");
 
     return {
-      ...payment,
-      status: "paid",
-      next_billing_at: nextBillingAt,
-current_period_end: periodEnd,
+      ...paidPaymentRes.rows[0],
+      current_period_start: periodStart,
+      current_period_end: periodEnd,
+      next_billing_at: periodEnd,
+      subscription_expires_at: periodEnd,
+      limits: plan.limits,
     };
   } catch (err) {
     await client.query("ROLLBACK");
@@ -422,13 +919,25 @@ current_period_end: periodEnd,
   }
 };
 
+// =====================================================
+// VERIFY PAYMENT
+// =====================================================
+
 export const verifySubscriptionPayment = async (req, res) => {
   try {
     const { provider, reference } = req.query;
 
     if (!provider || !reference) {
       return res.status(400).json({
-        message: "provider and reference are required",
+        success: false,
+        message: "provider and reference are required.",
+      });
+    }
+
+    if (!SUPPORTED_PROVIDERS.has(provider)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment provider.",
       });
     }
 
@@ -456,7 +965,8 @@ export const verifySubscriptionPayment = async (req, res) => {
 
       if (!txId) {
         return res.status(400).json({
-          message: "Flutterwave transaction_id is required",
+          success: false,
+          message: "Flutterwave transaction_id is required.",
         });
       }
 
@@ -495,7 +1005,7 @@ export const verifySubscriptionPayment = async (req, res) => {
     if (!verified) {
       return res.status(400).json({
         success: false,
-        message: "Payment was not verified",
+        message: "Payment was not verified.",
         provider_response: providerData,
       });
     }
@@ -507,54 +1017,95 @@ export const verifySubscriptionPayment = async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Subscription activated successfully",
-      subscription,
+      message: "Subscription activated successfully.",
+      subscription: {
+        plan: subscription.plan,
+        role: subscription.role,
+        status: "active",
+        amount: subscription.amount,
+        currency: subscription.currency,
+        provider: subscription.provider,
+        reference: subscription.reference,
+        paid_at: subscription.paid_at,
+        current_period_start: subscription.current_period_start,
+        current_period_end: subscription.current_period_end,
+        next_billing_at: subscription.next_billing_at,
+        subscription_expires_at: subscription.subscription_expires_at,
+        limits: subscription.limits,
+      },
     });
   } catch (err) {
-    console.error("Verify subscription payment error:", err?.response?.data || err);
+    console.error(
+      "Verify subscription payment error:",
+      err?.response?.data || err,
+    );
 
     return res.status(500).json({
-      message: "Failed to verify payment",
+      success: false,
+      message: "Failed to verify payment.",
       details: err?.response?.data?.message || err.message,
     });
   }
 };
 
+// =====================================================
+// GET MY SUBSCRIPTION
+// =====================================================
 
 export const getMySubscription = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
 
     if (!userId) {
-      return res.status(401).json({ message: "Unauthorized" });
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
     }
 
-    const userRes = await pool.query(
-      `
-      SELECT 
-  subscription_plan,
-  subscription_status,
-  subscription_expires_at,
-  current_period_end,
-  next_billing_at,
-  cancel_at_period_end,
-  free_listing_limit
-FROM users
-WHERE unique_id = $1
-LIMIT 1
-      `,
-      [userId],
-    );
-
-    const user = userRes.rows[0];
+    const user = await getUserForSubscription(userId);
 
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
     }
+
+    const role = normalizeRole(user.role);
+    const currency = getCurrencyForCountry(user.profile_country || user.country);
+
+    const inherited =
+      role === "agent" &&
+      user.is_solo_agent === false &&
+      user.linked_agency_id
+        ? await getBrokerageSubscriptionForAgent(user)
+        : null;
+
+    const ownPlanId =
+      user.subscription_status === "active" && user.subscription_plan
+        ? user.subscription_plan
+        : "free";
+
+    const ownPlan = getPlan({
+      role,
+      planId: ownPlanId,
+      currency,
+    });
+
+    const freePlan = getDefaultFreePlan({
+      role,
+      currency,
+    });
+
+    const effectivePlan =
+      inherited?.inherited && inherited.effective_plan_details
+        ? inherited.effective_plan_details
+        : ownPlan || freePlan;
 
     const paymentRes = await pool.query(
       `
-      SELECT 
+      SELECT
         plan,
         provider,
         reference,
@@ -564,56 +1115,76 @@ LIMIT 1
         paid_at,
         created_at
       FROM subscription_payments
-      WHERE user_id = $1
+      WHERE user_id::text = $1::text
       ORDER BY created_at DESC
-      LIMIT 1
+      LIMIT 10
       `,
       [userId],
     );
 
     return res.json({
       success: true,
+      role,
+      currency,
+      country: user.profile_country || user.country || null,
       subscription: {
-  plan: user.subscription_plan || "free",
-  status: user.subscription_status || "inactive",
-  expires_at: user.subscription_expires_at,
-  current_period_end: user.current_period_end,
-  next_billing_at: user.next_billing_at,
-  cancel_at_period_end: user.cancel_at_period_end || false,
-  free_listing_limit: user.free_listing_limit || 3,
-},
+        plan: ownPlanId,
+        status: user.subscription_status || "inactive",
+        expires_at: user.subscription_expires_at,
+        current_period_end: user.current_period_end,
+        next_billing_at: user.next_billing_at,
+        cancel_at_period_end: user.cancel_at_period_end || false,
+        limits: ownPlan?.limits || freePlan?.limits || null,
+      },
+      inherited_subscription: inherited || null,
+      effective_subscription: {
+        source: inherited?.inherited ? "brokerage" : "own",
+        plan: inherited?.inherited ? inherited.effective_plan : ownPlanId,
+        role: inherited?.inherited ? "brokerage" : role,
+        status: inherited?.inherited ? "active" : user.subscription_status || "inactive",
+        limits: effectivePlan?.limits || null,
+        plan_details: effectivePlan || null,
+      },
       latest_payment: paymentRes.rows[0] || null,
+      payment_history: paymentRes.rows,
+      available_plans: PLAN_CATALOG[role] || {},
     });
   } catch (err) {
     console.error("Get my subscription error:", err);
 
     return res.status(500).json({
-      message: "Failed to fetch subscription",
+      success: false,
+      message: "Failed to fetch subscription.",
       details: err.message,
     });
   }
 };
 
-
+// =====================================================
+// CANCEL SUBSCRIPTION
+// =====================================================
 
 export const cancelMySubscription = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
 
     if (!userId) {
-      return res.status(401).json({ message: "Unauthorized" });
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
     }
 
     const userRes = await pool.query(
       `
-      SELECT 
+      SELECT
         subscription_plan,
         subscription_status,
         current_period_end,
         next_billing_at,
         cancel_at_period_end
       FROM users
-      WHERE unique_id = $1
+      WHERE unique_id::text = $1::text
       LIMIT 1
       `,
       [userId],
@@ -622,11 +1193,15 @@ export const cancelMySubscription = async (req, res) => {
     const user = userRes.rows[0];
 
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
     }
 
     if (user.subscription_status !== "active") {
       return res.status(400).json({
+        success: false,
         message: "You do not have an active subscription to cancel.",
       });
     }
@@ -648,10 +1223,12 @@ export const cancelMySubscription = async (req, res) => {
     const result = await pool.query(
       `
       UPDATE users
-      SET cancel_at_period_end = TRUE,
-          next_billing_at = NULL
-      WHERE unique_id = $1
-      RETURNING 
+      SET
+        cancel_at_period_end = TRUE,
+        next_billing_at = NULL,
+        updated_at = NOW()
+      WHERE unique_id::text = $1::text
+      RETURNING
         subscription_plan,
         subscription_status,
         subscription_expires_at,
@@ -679,31 +1256,38 @@ export const cancelMySubscription = async (req, res) => {
     console.error("Cancel subscription error:", err);
 
     return res.status(500).json({
-      message: "Failed to cancel subscription",
+      success: false,
+      message: "Failed to cancel subscription.",
       details: err.message,
     });
   }
 };
 
+// =====================================================
+// REACTIVATE SUBSCRIPTION
+// =====================================================
 
 export const reactivateMySubscription = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
 
     if (!userId) {
-      return res.status(401).json({ message: "Unauthorized" });
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
     }
 
     const userRes = await pool.query(
       `
-      SELECT 
+      SELECT
         subscription_plan,
         subscription_status,
         current_period_end,
         subscription_expires_at,
         cancel_at_period_end
       FROM users
-      WHERE unique_id = $1
+      WHERE unique_id::text = $1::text
       LIMIT 1
       `,
       [userId],
@@ -712,17 +1296,22 @@ export const reactivateMySubscription = async (req, res) => {
     const user = userRes.rows[0];
 
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
     }
 
     if (user.subscription_status !== "active") {
       return res.status(400).json({
+        success: false,
         message: "You do not have an active subscription to reactivate.",
       });
     }
 
     if (!user.cancel_at_period_end) {
       return res.status(400).json({
+        success: false,
         message: "Your subscription is already active and renewing.",
       });
     }
@@ -733,10 +1322,12 @@ export const reactivateMySubscription = async (req, res) => {
     const result = await pool.query(
       `
       UPDATE users
-      SET cancel_at_period_end = FALSE,
-          next_billing_at = $1
-      WHERE unique_id = $2
-      RETURNING 
+      SET
+        cancel_at_period_end = FALSE,
+        next_billing_at = $1,
+        updated_at = NOW()
+      WHERE unique_id::text = $2::text
+      RETURNING
         subscription_plan,
         subscription_status,
         subscription_expires_at,
@@ -763,7 +1354,8 @@ export const reactivateMySubscription = async (req, res) => {
     console.error("Reactivate subscription error:", err);
 
     return res.status(500).json({
-      message: "Failed to reactivate subscription",
+      success: false,
+      message: "Failed to reactivate subscription.",
       details: err.message,
     });
   }
