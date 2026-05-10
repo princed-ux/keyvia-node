@@ -1,6 +1,7 @@
 import { onlineUsers } from "./onlineUsers.js";
 import { emitToUser } from "./socketUtils.js";
 import { pool } from "../db.js";
+import { createNotification } from "../controllers/notificationsController.js";
 
 export const registerSocketHandlers = (io) => {
   io.on("connection", (socket) => {
@@ -58,6 +59,12 @@ export const registerSocketHandlers = (io) => {
       }
     });
 
+    socket.on("join_team_group", ({ groupId }) => {
+      if (groupId) {
+        socket.join(`team_group_${groupId}`);
+      }
+    });
+
     socket.on("join_agent_room", ({ agent_id }) => {
       if (agent_id) {
         socket.join(`agent_${agent_id}`);
@@ -67,35 +74,84 @@ export const registerSocketHandlers = (io) => {
     // ==========================
     // SEND MESSAGE
     // ==========================
-    socket.on("send_message", async ({ conversationId, senderId, message }) => {
+    socket.on("send_message", async ({ conversationId, senderId, message, productId }) => {
       const actualSenderId = socket.userId || senderId;
 
       if (!conversationId || !actualSenderId || !message) return;
 
       try {
+        const conversation = await pool.query(
+          `SELECT user1_id, user2_id
+           FROM conversations
+           WHERE conversation_id = $1
+             AND (user1_id::text = $2::text OR user2_id::text = $2::text)
+           LIMIT 1`,
+          [conversationId, actualSenderId]
+        );
+
+        if (!conversation.rows.length) return;
+
+        const { user1_id, user2_id } = conversation.rows[0];
+        const recipientId =
+          String(user1_id) === String(actualSenderId) ? user2_id : user1_id;
+
+        const blocked = await pool.query(
+          `SELECT 1
+           FROM blocked_users
+           WHERE (blocker_id::text = $1::text AND blocked_id::text = $2::text)
+              OR (blocker_id::text = $2::text AND blocked_id::text = $1::text)
+           LIMIT 1`,
+          [actualSenderId, recipientId]
+        );
+
+        if (blocked.rows.length) return;
+
         const result = await pool.query(
           `INSERT INTO messages (conversation_id, sender_id, message)
            VALUES ($1, $2, $3)
-           RETURNING message_id, conversation_id, sender_id, message, seen, created_at`,
+           RETURNING
+             message_id AS id,
+             conversation_id,
+             sender_id,
+             message,
+             seen,
+             created_at`,
           [conversationId, actualSenderId, message]
         );
 
         const saved = result.rows[0];
+        const socketPayload = {
+          ...saved,
+          conversationId: saved.conversation_id,
+          senderId: saved.sender_id,
+          last_message: saved.message,
+          last_message_sender: saved.sender_id,
+          last_message_time: saved.created_at,
+        };
 
-        io.to(`conv_${conversationId}`).emit("receive_message", saved);
+        io.to(`conv_${conversationId}`).emit("receive_message", socketPayload);
 
-        // Update sidebar
-        const users = await pool.query(
-          `SELECT user1_id, user2_id FROM conversations WHERE conversation_id = $1`,
-          [conversationId]
-        );
+        emitToUser(io, user1_id, "conversation_updated", socketPayload);
+        emitToUser(io, user2_id, "conversation_updated", socketPayload);
 
-        if (users.rows.length) {
-          const { user1_id, user2_id } = users.rows[0];
-
-          emitToUser(io, user1_id, "conversation_updated", saved);
-          emitToUser(io, user2_id, "conversation_updated", saved);
-        }
+        await createNotification({
+          io,
+          recipientId,
+          senderId: actualSenderId,
+          type: "message",
+          title: "New Message",
+          message: "You have a new Keyvia message.",
+          entityType: "conversation",
+          entityId: String(conversationId),
+          productId: productId || null,
+          actionUrl: "/dashboard/messages",
+          actionLabel: "Open Inbox",
+          data: {
+            conversation_id: conversationId,
+            product_id: productId || null,
+            sender_id: actualSenderId,
+          },
+        }).catch(() => null);
       } catch (err) {
         console.error("Message error:", err);
       }

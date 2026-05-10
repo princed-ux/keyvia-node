@@ -6,6 +6,10 @@ import {
   updateProfileAvatar,
   getPublicProfile,
   getPublicAgentProfile,
+  getSocialOwnerProfile,
+  getSocialAgentProfile,
+  getSocialBrokerageProfile,
+  getSocialAgencyAgentProfile,
 } from "../controllers/profileController.js";
 
 import { upload } from "../middleware/upload.js";
@@ -43,6 +47,13 @@ router.put(
 // =====================================================
 
 router.get("/public/:username", getPublicProfile);
+
+// Role-specific public social aliases. These reuse the same public-safe
+// resolver and keep the current /public and /agent routes compatible.
+router.get("/social/owner/:identifier", getSocialOwnerProfile);
+router.get("/social/agent/:identifier", getSocialAgentProfile);
+router.get("/social/brokerage/:identifier", getSocialBrokerageProfile);
+router.get("/social/agency-agent/:identifier", getSocialAgencyAgentProfile);
 
 // =====================================================
 // PUBLIC AGENT PROFILE

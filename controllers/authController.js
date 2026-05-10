@@ -6,6 +6,11 @@ import {
   sendSignupOtpEmail,
   sendPasswordResetEmail,
 } from "../utils/sendEmail.js";
+import {
+  sendVerificationSubmittedEmail,
+  sendWelcomeRoleEmail,
+} from "../utils/emailService.js";
+import { createNotification } from "./notificationsController.js";
 import { uploadToS3 } from "../middleware/upload.js";
 import { sendSmsOtp } from "../utils/sendSms.js";
 import {
@@ -97,6 +102,63 @@ const normalizePhone = (phone) => String(phone || "").trim();
 const normalizeEmail = (email) => String(email || "").toLowerCase().trim();
 const normalizeTeamCode = (value) => String(value || "").trim().toUpperCase();
 
+const isTransientConnectionError = (err = {}) => {
+  const code = String(err.code || "").toUpperCase();
+  const message = `${err.message || ""} ${err.cause?.message || ""}`.toLowerCase();
+
+  return (
+    ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EPIPE"].includes(code) ||
+    message.includes("connection terminated") ||
+    message.includes("connection timeout") ||
+    message.includes("connection timed out") ||
+    message.includes("connection terminated unexpectedly") ||
+    message.includes("network timeout") ||
+    message.includes("query timeout") ||
+    message.includes("statement timeout")
+  );
+};
+
+const sendAuthConnectionError = (
+  res,
+  message = "Could not complete this auth request. Your connection may be slow or unstable. Please try again.",
+) =>
+  res.status(503).json({
+    success: false,
+    message,
+    code: "SERVICE_TEMPORARILY_UNAVAILABLE",
+    retryable: true,
+  });
+
+const generateBrokerageTeamCode = () => {
+  return `BRKR-${Math.random().toString(36).slice(2, 8).toUpperCase()}-${Date.now()
+    .toString(36)
+    .slice(-4)
+    .toUpperCase()}`;
+};
+
+const createUniqueBrokerageTeamCode = async (client) => {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const code = generateBrokerageTeamCode();
+    const exists = await client.query(
+      `
+      SELECT 1
+      FROM users
+      WHERE UPPER(TRIM(team_code)) = UPPER(TRIM($1))
+      UNION
+      SELECT 1
+      FROM brokerage_profiles
+      WHERE UPPER(TRIM(team_code)) = UPPER(TRIM($1))
+      LIMIT 1
+      `,
+      [code],
+    );
+
+    if (!exists.rows.length) return code;
+  }
+
+  throw new Error("Unable to generate a unique brokerage team code.");
+};
+
 const rekognition = new RekognitionClient({
   region: "eu-west-1",
   credentials: {
@@ -110,6 +172,7 @@ const rekognition = new RekognitionClient({
 // ===================================================
 export const register = async (req, res) => {
   const { name, email, password } = req.body;
+  let userCreated = false;
 
   if (!name || !email || !password) {
     return res.status(400).json({ message: "All fields are required." });
@@ -142,6 +205,7 @@ export const register = async (req, res) => {
   `,
   [name, cleanEmail, hashedPassword]
 );
+    userCreated = true;
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const codeHash = await bcrypt.hash(code, 10);
@@ -166,6 +230,21 @@ export const register = async (req, res) => {
     });
   } catch (err) {
     console.error("[Register] Error:", err);
+
+    if (isTransientConnectionError(err)) {
+      if (userCreated) {
+        try {
+          await pool.query("DELETE FROM users WHERE email=$1", [
+            normalizeEmail(email),
+          ]);
+        } catch {}
+      }
+
+      return sendAuthConnectionError(
+        res,
+        "Could not create your account. Your connection may be slow or unstable. Please try again.",
+      );
+    }
 
     if (
       err.code === "ETIMEDOUT" ||
@@ -264,6 +343,14 @@ export const verifySignupOtp = async (req, res) => {
     });
   } catch (err) {
     console.error("[VerifySignupOtp]", err);
+
+    if (isTransientConnectionError(err)) {
+      return sendAuthConnectionError(
+        res,
+        "Could not verify your signup code. Your connection may be slow or unstable. Please try again.",
+      );
+    }
+
     return res.status(500).json({ message: "Server error." });
   }
 };
@@ -296,6 +383,13 @@ export const resendSignupOtp = async (req, res) => {
     return res.json({ success: true, message: "New code sent." });
   } catch (err) {
     console.error("[ResendOTP]", err);
+
+    if (isTransientConnectionError(err)) {
+      return sendAuthConnectionError(
+        res,
+        "Could not resend your verification code. Your connection may be slow or unstable. Please try again.",
+      );
+    }
 
     if (
       err.code === "ETIMEDOUT" ||
@@ -519,7 +613,7 @@ export const setRole = async (req, res) => {
       if (role === "brokerage") {
         generatedTeamCode =
           currentUser.team_code ||
-          `BRKR-${Math.random().toString(36).substring(2, 12).toUpperCase()}`;
+          (await createUniqueBrokerageTeamCode(client));
         linkedAgencyId = null;
         isSoloAgent = null;
       }
@@ -606,6 +700,36 @@ export const setRole = async (req, res) => {
       sameSite: "Lax",
       secure: process.env.NODE_ENV === "production",
       maxAge: 45 * 24 * 60 * 60 * 1000,
+    });
+
+    createNotification({
+      io: req.io,
+      recipientId: updatedUser.unique_id,
+      type: "welcome",
+      title: "Welcome to Keyvia",
+      message:
+        role === "buyer"
+          ? "Your buyer workspace is ready."
+          : "Your role is set. Continue onboarding so we can verify your account.",
+      entityType: "user",
+      entityId: updatedUser.unique_id,
+      actionUrl:
+        role === "buyer"
+          ? "/buyer/dashboard"
+          : mapEnumToRole(updatedUser.role) === "brokerage"
+            ? "/brokerage/dashboard"
+            : "/dashboard",
+      actionLabel: "Open Dashboard",
+    }).catch((notificationErr) => {
+      console.warn("[SetRole] Welcome notification skipped:", notificationErr?.message);
+    });
+
+    sendWelcomeRoleEmail({
+      email: updatedUser.email,
+      name: updatedUser.name,
+      role: mapEnumToRole(updatedUser.role),
+    }).catch((emailErr) => {
+      console.warn("[SetRole] Welcome email skipped:", emailErr?.message);
     });
 
     return res.json({
@@ -959,6 +1083,7 @@ export const finishOnboarding = async (req, res) => {
     role,
     agency_name,
     brokerage_address,
+    registration_number,
     team_code,
     preferred_location,
     budget_min,
@@ -983,19 +1108,49 @@ export const finishOnboarding = async (req, res) => {
       });
 
       const faceData = await rekognition.send(command);
+      const faces = faceData.FaceDetails || [];
+      const primaryFace = faces[0];
 
-      if (!faceData.FaceDetails || faceData.FaceDetails.length === 0) {
-        return res.status(400).json({
+      if (!faces.length || Number(primaryFace?.Confidence || 0) < 85) {
+        return res.status(422).json({
           success: false,
-          message:
-            "Verification Failed: No clear human face detected in the profile picture. Please upload a real photo.",
+          code: "FACE_NOT_DETECTED",
+          message: "We could not detect a clear human face in your profile photo. Please upload a bright, front-facing photo of yourself.",
+        });
+      }
+
+      if (faces.length > 1) {
+        return res.status(422).json({
+          success: false,
+          code: "MULTIPLE_FACES_DETECTED",
+          message: "Please upload a photo with only your face visible. Group photos cannot be used for verification.",
         });
       }
     } catch (rekError) {
       console.error("[FinishOnboarding] AWS Rekognition Error:", rekError);
+      const code = String(rekError?.name || rekError?.code || "");
+      const badImage =
+        code.includes("InvalidImageFormat") ||
+        code.includes("InvalidParameter") ||
+        String(rekError?.message || "").toLowerCase().includes("invalid image");
+
+      if (badImage) {
+        return res.status(422).json({
+          success: false,
+          code: "IMAGE_NOT_RECOGNIZABLE",
+          message: "We could not read that image clearly. Please upload a supported, clear photo of your face.",
+        });
+      }
+
       return res
-        .status(500)
-        .json({ message: "Image analysis failed. Try again." });
+        .status(503)
+        .json({
+          success: false,
+          code: "FACE_VERIFICATION_UNAVAILABLE",
+          retryable: true,
+          message:
+            "Could not verify your profile photo right now. Your connection may be slow or the image check service is temporarily unavailable.",
+        });
     }
   }
 
@@ -1043,6 +1198,11 @@ export const finishOnboarding = async (req, res) => {
         ? currentUser.is_solo_agent
         : true;
     let finalAgencyName = agency_name || null;
+    let finalTeamCode = currentUser.team_code || null;
+
+    if (normalizedRole === "brokerage" && !finalTeamCode) {
+      finalTeamCode = await createUniqueBrokerageTeamCode(client);
+    }
 
     if (normalizedRole === "agent" && team_code) {
       const normalizedCode = normalizeTeamCode(team_code);
@@ -1252,6 +1412,18 @@ const docColumn =
       ]
     );
 
+    if (normalizedRole === "brokerage" && finalTeamCode) {
+      await client.query(
+        `
+        UPDATE users
+        SET team_code = $2,
+            updated_at = NOW()
+        WHERE unique_id = $1
+        `,
+        [userId, finalTeamCode],
+      );
+    }
+
     await client.query(
       `
       INSERT INTO profiles (
@@ -1319,12 +1491,16 @@ const docColumn =
     );
 
     if (normalizedRole === "brokerage") {
+      const brokerageRegistrationNumber =
+        registration_number || license_number || null;
+
       await client.query(
         `
         INSERT INTO brokerage_profiles (
           unique_id,
           company_name,
           brokerage_address,
+          registration_number,
           team_code,
           verified_badge,
           subscription_plan,
@@ -1335,12 +1511,13 @@ const docColumn =
           updated_at
         )
         VALUES (
-          $1, $2, $3, $4, FALSE, 'free', 'inactive', 5, 0, FALSE, NOW()
+          $1, $2, $3, $4, $5, FALSE, 'free', 'inactive', 5, 0, FALSE, NOW()
         )
         ON CONFLICT (unique_id)
         DO UPDATE SET
           company_name = COALESCE(EXCLUDED.company_name, brokerage_profiles.company_name),
           brokerage_address = COALESCE(EXCLUDED.brokerage_address, brokerage_profiles.brokerage_address),
+          registration_number = COALESCE(EXCLUDED.registration_number, brokerage_profiles.registration_number),
           team_code = COALESCE(EXCLUDED.team_code, brokerage_profiles.team_code),
           updated_at = NOW()
         `,
@@ -1348,7 +1525,8 @@ const docColumn =
           userId,
           finalAgencyName || null,
           brokerage_address || null,
-          currentUser.team_code || null,
+          brokerageRegistrationNumber,
+          finalTeamCode || null,
         ]
       );
     }
@@ -1383,6 +1561,29 @@ const docColumn =
       );
     }
 
+    if (normalizedRole === "agent" || normalizedRole === "brokerage") {
+      await client.query(
+        `
+        UPDATE profiles
+        SET team_code = COALESCE($2, team_code),
+            linked_agency_id = $3,
+            is_solo_agent = $4,
+            brokerage_name = COALESCE($5, brokerage_name),
+            brokerage_address = COALESCE($6, brokerage_address),
+            updated_at = NOW()
+        WHERE unique_id = $1
+        `,
+        [
+          userId,
+          normalizedRole === "brokerage" ? finalTeamCode : null,
+          linkedAgencyId,
+          normalizedRole === "agent" ? isSoloAgent : null,
+          finalAgencyName || null,
+          brokerage_address || null,
+        ],
+      );
+    }
+
     if (normalizedRole === "owner") {
       await client.query(
         `
@@ -1396,6 +1597,37 @@ const docColumn =
     }
 
     await client.query("COMMIT");
+
+    createNotification({
+      io: req.io,
+      recipientId: userId,
+      type: "verification_submitted",
+      title: "Verification submitted",
+      message:
+        "Your account verification is under review. We will notify you once it is approved or if anything needs attention.",
+      entityType: "user",
+      entityId: userId,
+      actionUrl:
+        normalizedRole === "brokerage"
+          ? "/brokerage/dashboard"
+          : normalizedRole === "owner"
+            ? "/owner/dashboard"
+            : "/dashboard",
+      actionLabel: "Open Dashboard",
+    }).catch((notificationErr) => {
+      console.warn(
+        "[FinishOnboarding] Review notification skipped:",
+        notificationErr?.message,
+      );
+    });
+
+    sendVerificationSubmittedEmail({
+      email: currentUser.email,
+      name: currentUser.name,
+      role: normalizedRole,
+    }).catch((emailErr) => {
+      console.warn("[FinishOnboarding] Review email skipped:", emailErr?.message);
+    });
 
     return res.json({
   success: true,
@@ -1415,9 +1647,24 @@ const docColumn =
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[FinishOnboarding] Error:", err);
-    return res.status(500).json({
-      message: "Server error during onboarding.",
-      details: err.message,
+    const message = String(err?.message || "").toLowerCase();
+    const isConnectionIssue =
+      message.includes("connection terminated") ||
+      message.includes("timeout") ||
+      ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED"].includes(
+        String(err?.code || "").toUpperCase(),
+      );
+
+    return res.status(isConnectionIssue ? 503 : 500).json({
+      success: false,
+      message: isConnectionIssue
+        ? "Could not submit verification. Your connection may be slow or unstable. Please try again."
+        : "Could not submit verification right now. Please check the form and try again.",
+      code: isConnectionIssue
+        ? "SERVICE_TEMPORARILY_UNAVAILABLE"
+        : "ONBOARDING_SUBMIT_FAILED",
+      retryable: isConnectionIssue || undefined,
+      ...(process.env.NODE_ENV !== "production" && { details: err.message }),
     });
   } finally {
     client.release();

@@ -13,6 +13,9 @@ import {
   getPublicAgentProfile,
   analyzeListing,
   batchAnalyzeListings,
+  reportListing,
+  requestListingTour,
+  notifyLiveTourInterest,
 
   createListingDraft,
   updateListingDraft,
@@ -157,6 +160,25 @@ router.put(
   "/:product_id/activate",
   authenticateToken,
   activateListing,
+);
+
+// Buyer/public safety report. Auth keeps reports attributable and rate-limited.
+router.post(
+  "/:product_id/report",
+  authenticateToken,
+  reportListing,
+);
+
+router.post(
+  "/:product_id/tour-request",
+  authenticateToken,
+  requestListingTour,
+);
+
+router.post(
+  "/:product_id/live-tour/notify",
+  authenticateToken,
+  notifyLiveTourInterest,
 );
 
 /* ============================================================

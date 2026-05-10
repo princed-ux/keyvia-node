@@ -1,5 +1,6 @@
 import { pool } from "../db.js";
 import { uploadToS3 } from "../middleware/upload.js";
+import { COUNTRY_ISO_MAP } from "../utils/countryMap.js";
 
 // =====================================================
 // HELPERS
@@ -9,6 +10,8 @@ const normalizeRole = (role) => {
   const value = String(role || "").toLowerCase().trim();
 
   if (value === "brokerage_owner") return "brokerage";
+  if (value === "agency_agent" || value === "agencyagent") return "agent";
+  if (value === "brokerage_agent") return "agent";
   if (value === "super_admin") return "superadmin";
   if (value === "landlord") return "owner";
 
@@ -266,48 +269,872 @@ const normalizeProfileResponse = (base = {}, roleData = {}) => {
   return response;
 };
 
+const UUID_REGEX =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+const SOCIAL_PROFILE_COLUMNS = [
+  "social_instagram",
+  "social_facebook",
+  "social_twitter",
+  "social_linkedin",
+  "social_tiktok",
+];
+
+const PUBLIC_LISTING_COLUMNS = [
+  "product_id",
+  "uploaded_by_id",
+  "agent_unique_id",
+  "created_by",
+  "assigned_agent_id",
+  "agency_id",
+  "brokerage_id",
+  "title",
+  "description",
+  "property_type",
+  "property_subtype",
+  "listing_type",
+  "category",
+  "price",
+  "currency",
+  "price_currency",
+  "price_period",
+  "bedrooms",
+  "bathrooms",
+  "square_footage",
+  "area_sqft",
+  "building_area_sqft",
+  "land_area_sqft",
+  "lot_size",
+  "year_built",
+  "address",
+  "city",
+  "state",
+  "country",
+  "neighborhood",
+  "estate_name",
+  "landmark",
+  "latitude",
+  "longitude",
+  "photos",
+  "floor_plans",
+  "features",
+  "amenities",
+  "views_count",
+  "saves_count",
+  "shares_count",
+  "status",
+  "is_active",
+  "featured_until",
+  "showcase_until",
+  "created_at",
+  "listed_at",
+  "activated_at",
+  "updated_at",
+];
+
+const getTableColumns = async (client, tableName) => {
+  const result = await client.query(
+    `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = $1
+    `,
+    [tableName],
+  );
+
+  return new Set(result.rows.map((row) => row.column_name));
+};
+
+const selectIfColumn = (columns, alias, column, fallback, output = column) => {
+  return columns.has(column)
+    ? `${alias}.${column} AS ${output}`
+    : `${fallback} AS ${output}`;
+};
+
+const refIfColumn = (columns, alias, column, fallback = "NULL::text") => {
+  return columns.has(column) ? `${alias}.${column}` : fallback;
+};
+
+const nullableText = "NULL::text";
+const nullableUuid = "NULL::uuid";
+const nullableBool = "NULL::boolean";
+const nullableInt = "NULL::int";
+const nullableDate = "NULL::timestamptz";
+const emptyJson = "'[]'::jsonb";
+
+const makePublicProfileError = (message, statusCode = 500) => {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+};
+
+const cleanPublicIdentifier = (value) => String(value || "").trim().replace(/^@+/, "");
+
+const normalizeDisplaySlug = (value) => {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^@+/, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+};
+
+const parseJsonArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+
+  try {
+    const parsed = typeof value === "string" ? JSON.parse(value) : value;
+
+    if (Array.isArray(parsed)) return parsed;
+
+    if (parsed && typeof parsed === "object") {
+      return Object.keys(parsed).filter(
+        (key) => parsed[key] === true || parsed[key] === "true",
+      );
+    }
+  } catch {
+    return [];
+  }
+
+  return [];
+};
+
+const normalizePublicPhotos = (value) => {
+  return parseJsonArray(value)
+    .map((photo) => {
+      if (!photo) return null;
+
+      if (typeof photo === "string") {
+        return {
+          url: buildPublicMediaUrl(photo),
+          key: null,
+          type: "image",
+          provider: "legacy",
+        };
+      }
+
+      const url = photo.url || photo.s3_url || photo.secure_url || photo.src || null;
+      const key = photo.key || photo.s3_key || photo.public_id || null;
+
+      return {
+        ...photo,
+        url: buildPublicMediaUrl(url || key),
+        key,
+        type: photo.type || "image",
+      };
+    })
+    .filter(Boolean);
+};
+
+const normalizePublicRole = (role) => normalizeRole(role || "user");
+
+const getCountryCode = (country) => {
+  if (!country) return null;
+
+  const exact = COUNTRY_ISO_MAP?.[country];
+  if (exact) return exact;
+
+  const match = Object.entries(COUNTRY_ISO_MAP || {}).find(
+    ([name]) => name.toLowerCase() === String(country).toLowerCase(),
+  );
+
+  return match?.[1] || null;
+};
+
+const getPublicRoleLabel = (role, isAgencyAgent) => {
+  const normalized = normalizePublicRole(role);
+
+  if (normalized === "brokerage") return "Brokerage Company";
+  if (normalized === "owner") return "Property Owner";
+  if (normalized === "buyer") return "Buyer";
+  if (normalized === "admin" || normalized === "superadmin") return "Keyvia Admin";
+  if (normalized === "agent") {
+    return isAgencyAgent ? "Agency Agent" : "Real Estate Agent";
+  }
+
+  return "Keyvia Member";
+};
+
+const getPublicBadge = (profile = {}, isVerified) => {
+  const subscriptionStatus = String(profile.subscription_status || "").toLowerCase();
+  const subscriptionPlan = String(profile.subscription_plan || "").toLowerCase();
+
+  if (isVerified && subscriptionStatus === "active") {
+    if (
+      [
+        "elite_agent",
+        "elite_owner",
+        "elite_brokerage",
+        "enterprise",
+      ].includes(subscriptionPlan)
+    ) {
+      return "elite_verified";
+    }
+
+    if (["pro_agent", "pro_owner", "pro_brokerage"].includes(subscriptionPlan)) {
+      return "pro_verified";
+    }
+  }
+
+  return isVerified ? "verified" : null;
+};
+
+const mergeSocialLinks = (profile = {}) => {
+  const socialLinks = normalizeSocialLinks(profile.social_links);
+
+  const merged = {
+    instagram: profile.social_instagram || socialLinks.instagram || "",
+    facebook: profile.social_facebook || socialLinks.facebook || "",
+    linkedin: profile.social_linkedin || socialLinks.linkedin || "",
+    twitter: profile.social_twitter || socialLinks.twitter || "",
+    tiktok: profile.social_tiktok || socialLinks.tiktok || "",
+  };
+
+  return {
+    social_links: merged,
+    social_instagram: merged.instagram,
+    social_facebook: merged.facebook,
+    social_linkedin: merged.linkedin,
+    social_twitter: merged.twitter,
+    social_tiktok: merged.tiktok,
+  };
+};
+
+const listingFallbackForColumn = (column) => {
+  if (["photos", "floor_plans", "features", "amenities"].includes(column)) {
+    return emptyJson;
+  }
+
+  if (["bedrooms", "bathrooms", "views_count", "saves_count", "shares_count"].includes(column)) {
+    return "0";
+  }
+
+  if (column === "is_active") return "false";
+
+  if (
+    [
+      "created_at",
+      "listed_at",
+      "activated_at",
+      "updated_at",
+      "featured_until",
+      "showcase_until",
+    ].includes(column)
+  ) {
+    return nullableDate;
+  }
+
+  return nullableText;
+};
+
+const getPublicListingSelect = (listingColumns) => {
+  return PUBLIC_LISTING_COLUMNS.map((column) =>
+    listingColumns.has(column)
+      ? `l.${column} AS ${column}`
+      : `${listingFallbackForColumn(column)} AS ${column}`,
+  ).join(",\n          ");
+};
+
+const getListingOwnerConditions = (listingColumns, targetSql = "$1::text") => {
+  return [
+    "uploaded_by_id",
+    "agent_unique_id",
+    "created_by",
+    "assigned_agent_id",
+    "brokerage_id",
+    "agency_id",
+  ]
+    .filter((column) => listingColumns.has(column))
+    .map((column) => `l.${column}::text = ${targetSql}`);
+};
+
+const getPublicListingFilters = (listingColumns) => {
+  const filters = [];
+
+  if (listingColumns.has("status")) {
+    filters.push("LOWER(l.status::text) = 'approved'");
+  }
+
+  if (listingColumns.has("is_active")) {
+    filters.push("l.is_active IS TRUE");
+  }
+
+  return filters;
+};
+
+const getPublicListingOrder = (listingColumns) => {
+  const dateColumns = ["activated_at", "listed_at", "created_at"].filter((column) =>
+    listingColumns.has(column),
+  );
+
+  if (dateColumns.length) {
+    return `COALESCE(${dateColumns.map((column) => `l.${column}`).join(", ")}) DESC NULLS LAST`;
+  }
+
+  return "l.product_id DESC";
+};
+
+const normalizePublicListing = (listing = {}) => {
+  const photos = normalizePublicPhotos(listing.photos);
+
+  return {
+    ...listing,
+    photos,
+    floor_plans: normalizePublicPhotos(listing.floor_plans),
+    features: parseJsonArray(listing.features),
+    amenities: parseJsonArray(listing.amenities),
+    latitude:
+      listing.latitude !== null && listing.latitude !== undefined
+        ? Number(listing.latitude)
+        : null,
+    longitude:
+      listing.longitude !== null && listing.longitude !== undefined
+        ? Number(listing.longitude)
+        : null,
+    price_currency: listing.price_currency || listing.currency || "USD",
+    square_footage:
+      listing.square_footage ||
+      listing.area_sqft ||
+      listing.building_area_sqft ||
+      null,
+    status: listing.status || "approved",
+    is_active: listing.is_active !== false,
+  };
+};
+
+const getPublicListingsForProfile = async (client, profile, listingColumns) => {
+  const ownerConditions = getListingOwnerConditions(listingColumns);
+
+  if (!ownerConditions.length) return [];
+
+  const filters = [
+    `(${ownerConditions.join(" OR ")})`,
+    ...getPublicListingFilters(listingColumns),
+  ];
+
+  const result = await client.query(
+    `
+    SELECT
+      ${getPublicListingSelect(listingColumns)}
+    FROM listings l
+    WHERE ${filters.join("\n      AND ")}
+    ORDER BY ${getPublicListingOrder(listingColumns)}
+    LIMIT 100
+    `,
+    [String(profile.unique_id)],
+  );
+
+  return result.rows.map(normalizePublicListing);
+};
+
+const getPublicBrokerageSummary = async (client, brokerageId, tableColumns) => {
+  if (!brokerageId) return null;
+
+  const { users, profiles, brokerageProfiles } = tableColumns;
+
+  const brokerageJoin = brokerageProfiles.size
+    ? "LEFT JOIN brokerage_profiles bp ON bp.unique_id::text = u.unique_id::text"
+    : "";
+
+  const result = await client.query(
+    `
+    SELECT
+      u.unique_id,
+      ${selectIfColumn(users, "u", "role", nullableText, "role")},
+      ${selectIfColumn(users, "u", "name", nullableText, "user_name")},
+      ${selectIfColumn(users, "u", "username", nullableText, "user_username")},
+      ${selectIfColumn(users, "u", "avatar_url", nullableText, "user_avatar_url")},
+      ${selectIfColumn(users, "u", "verification_status", nullableText, "verification_status")},
+      ${selectIfColumn(users, "u", "is_verified", nullableBool, "is_verified")},
+      ${selectIfColumn(profiles, "p", "full_name", nullableText, "profile_full_name")},
+      ${selectIfColumn(profiles, "p", "username", nullableText, "profile_username")},
+      ${selectIfColumn(profiles, "p", "avatar_url", nullableText, "profile_avatar_url")},
+      ${selectIfColumn(profiles, "p", "city", nullableText, "profile_city")},
+      ${selectIfColumn(profiles, "p", "country", nullableText, "profile_country")},
+      ${selectIfColumn(brokerageProfiles, "bp", "company_name", nullableText, "company_name")},
+      ${selectIfColumn(brokerageProfiles, "bp", "logo_url", nullableText, "logo_url")},
+      ${selectIfColumn(brokerageProfiles, "bp", "verified_badge", nullableBool, "verified_badge")}
+    FROM users u
+    LEFT JOIN profiles p
+      ON p.unique_id::text = u.unique_id::text
+    ${brokerageJoin}
+    WHERE u.unique_id::text = $1::text
+    LIMIT 1
+    `,
+    [String(brokerageId)],
+  );
+
+  const row = result.rows[0];
+  if (!row) return null;
+
+  const status = normalizeVerificationStatus(row.verification_status);
+  const isVerified = row.is_verified === true || row.verified_badge === true || status === "verified";
+  const companyName = row.company_name || row.profile_full_name || row.user_name || "Keyvia Brokerage";
+
+  return {
+    unique_id: row.unique_id,
+    full_name: companyName,
+    name: companyName,
+    company_name: companyName,
+    brokerage_name: companyName,
+    username: row.profile_username || row.user_username || "",
+    avatar_url: buildPublicMediaUrl(row.logo_url || row.profile_avatar_url || row.user_avatar_url),
+    logo_url: buildPublicMediaUrl(row.logo_url || row.profile_avatar_url || row.user_avatar_url),
+    role: normalizePublicRole(row.role || "brokerage"),
+    role_label: "Brokerage Company",
+    city: row.profile_city || "",
+    country: row.profile_country || "",
+    country_code: getCountryCode(row.profile_country),
+    verification_status: isVerified ? "verified" : status,
+    is_verified: isVerified,
+  };
+};
+
+const getBrokerageTeamAgents = async (
+  client,
+  brokerageId,
+  tableColumns,
+  listingColumns,
+) => {
+  if (!brokerageId) return [];
+
+  const { users, profiles, agentProfiles } = tableColumns;
+
+  const agentJoin = agentProfiles.size
+    ? "LEFT JOIN agent_profiles ap ON ap.unique_id::text = u.unique_id::text"
+    : "";
+
+  const linkedConditions = [];
+  if (users.has("linked_agency_id")) linkedConditions.push("u.linked_agency_id::text = $1::text");
+  if (agentProfiles.has("linked_agency_id")) linkedConditions.push("ap.linked_agency_id::text = $1::text");
+
+  if (!linkedConditions.length) return [];
+
+  const listingCountConditions = getListingOwnerConditions(listingColumns, "u.unique_id::text");
+  const listingCountFilters = [
+    ...(listingCountConditions.length ? [`(${listingCountConditions.join(" OR ")})`] : []),
+    ...getPublicListingFilters(listingColumns),
+  ];
+
+  const listingCountSql = listingCountFilters.length
+    ? `(SELECT COUNT(*)::int FROM listings l WHERE ${listingCountFilters.join(" AND ")})`
+    : "0";
+
+  const result = await client.query(
+    `
+    SELECT DISTINCT ON (u.unique_id)
+      u.unique_id,
+      ${selectIfColumn(users, "u", "role", nullableText, "role")},
+      ${selectIfColumn(users, "u", "name", nullableText, "user_name")},
+      ${selectIfColumn(users, "u", "username", nullableText, "user_username")},
+      ${selectIfColumn(users, "u", "avatar_url", nullableText, "user_avatar_url")},
+      ${selectIfColumn(users, "u", "city", nullableText, "user_city")},
+      ${selectIfColumn(users, "u", "country", nullableText, "user_country")},
+      ${selectIfColumn(users, "u", "verification_status", nullableText, "verification_status")},
+      ${selectIfColumn(users, "u", "is_verified", nullableBool, "is_verified")},
+      ${selectIfColumn(users, "u", "is_solo_agent", nullableBool, "user_is_solo_agent")},
+      ${selectIfColumn(profiles, "p", "full_name", nullableText, "profile_full_name")},
+      ${selectIfColumn(profiles, "p", "username", nullableText, "profile_username")},
+      ${selectIfColumn(profiles, "p", "avatar_url", nullableText, "profile_avatar_url")},
+      ${selectIfColumn(profiles, "p", "city", nullableText, "profile_city")},
+      ${selectIfColumn(profiles, "p", "country", nullableText, "profile_country")},
+      ${selectIfColumn(agentProfiles, "ap", "experience_years", nullableInt, "experience_years")},
+      ${selectIfColumn(agentProfiles, "ap", "is_solo_agent", nullableBool, "agent_is_solo_agent")},
+      ${listingCountSql} AS listing_count
+    FROM users u
+    LEFT JOIN profiles p
+      ON p.unique_id::text = u.unique_id::text
+    ${agentJoin}
+    WHERE LOWER(COALESCE(u.role::text, '')) IN ('agent', 'agency_agent', 'agencyagent', 'brokerage_agent')
+      AND (${linkedConditions.join(" OR ")})
+    ORDER BY u.unique_id, COALESCE(p.full_name, u.name)
+    LIMIT 50
+    `,
+    [String(brokerageId)],
+  );
+
+  return result.rows.map((row) => {
+    const status = normalizeVerificationStatus(row.verification_status);
+    const isVerified = row.is_verified === true || status === "verified";
+    const isSoloAgent =
+      typeof row.agent_is_solo_agent === "boolean"
+        ? row.agent_is_solo_agent
+        : row.user_is_solo_agent;
+
+    return {
+      unique_id: row.unique_id,
+      full_name: row.profile_full_name || row.user_name || "Keyvia Agent",
+      name: row.profile_full_name || row.user_name || "Keyvia Agent",
+      username: row.profile_username || row.user_username || "",
+      avatar_url: buildPublicMediaUrl(row.profile_avatar_url || row.user_avatar_url),
+      role: "agent",
+      role_label: isSoloAgent === false ? "Agency Agent" : "Real Estate Agent",
+      is_solo_agent: isSoloAgent,
+      city: row.profile_city || row.user_city || "",
+      country: row.profile_country || row.user_country || "",
+      country_code: getCountryCode(row.profile_country || row.user_country),
+      verification_status: isVerified ? "verified" : status,
+      is_verified: isVerified,
+      experience_years: row.experience_years || null,
+      listing_count: Number(row.listing_count || 0),
+    };
+  });
+};
+
+const roleMatchesExpected = (agent, expectedRole) => {
+  if (!expectedRole) return true;
+
+  const role = normalizePublicRole(agent.role);
+
+  if (expectedRole === "owner") return role === "owner";
+  if (expectedRole === "brokerage") return role === "brokerage";
+  if (expectedRole === "agency-agent") return role === "agent" && agent.is_agency_agent === true;
+  if (expectedRole === "agent") return role === "agent" && agent.is_agency_agent !== true;
+
+  return true;
+};
+
+export const resolvePublicProfilePayload = async ({
+  identifier,
+  expectedRole = null,
+  client = pool,
+} = {}) => {
+  const queryValue = cleanPublicIdentifier(identifier);
+
+  if (!queryValue) {
+    throw makePublicProfileError("Profile identifier is required.", 400);
+  }
+
+  const [
+    users,
+    profiles,
+    agentProfiles,
+    brokerageProfiles,
+    listingColumns,
+  ] = await Promise.all([
+    getTableColumns(client, "users"),
+    getTableColumns(client, "profiles"),
+    getTableColumns(client, "agent_profiles"),
+    getTableColumns(client, "brokerage_profiles"),
+    getTableColumns(client, "listings"),
+  ]);
+
+  const isUuid = UUID_REGEX.test(queryValue);
+  const slugValue = normalizeDisplaySlug(queryValue);
+  const params = isUuid ? [queryValue] : [queryValue, slugValue];
+
+  const profileConditions = [];
+
+  if (isUuid) {
+    profileConditions.push("u.unique_id::text = $1::text");
+  } else {
+    if (users.has("username")) profileConditions.push("LOWER(u.username) = LOWER($1)");
+    if (profiles.has("username")) profileConditions.push("LOWER(p.username) = LOWER($1)");
+    if (users.has("name")) {
+      profileConditions.push("LOWER(COALESCE(u.name, '')) = LOWER($1)");
+      profileConditions.push("LOWER(REPLACE(COALESCE(u.name, ''), ' ', '_')) = LOWER($2)");
+    }
+    if (profiles.has("full_name")) {
+      profileConditions.push("LOWER(COALESCE(p.full_name, '')) = LOWER($1)");
+      profileConditions.push("LOWER(REPLACE(COALESCE(p.full_name, ''), ' ', '_')) = LOWER($2)");
+    }
+  }
+
+  if (!profileConditions.length) {
+    throw makePublicProfileError("Profile lookup is not available.", 500);
+  }
+
+  const agentJoin = agentProfiles.size
+    ? "LEFT JOIN agent_profiles ap ON ap.unique_id::text = u.unique_id::text"
+    : "";
+
+  const brokerageJoin = brokerageProfiles.size
+    ? "LEFT JOIN brokerage_profiles bp ON bp.unique_id::text = u.unique_id::text"
+    : "";
+
+  const socialSelect = SOCIAL_PROFILE_COLUMNS.map((column) =>
+    selectIfColumn(profiles, "p", column, nullableText, column),
+  ).join(",\n        ");
+
+  const profileRes = await client.query(
+    `
+    SELECT
+      u.unique_id,
+      ${selectIfColumn(users, "u", "email", nullableText, "private_email")},
+      ${selectIfColumn(users, "u", "name", nullableText, "user_name")},
+      ${selectIfColumn(users, "u", "username", nullableText, "user_username")},
+      ${selectIfColumn(users, "u", "phone", nullableText, "private_phone")},
+      ${selectIfColumn(users, "u", "role", nullableText, "role")},
+      ${selectIfColumn(users, "u", "avatar_url", nullableText, "user_avatar_url")},
+      ${selectIfColumn(users, "u", "bio", nullableText, "user_bio")},
+      ${selectIfColumn(users, "u", "city", nullableText, "user_city")},
+      ${selectIfColumn(users, "u", "country", nullableText, "user_country")},
+      ${selectIfColumn(users, "u", "verification_status", nullableText, "verification_status")},
+      ${selectIfColumn(users, "u", "is_verified", nullableBool, "is_verified")},
+      ${selectIfColumn(users, "u", "is_solo_agent", nullableBool, "user_is_solo_agent")},
+      ${selectIfColumn(users, "u", "linked_agency_id", nullableUuid, "user_linked_agency_id")},
+      ${selectIfColumn(users, "u", "brokerage_name", nullableText, "user_brokerage_name")},
+      ${selectIfColumn(users, "u", "subscription_plan", nullableText, "subscription_plan")},
+      ${selectIfColumn(users, "u", "subscription_status", nullableText, "subscription_status")},
+      ${selectIfColumn(users, "u", "created_at", nullableDate, "created_at")},
+
+      ${selectIfColumn(profiles, "p", "full_name", nullableText, "profile_full_name")},
+      ${selectIfColumn(profiles, "p", "username", nullableText, "profile_username")},
+      ${selectIfColumn(profiles, "p", "avatar_url", nullableText, "profile_avatar_url")},
+      ${selectIfColumn(profiles, "p", "bio", nullableText, "profile_bio")},
+      ${selectIfColumn(profiles, "p", "city", nullableText, "profile_city")},
+      ${selectIfColumn(profiles, "p", "country", nullableText, "profile_country")},
+      ${selectIfColumn(profiles, "p", "social_links", "'{}'::jsonb", "social_links")},
+      ${socialSelect},
+
+      ${selectIfColumn(agentProfiles, "ap", "experience_years", nullableInt, "experience_years")},
+      ${selectIfColumn(agentProfiles, "ap", "linked_agency_id", nullableUuid, "agent_linked_agency_id")},
+      ${selectIfColumn(agentProfiles, "ap", "is_solo_agent", nullableBool, "agent_is_solo_agent")},
+
+      ${selectIfColumn(brokerageProfiles, "bp", "company_name", nullableText, "brokerage_company_name")},
+      ${selectIfColumn(brokerageProfiles, "bp", "brokerage_address", nullableText, "brokerage_address")},
+      ${selectIfColumn(brokerageProfiles, "bp", "logo_url", nullableText, "brokerage_logo_url")},
+      ${selectIfColumn(brokerageProfiles, "bp", "website", nullableText, "brokerage_website")},
+      ${selectIfColumn(brokerageProfiles, "bp", "verified_badge", nullableBool, "brokerage_verified_badge")}
+    FROM users u
+    LEFT JOIN profiles p
+      ON p.unique_id::text = u.unique_id::text
+    ${agentJoin}
+    ${brokerageJoin}
+    WHERE ${profileConditions.map((condition) => `(${condition})`).join(" OR ")}
+    LIMIT 1
+    `,
+    params,
+  );
+
+  const row = profileRes.rows[0];
+
+  if (!row) {
+    throw makePublicProfileError("Profile not found.", 404);
+  }
+
+  const rawRole = String(row.role || "").toLowerCase();
+  const role = normalizePublicRole(row.role);
+  const linkedBrokerageId = row.agent_linked_agency_id || row.user_linked_agency_id || null;
+  const isSoloAgent =
+    typeof row.agent_is_solo_agent === "boolean"
+      ? row.agent_is_solo_agent
+      : row.user_is_solo_agent;
+  const isAgencyAgent =
+    role === "agent" &&
+    (isSoloAgent === false ||
+      Boolean(linkedBrokerageId) ||
+      rawRole === "agency_agent" ||
+      rawRole === "agencyagent" ||
+      rawRole === "brokerage_agent");
+  const verificationStatus = normalizeVerificationStatus(row.verification_status);
+  const isVerified =
+    row.is_verified === true ||
+    row.brokerage_verified_badge === true ||
+    verificationStatus === "verified";
+  const socials = mergeSocialLinks(row);
+  const companyName =
+    row.brokerage_company_name ||
+    row.user_brokerage_name ||
+    (role === "brokerage" ? row.profile_full_name || row.user_name : null) ||
+    null;
+
+  const agent = {
+    unique_id: row.unique_id,
+    full_name:
+      companyName && role === "brokerage"
+        ? companyName
+        : row.profile_full_name || row.user_name || "Keyvia User",
+    name:
+      companyName && role === "brokerage"
+        ? companyName
+        : row.profile_full_name || row.user_name || "Keyvia User",
+    display_name:
+      companyName && role === "brokerage"
+        ? companyName
+        : row.profile_full_name || row.user_name || "Keyvia User",
+    username: row.profile_username || row.user_username || "",
+    avatar_url: buildPublicMediaUrl(
+      row.brokerage_logo_url || row.profile_avatar_url || row.user_avatar_url,
+    ),
+    logo_url: buildPublicMediaUrl(row.brokerage_logo_url || row.profile_avatar_url || row.user_avatar_url),
+    cover_url: null,
+    bio: row.profile_bio || row.user_bio || "",
+    about: row.profile_bio || row.user_bio || "",
+    country: row.profile_country || row.user_country || "",
+    country_code: getCountryCode(row.profile_country || row.user_country),
+    city: row.profile_city || row.user_city || "",
+    role,
+    db_role: row.role,
+    role_label: getPublicRoleLabel(role, isAgencyAgent),
+    is_solo_agent: role === "agent" ? isSoloAgent !== false && !linkedBrokerageId : null,
+    is_agency_agent: isAgencyAgent,
+    company_name: companyName,
+    agency_name: role === "agent" && isAgencyAgent ? companyName : null,
+    brokerage_name:
+      role === "brokerage" || isAgencyAgent ? companyName : null,
+    brokerage_address: role === "brokerage" ? row.brokerage_address || "" : "",
+    website: role === "brokerage" ? row.brokerage_website || "" : "",
+    verification_status: isVerified ? "verified" : verificationStatus,
+    is_verified: isVerified,
+    public_badge: getPublicBadge(row, isVerified),
+    experience_years: row.experience_years || null,
+    experience: row.experience_years || null,
+    created_at: row.created_at,
+    joined_at: row.created_at,
+    email: null,
+    phone: null,
+    ...socials,
+  };
+
+  if (!roleMatchesExpected(agent, expectedRole)) {
+    throw makePublicProfileError("Profile not found for this role.", 404);
+  }
+
+  const [listings, brokerage, teamAgents] = await Promise.all([
+    role !== "buyer"
+      ? getPublicListingsForProfile(client, agent, listingColumns)
+      : Promise.resolve([]),
+    isAgencyAgent
+      ? getPublicBrokerageSummary(client, linkedBrokerageId, {
+          users,
+          profiles,
+          brokerageProfiles,
+        })
+      : Promise.resolve(null),
+    role === "brokerage"
+      ? getBrokerageTeamAgents(
+          client,
+          row.unique_id,
+          { users, profiles, agentProfiles },
+          listingColumns,
+        )
+      : Promise.resolve([]),
+  ]);
+
+  if (brokerage) {
+    agent.company_name = agent.company_name || brokerage.company_name;
+    agent.agency_name = agent.agency_name || brokerage.company_name;
+    agent.brokerage_name = agent.brokerage_name || brokerage.company_name;
+    agent.brokerage = brokerage;
+  }
+
+  const listingViews = listings.reduce(
+    (sum, listing) => sum + Number(listing.views_count || 0),
+    0,
+  );
+
+  agent.listing_count = listings.length;
+  agent.active_listings_count = listings.length;
+  agent.team_agents_count = teamAgents.length;
+
+  return {
+    success: true,
+    agent,
+    profile: agent,
+    listings,
+    team_agents: teamAgents,
+    brokerage,
+    analytics: {
+      profile_views: 0,
+      listing_views: listingViews,
+      listings_count: listings.length,
+      team_agents_count: teamAgents.length,
+    },
+    default_cover:
+      role === "buyer"
+        ? "https://images.unsplash.com/photo-1560518883-ce09059eeffa?q=80&w=1973&auto=format&fit=crop"
+        : null,
+  };
+};
+
+const sendPublicProfilePayload = async (req, res, options = {}) => {
+  try {
+    const identifier =
+      req.params.identifier || req.params.username || req.params.unique_id;
+
+    const payload = await resolvePublicProfilePayload({
+      identifier,
+      expectedRole: options.expectedRole || null,
+    });
+
+    return res.json(payload);
+  } catch (err) {
+    const status = err.statusCode || 500;
+
+    if (status >= 500) {
+      console.error("[PublicProfile] Error:", err);
+    }
+
+    return res.status(status).json({
+      success: false,
+      message:
+        status === 500
+          ? "Failed to fetch public profile."
+          : err.message || "Profile not found.",
+    });
+  }
+};
+
 // =====================================================
 // GET PROFILE
 // Private profile for the logged-in user.
 // =====================================================
 
 export const getProfile = async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { unique_id } = req.user;
+    const [
+      users,
+      profiles,
+      agentProfiles,
+      brokerageProfiles,
+      ownerProfiles,
+    ] = await Promise.all([
+      getTableColumns(client, "users"),
+      getTableColumns(client, "profiles"),
+      getTableColumns(client, "agent_profiles"),
+      getTableColumns(client, "brokerage_profiles"),
+      getTableColumns(client, "owner_profiles"),
+    ]);
 
-    const baseRes = await pool.query(
+    const baseRes = await client.query(
       `
       SELECT
-        u.id,
         u.unique_id,
-        u.email,
-        u.name,
-        u.role,
-        u.verification_status,
-        u.is_verified,
-        u.avatar_url,
-        u.rejection_reason,
-        u.special_id,
-        u.team_code,
-        u.linked_agency_id,
-        u.is_solo_agent,
-        u.phone_verified,
+        ${selectIfColumn(users, "u", "id", nullableUuid, "id")},
+        ${selectIfColumn(users, "u", "email", nullableText, "email")},
+        ${selectIfColumn(users, "u", "name", nullableText, "name")},
+        ${selectIfColumn(users, "u", "role", nullableText, "role")},
+        ${selectIfColumn(users, "u", "verification_status", nullableText, "verification_status")},
+        ${selectIfColumn(users, "u", "is_verified", nullableBool, "is_verified")},
+        COALESCE(${refIfColumn(profiles, "p", "avatar_url")}, ${refIfColumn(users, "u", "avatar_url")}) AS avatar_url,
+        ${selectIfColumn(users, "u", "rejection_reason", nullableText, "rejection_reason")},
+        ${selectIfColumn(users, "u", "special_id", nullableText, "special_id")},
+        ${selectIfColumn(users, "u", "team_code", nullableText, "team_code")},
+        ${selectIfColumn(users, "u", "linked_agency_id", nullableUuid, "linked_agency_id")},
+        ${selectIfColumn(users, "u", "is_solo_agent", nullableBool, "is_solo_agent")},
+        ${selectIfColumn(users, "u", "phone_verified", nullableBool, "phone_verified")},
 
-        COALESCE(p.full_name, u.name) AS full_name,
-        COALESCE(p.username, u.username) AS username,
-        COALESCE(p.phone, u.phone) AS phone,
-        COALESCE(p.gender, u.gender) AS gender,
-        COALESCE(p.country, u.country) AS country,
-        COALESCE(p.city, u.city) AS city,
-        COALESCE(p.bio, u.bio) AS bio,
-        p.social_links,
-        p.preferred_location,
-        p.budget_min,
-        p.budget_max,
-        p.property_type_preference,
-        p.move_in_date,
-        p.created_at AS profile_created_at,
-        p.updated_at AS profile_updated_at
+        COALESCE(${refIfColumn(profiles, "p", "full_name")}, ${refIfColumn(users, "u", "name")}) AS full_name,
+        COALESCE(${refIfColumn(profiles, "p", "username")}, ${refIfColumn(users, "u", "username")}) AS username,
+        COALESCE(${refIfColumn(profiles, "p", "phone")}, ${refIfColumn(users, "u", "phone")}) AS phone,
+        COALESCE(${refIfColumn(profiles, "p", "gender")}, ${refIfColumn(users, "u", "gender")}) AS gender,
+        COALESCE(${refIfColumn(profiles, "p", "country")}, ${refIfColumn(users, "u", "country")}) AS country,
+        COALESCE(${refIfColumn(profiles, "p", "city")}, ${refIfColumn(users, "u", "city")}) AS city,
+        COALESCE(${refIfColumn(profiles, "p", "bio")}, ${refIfColumn(users, "u", "bio")}) AS bio,
+        ${selectIfColumn(profiles, "p", "social_links", "'{}'::jsonb", "social_links")},
+        ${selectIfColumn(profiles, "p", "preferred_location", nullableText, "preferred_location")},
+        ${selectIfColumn(profiles, "p", "budget_min", nullableText, "budget_min")},
+        ${selectIfColumn(profiles, "p", "budget_max", nullableText, "budget_max")},
+        ${selectIfColumn(profiles, "p", "property_type_preference", nullableText, "property_type_preference")},
+        ${selectIfColumn(profiles, "p", "move_in_date", nullableDate, "move_in_date")},
+        ${selectIfColumn(profiles, "p", "created_at", nullableDate, "profile_created_at")},
+        ${selectIfColumn(profiles, "p", "updated_at", nullableDate, "profile_updated_at")}
 
       FROM users u
       LEFT JOIN profiles p
@@ -330,29 +1157,31 @@ export const getProfile = async (req, res) => {
 
     let roleData = {};
 
-    if (role === "brokerage") {
-      const result = await pool.query(
+    if (role === "brokerage" && brokerageProfiles.has("unique_id")) {
+      const result = await client.query(
         `
         SELECT
-          unique_id,
-          company_name,
-          company_name AS agency_name,
-          company_name AS brokerage_name,
-          brokerage_address,
-          registration_number,
-          team_code,
-          linked_agency_id,
-          is_solo_agent,
-          verified_badge,
-          subscription_plan,
-          billing_status,
-          listing_limit,
-          agent_limit,
-          live_access,
-          created_at,
-          updated_at
-        FROM brokerage_profiles
-        WHERE unique_id::text = $1::text
+          bp.unique_id,
+          ${selectIfColumn(brokerageProfiles, "bp", "company_name", nullableText, "company_name")},
+          ${selectIfColumn(brokerageProfiles, "bp", "company_name", nullableText, "agency_name")},
+          ${selectIfColumn(brokerageProfiles, "bp", "company_name", nullableText, "brokerage_name")},
+          ${selectIfColumn(brokerageProfiles, "bp", "brokerage_address", nullableText, "brokerage_address")},
+          ${selectIfColumn(brokerageProfiles, "bp", "registration_number", nullableText, "registration_number")},
+          ${selectIfColumn(brokerageProfiles, "bp", "team_code", nullableText, "team_code")},
+          ${selectIfColumn(users, "u", "linked_agency_id", nullableUuid, "linked_agency_id")},
+          ${selectIfColumn(users, "u", "is_solo_agent", nullableBool, "is_solo_agent")},
+          ${selectIfColumn(brokerageProfiles, "bp", "verified_badge", nullableBool, "verified_badge")},
+          ${selectIfColumn(brokerageProfiles, "bp", "subscription_plan", nullableText, "subscription_plan")},
+          ${selectIfColumn(brokerageProfiles, "bp", "billing_status", nullableText, "billing_status")},
+          ${selectIfColumn(brokerageProfiles, "bp", "listing_limit", nullableInt, "listing_limit")},
+          ${selectIfColumn(brokerageProfiles, "bp", "agent_limit", nullableInt, "agent_limit")},
+          ${selectIfColumn(brokerageProfiles, "bp", "live_access", nullableBool, "live_access")},
+          ${selectIfColumn(brokerageProfiles, "bp", "created_at", nullableDate, "created_at")},
+          ${selectIfColumn(brokerageProfiles, "bp", "updated_at", nullableDate, "updated_at")}
+        FROM brokerage_profiles bp
+        LEFT JOIN users u
+          ON u.unique_id::text = bp.unique_id::text
+        WHERE bp.unique_id::text = $1::text
         LIMIT 1
         `,
         [unique_id],
@@ -361,27 +1190,33 @@ export const getProfile = async (req, res) => {
       roleData = result.rows[0] || {};
     }
 
-    if (role === "agent") {
-      const result = await pool.query(
+    if (role === "agent" && agentProfiles.has("unique_id")) {
+      const brokerageJoin =
+        brokerageProfiles.has("unique_id") && agentProfiles.has("linked_agency_id")
+          ? `LEFT JOIN brokerage_profiles bp
+          ON bp.unique_id::text = ap.linked_agency_id::text`
+          : "";
+      const brokerageColumnsForAgent = brokerageJoin ? brokerageProfiles : new Set();
+
+      const result = await client.query(
         `
         SELECT
           ap.unique_id,
-          ap.license_number,
-          ap.experience_years,
-          ap.team_code,
-          ap.linked_agency_id,
-          ap.is_solo_agent,
-          ap.created_at,
-          ap.updated_at,
+          ${selectIfColumn(agentProfiles, "ap", "license_number", nullableText, "license_number")},
+          ${selectIfColumn(agentProfiles, "ap", "experience_years", nullableInt, "experience_years")},
+          ${selectIfColumn(agentProfiles, "ap", "team_code", nullableText, "team_code")},
+          ${selectIfColumn(agentProfiles, "ap", "linked_agency_id", nullableUuid, "linked_agency_id")},
+          ${selectIfColumn(agentProfiles, "ap", "is_solo_agent", nullableBool, "is_solo_agent")},
+          ${selectIfColumn(agentProfiles, "ap", "created_at", nullableDate, "created_at")},
+          ${selectIfColumn(agentProfiles, "ap", "updated_at", nullableDate, "updated_at")},
 
-          bp.company_name AS brokerage_name,
-          bp.company_name AS agency_name,
-          bp.team_code AS brokerage_team_code,
-          bp.verified_badge AS brokerage_verified_badge
+          ${selectIfColumn(brokerageColumnsForAgent, "bp", "company_name", nullableText, "brokerage_name")},
+          ${selectIfColumn(brokerageColumnsForAgent, "bp", "company_name", nullableText, "agency_name")},
+          ${selectIfColumn(brokerageColumnsForAgent, "bp", "team_code", nullableText, "brokerage_team_code")},
+          ${selectIfColumn(brokerageColumnsForAgent, "bp", "verified_badge", nullableBool, "brokerage_verified_badge")}
 
         FROM agent_profiles ap
-        LEFT JOIN brokerage_profiles bp
-          ON bp.unique_id::text = ap.linked_agency_id::text
+        ${brokerageJoin}
         WHERE ap.unique_id::text = $1::text
         LIMIT 1
         `,
@@ -391,8 +1226,8 @@ export const getProfile = async (req, res) => {
       roleData = result.rows[0] || {};
     }
 
-    if (role === "owner") {
-      const result = await pool.query(
+    if (role === "owner" && ownerProfiles.has("unique_id")) {
+      const result = await client.query(
         `
         SELECT *
         FROM owner_profiles
@@ -414,6 +1249,8 @@ export const getProfile = async (req, res) => {
       message: "Failed to fetch profile.",
       details: err.message,
     });
+  } finally {
+    client.release();
   }
 };
 
@@ -764,155 +1601,7 @@ export const updateProfileAvatar = async (req, res) => {
 // =====================================================
 
 export const getPublicProfile = async (req, res) => {
-  try {
-    let { username } = req.params;
-    username = String(username || "").trim();
-
-    if (!username) {
-      return res.status(400).json({
-        success: false,
-        message: "Profile identifier is required.",
-      });
-    }
-
-    if (username.startsWith("@")) {
-      username = username.slice(1);
-    }
-
-    const isUuid =
-      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        username,
-      );
-
-    const profileRes = await pool.query(
-      `
-      SELECT
-        u.unique_id,
-        u.email,
-        u.name,
-        u.role,
-        u.avatar_url,
-        u.verification_status,
-        u.is_verified,
-        u.special_id,
-
-        COALESCE(p.full_name, u.name) AS full_name,
-        COALESCE(p.username, u.username) AS username,
-        COALESCE(p.phone, u.phone) AS phone,
-        COALESCE(p.country, u.country) AS country,
-        COALESCE(p.city, u.city) AS city,
-        COALESCE(p.bio, u.bio) AS bio,
-        p.social_links
-
-      FROM users u
-      LEFT JOIN profiles p
-        ON p.unique_id::text = u.unique_id::text
-      WHERE ${
-        isUuid
-          ? "u.unique_id::text = $1::text"
-          : "(LOWER(p.username) = LOWER($1) OR LOWER(u.username) = LOWER($1))"
-      }
-      LIMIT 1
-      `,
-      [username],
-    );
-
-    if (!profileRes.rows.length) {
-      return res.status(404).json({
-        success: false,
-        message: "Profile not found.",
-      });
-    }
-
-    const base = profileRes.rows[0];
-    const role = normalizeRole(base.role);
-
-    let roleData = {};
-
-    if (role === "agent") {
-      const result = await pool.query(
-        `
-        SELECT
-          ap.unique_id,
-          ap.experience_years,
-          ap.linked_agency_id,
-          ap.is_solo_agent,
-
-          bp.company_name AS brokerage_name,
-          bp.company_name AS agency_name,
-          bp.verified_badge AS brokerage_verified_badge
-
-        FROM agent_profiles ap
-        LEFT JOIN brokerage_profiles bp
-          ON bp.unique_id::text = ap.linked_agency_id::text
-        WHERE ap.unique_id::text = $1::text
-        LIMIT 1
-        `,
-        [base.unique_id],
-      );
-
-      roleData = result.rows[0] || {};
-    }
-
-    if (role === "brokerage") {
-      const result = await pool.query(
-        `
-        SELECT
-          unique_id,
-          company_name,
-          company_name AS agency_name,
-          company_name AS brokerage_name,
-          brokerage_address,
-          verified_badge,
-          live_access
-        FROM brokerage_profiles
-        WHERE unique_id::text = $1::text
-        LIMIT 1
-        `,
-        [base.unique_id],
-      );
-
-      roleData = result.rows[0] || {};
-    }
-
-    const normalized = normalizeProfileResponse(base, roleData);
-
-    return res.json({
-      success: true,
-      profile: {
-        unique_id: normalized.unique_id,
-        full_name: normalized.full_name,
-        username: normalized.username,
-        avatar_url: normalized.avatar_url,
-        bio: normalized.bio,
-        country: normalized.country,
-        city: normalized.city,
-        role: normalized.role,
-        verification_status: normalized.verification_status,
-        is_verified: normalized.is_verified,
-
-        agency_name: normalized.agency_name || "",
-        brokerage_name: normalized.brokerage_name || "",
-        experience_years: normalized.experience_years || null,
-        experience: normalized.experience || null,
-
-        social_links: normalized.social_links,
-        social_instagram: normalized.social_instagram,
-        social_facebook: normalized.social_facebook,
-        social_linkedin: normalized.social_linkedin,
-        social_twitter: normalized.social_twitter,
-        social_tiktok: normalized.social_tiktok,
-      },
-    });
-  } catch (err) {
-    console.error("[GetPublicProfile] Error:", err);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch public profile.",
-      details: err.message,
-    });
-  }
+  return sendPublicProfilePayload(req, res);
 };
 
 // =====================================================
@@ -923,166 +1612,21 @@ export const getPublicProfile = async (req, res) => {
 // =====================================================
 
 export const getPublicAgentProfile = async (req, res) => {
-  try {
-    let { unique_id } = req.params;
-    unique_id = String(unique_id || "").trim();
+  return sendPublicProfilePayload(req, res);
+};
 
-    if (!unique_id) {
-      return res.status(400).json({
-        success: false,
-        message: "Agent identifier is required.",
-      });
-    }
+export const getSocialOwnerProfile = async (req, res) => {
+  return sendPublicProfilePayload(req, res, { expectedRole: "owner" });
+};
 
-    if (unique_id.startsWith("@")) {
-      unique_id = unique_id.slice(1);
-    }
+export const getSocialAgentProfile = async (req, res) => {
+  return sendPublicProfilePayload(req, res, { expectedRole: "agent" });
+};
 
-    const isUuid =
-      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        unique_id,
-      );
+export const getSocialBrokerageProfile = async (req, res) => {
+  return sendPublicProfilePayload(req, res, { expectedRole: "brokerage" });
+};
 
-    const profileRes = await pool.query(
-      `
-      SELECT
-        u.unique_id,
-        u.email,
-        u.name,
-        u.role,
-        u.avatar_url,
-        u.verification_status,
-        u.is_verified,
-        u.special_id,
-
-        COALESCE(p.full_name, u.name) AS full_name,
-        COALESCE(p.username, u.username) AS username,
-        COALESCE(p.phone, u.phone) AS phone,
-        COALESCE(p.country, u.country) AS country,
-        COALESCE(p.city, u.city) AS city,
-        COALESCE(p.bio, u.bio) AS bio,
-        p.social_links
-
-      FROM users u
-      LEFT JOIN profiles p
-        ON p.unique_id::text = u.unique_id::text
-      WHERE ${
-        isUuid
-          ? "u.unique_id::text = $1::text"
-          : "(LOWER(p.username) = LOWER($1) OR LOWER(u.username) = LOWER($1) OR LOWER(u.name) = LOWER($1))"
-      }
-        AND LOWER(u.role::text) IN ('agent', 'brokerage_owner', 'brokerage', 'owner')
-      LIMIT 1
-      `,
-      [unique_id],
-    );
-
-    if (!profileRes.rows.length) {
-      return res.status(404).json({
-        success: false,
-        message: "Agent profile not found.",
-      });
-    }
-
-    const base = profileRes.rows[0];
-    const role = normalizeRole(base.role);
-
-    let roleData = {};
-
-    if (role === "agent") {
-      const result = await pool.query(
-        `
-        SELECT
-          ap.unique_id,
-          ap.experience_years,
-          ap.linked_agency_id,
-          ap.is_solo_agent,
-
-          bp.company_name AS brokerage_name,
-          bp.company_name AS agency_name,
-          bp.verified_badge AS brokerage_verified_badge
-
-        FROM agent_profiles ap
-        LEFT JOIN brokerage_profiles bp
-          ON bp.unique_id::text = ap.linked_agency_id::text
-        WHERE ap.unique_id::text = $1::text
-        LIMIT 1
-        `,
-        [base.unique_id],
-      );
-
-      roleData = result.rows[0] || {};
-    }
-
-    if (role === "brokerage") {
-      const result = await pool.query(
-        `
-        SELECT
-          unique_id,
-          company_name,
-          company_name AS agency_name,
-          company_name AS brokerage_name,
-          brokerage_address,
-          verified_badge,
-          live_access
-        FROM brokerage_profiles
-        WHERE unique_id::text = $1::text
-        LIMIT 1
-        `,
-        [base.unique_id],
-      );
-
-      roleData = result.rows[0] || {};
-    }
-
-    const normalized = normalizeProfileResponse(base, roleData);
-
-    const listingsRes = await pool.query(
-      `
-      SELECT *
-      FROM listings
-      WHERE uploaded_by_id::text = $1::text
-        AND status = 'approved'
-        AND is_active = true
-      ORDER BY created_at DESC
-      LIMIT 24
-      `,
-      [base.unique_id],
-    );
-
-    return res.json({
-      success: true,
-      agent: {
-        unique_id: normalized.unique_id,
-        full_name: normalized.full_name,
-        name: normalized.full_name,
-        username: normalized.username,
-        avatar_url: normalized.avatar_url,
-        bio: normalized.bio,
-        country: normalized.country,
-        city: normalized.city,
-        email: normalized.email,
-        phone: normalized.phone,
-        role: normalized.role,
-        verification_status: normalized.verification_status,
-        is_verified: normalized.is_verified,
-
-        agency_name: normalized.agency_name || "",
-        brokerage_name: normalized.brokerage_name || "",
-        experience_years: normalized.experience_years || null,
-        experience: normalized.experience || null,
-
-        social_links: normalized.social_links,
-      },
-      listings: listingsRes.rows,
-    });
-  } catch (err) {
-    console.error("[GetPublicAgentProfile] Error:", err);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch public agent profile.",
-      details: err.message,
-    });
-  }
+export const getSocialAgencyAgentProfile = async (req, res) => {
+  return sendPublicProfilePayload(req, res, { expectedRole: "agency-agent" });
 };

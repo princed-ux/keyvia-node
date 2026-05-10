@@ -1,5 +1,7 @@
 // controllers/onboardingController.js
 import { pool } from "../db.js";
+import { createNotification } from "./notificationsController.js";
+import { sendVerificationSubmittedEmail } from "../utils/emailService.js";
 
 /**
  * GET user's onboarding status
@@ -135,7 +137,16 @@ export const submitOnboarding = async (req, res) => {
 
       // Create notification for admin
       const userResult = await client.query(
-        `SELECT email, full_name, role FROM users WHERE id = $1`,
+        `
+        SELECT
+          id,
+          unique_id,
+          email,
+          COALESCE(name, email) AS full_name,
+          role
+        FROM users
+        WHERE id = $1
+        `,
         [userId],
       );
 
@@ -146,11 +157,38 @@ export const submitOnboarding = async (req, res) => {
         // Create notification for all super admins
         await client.query(
           `INSERT INTO notifications (recipient_id, type, title, message, related_resource_type, related_resource_id, action_url)
-           SELECT id, 'account_approval', 'New Verification Request', $1, 'user', $2, '/admin/approvals'
+           SELECT unique_id, 'account_approval', 'New Verification Request', $1, 'user', $2, '/admin/approvals'
            FROM users
            WHERE is_super_admin = true`,
-          [notifMessage, userId],
+          [notifMessage, user.unique_id],
         );
+
+        await createNotification({
+          client,
+          io: req.io,
+          recipientId: user.unique_id,
+          type: "verification_submitted",
+          title: "Verification submitted",
+          message:
+            "Your account verification is under review. We will notify you once it is approved or if anything needs attention.",
+          entityType: "user",
+          entityId: user.unique_id,
+          actionUrl: "/dashboard",
+          actionLabel: "Open Dashboard",
+        }).catch((notificationErr) => {
+          console.warn(
+            "[SubmitOnboarding] Review notification skipped:",
+            notificationErr?.message,
+          );
+        });
+
+        sendVerificationSubmittedEmail({
+          email: user.email,
+          name: user.full_name,
+          role: user.role,
+        }).catch((emailErr) => {
+          console.warn("[SubmitOnboarding] Review email skipped:", emailErr?.message);
+        });
       }
 
       await client.query("COMMIT");

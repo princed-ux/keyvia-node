@@ -6,6 +6,20 @@ import { pool } from "../db.js";
  */
 const normalizeRole = (role) => String(role || "").trim().toLowerCase();
 
+const isConnectionIssue = (err = {}) => {
+  const code = String(err.code || "").toUpperCase();
+  const message = String(err.message || "").toLowerCase();
+
+  return (
+    ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EPIPE"].includes(code) ||
+    message.includes("connection terminated") ||
+    message.includes("connection timeout") ||
+    message.includes("connection timed out") ||
+    message.includes("query timeout") ||
+    message.includes("statement timeout")
+  );
+};
+
 /**
  * Load authenticated user ONLY from users table.
  * This becomes the single source of truth for auth/session identity.
@@ -213,9 +227,16 @@ export const authenticateAndAttachUser = async (req, res, next) => {
     return next();
   } catch (err) {
     console.error("[AuthMiddleware] Unexpected error:", err);
-    return res.status(500).json({
-      message: "Unexpected server error",
-      code: "AUTH_MIDDLEWARE_ERROR",
+    const connectionIssue = isConnectionIssue(err);
+    return res.status(connectionIssue ? 503 : 500).json({
+      success: false,
+      message: connectionIssue
+        ? "Could not verify your session. Your connection may be slow or unstable. Please try again."
+        : "Could not verify your session. Please try again.",
+      code: connectionIssue
+        ? "SERVICE_TEMPORARILY_UNAVAILABLE"
+        : "AUTH_MIDDLEWARE_ERROR",
+      retryable: connectionIssue || undefined,
     });
   }
 };

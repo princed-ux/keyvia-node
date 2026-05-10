@@ -6,42 +6,91 @@ const router = express.Router();
 
 // ✅ 1. Toggle Favorite (Like/Unlike)
 router.post("/toggle", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { product_id } = req.body;
     const user_id = req.user.unique_id;
 
+    if (!product_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Listing product ID is required.",
+      });
+    }
+
+    await client.query("BEGIN");
+
     // Check if it already exists
-    const check = await pool.query(
+    const check = await client.query(
       "SELECT * FROM favorites WHERE user_id = $1 AND product_id = $2",
       [user_id, product_id],
     );
 
     if (check.rows.length > 0) {
       // It exists -> DELETE it (Unlike)
-      await pool.query(
+      await client.query(
         "DELETE FROM favorites WHERE user_id = $1 AND product_id = $2",
         [user_id, product_id],
       );
+
+      const countResult = await client.query(
+        `
+        UPDATE listings
+        SET saves_count = GREATEST(COALESCE(saves_count, 0) - 1, 0)
+        WHERE product_id = $1
+        RETURNING saves_count
+        `,
+        [product_id],
+      );
+
+      await client.query("COMMIT");
+
       return res.json({
+        success: true,
         is_favorited: false,
+        saves_count: countResult.rows[0]?.saves_count || 0,
         message: "Removed from saved homes",
       });
     } else {
       // It doesn't exist -> INSERT it (Like)
-      await pool.query(
+      await client.query(
         "INSERT INTO favorites (user_id, product_id) VALUES ($1, $2)",
         [user_id, product_id],
+      );
+
+      const countResult = await client.query(
+        `
+        UPDATE listings
+        SET saves_count = COALESCE(saves_count, 0) + 1
+        WHERE product_id = $1
+        RETURNING saves_count
+        `,
+        [product_id],
       );
 
       // OPTIONAL: Notify the Agent here using Socket.IO or Email
       // const listing = await pool.query("SELECT agent_unique_id FROM listings WHERE product_id = $1", [product_id]);
       // sendNotification(listing.rows[0].agent_unique_id, "Someone liked your home!");
 
-      return res.json({ is_favorited: true, message: "Added to saved homes" });
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        is_favorited: true,
+        saves_count: countResult.rows[0]?.saves_count || 0,
+        message: "Added to saved homes",
+      });
     }
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({
+      success: false,
+      message: "Could not update saved homes right now.",
+    });
+  } finally {
+    client.release();
   }
 });
 

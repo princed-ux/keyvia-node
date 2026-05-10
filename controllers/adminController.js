@@ -4,6 +4,7 @@ import {
   analyzeVerificationBulk,
 } from "../services/aiVerificationService.js";
 import { emitUserNotification } from "../services/socketEmitter.js";
+import { sendVerificationStatusEmail } from "../utils/emailService.js";
 
 // =========================================================
 // 1. GET PENDING IDENTITY VERIFICATIONS
@@ -18,13 +19,13 @@ export const getPendingProfiles = async (req, res) => {
         u.email,
         COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
         p.country,
-        p.city,
+        COALESCE(p.city, bp.brokerage_address) AS city,
         COALESCE(p.phone, u.phone) AS phone,
         LOWER(u.role::TEXT) AS role,
         u.license_number,
-        bp.company_name,
-        bp.brokerage_address,
-        bp.registration_number,
+        COALESCE(bp.company_name, u.brokerage_name, u.name) AS company_name,
+        COALESCE(bp.brokerage_address, u.brokerage_address) AS brokerage_address,
+        COALESCE(bp.registration_number, u.license_number) AS registration_number,
         ap.experience_years AS experience,
         u.special_id,
         p.bio,
@@ -36,11 +37,11 @@ export const getPendingProfiles = async (req, res) => {
         COALESCE(u.license_document_url, u.identity_document_url) AS document_url
       FROM users u
       LEFT JOIN profiles p
-        ON p.unique_id::uuid = u.unique_id
+        ON p.unique_id::text = u.unique_id::text
       LEFT JOIN brokerage_profiles bp
-        ON bp.unique_id = u.unique_id
+        ON bp.unique_id::text = u.unique_id::text
       LEFT JOIN agent_profiles ap
-        ON ap.unique_id = u.unique_id
+        ON ap.unique_id::text = u.unique_id::text
       WHERE u.verification_status = 'pending'
       ORDER BY u.created_at DESC
     `);
@@ -68,13 +69,13 @@ export const analyzeAgentProfile = async (req, res) => {
         u.email,
         COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
         p.country,
-        p.city,
+        COALESCE(p.city, bp.brokerage_address) AS city,
         COALESCE(p.phone, u.phone) AS phone,
         LOWER(u.role::TEXT) AS role,
         u.license_number,
-        bp.company_name,
-        bp.brokerage_address,
-        bp.registration_number,
+        COALESCE(bp.company_name, u.brokerage_name, u.name) AS company_name,
+        COALESCE(bp.brokerage_address, u.brokerage_address) AS brokerage_address,
+        COALESCE(bp.registration_number, u.license_number) AS registration_number,
         ap.experience_years AS experience,
         u.special_id,
         p.bio,
@@ -86,11 +87,11 @@ export const analyzeAgentProfile = async (req, res) => {
         COALESCE(u.license_document_url, u.identity_document_url) AS document_url
       FROM users u
       LEFT JOIN profiles p
-        ON p.unique_id::uuid = u.unique_id
+        ON p.unique_id::text = u.unique_id::text
       LEFT JOIN brokerage_profiles bp
-        ON bp.unique_id = u.unique_id
+        ON bp.unique_id::text = u.unique_id::text
       LEFT JOIN agent_profiles ap
-        ON ap.unique_id = u.unique_id
+        ON ap.unique_id::text = u.unique_id::text
       WHERE u.unique_id = $1
       LIMIT 1
       `,
@@ -125,13 +126,13 @@ export const analyzeAllPendingProfiles = async (req, res) => {
         u.email,
         COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
         p.country,
-        p.city,
+        COALESCE(p.city, bp.brokerage_address) AS city,
         COALESCE(p.phone, u.phone) AS phone,
         LOWER(u.role::TEXT) AS role,
         u.license_number,
-        bp.company_name,
-        bp.brokerage_address,
-        bp.registration_number,
+        COALESCE(bp.company_name, u.brokerage_name, u.name) AS company_name,
+        COALESCE(bp.brokerage_address, u.brokerage_address) AS brokerage_address,
+        COALESCE(bp.registration_number, u.license_number) AS registration_number,
         ap.experience_years AS experience,
         u.special_id,
         p.bio,
@@ -143,11 +144,11 @@ export const analyzeAllPendingProfiles = async (req, res) => {
         COALESCE(u.license_document_url, u.identity_document_url) AS document_url
       FROM users u
       LEFT JOIN profiles p
-        ON p.unique_id::uuid = u.unique_id
+        ON p.unique_id::text = u.unique_id::text
       LEFT JOIN brokerage_profiles bp
-        ON bp.unique_id = u.unique_id
+        ON bp.unique_id::text = u.unique_id::text
       LEFT JOIN agent_profiles ap
-        ON ap.unique_id = u.unique_id
+        ON ap.unique_id::text = u.unique_id::text
       WHERE u.verification_status = 'pending'
     `);
 
@@ -160,6 +161,9 @@ export const analyzeAllPendingProfiles = async (req, res) => {
 
     for (const report of reports) {
       const { unique_id, score, verdict, flags } = report;
+      const profile = profiles.find(
+        (item) => String(item.unique_id) === String(unique_id),
+      );
 
       let newStatus = "pending";
       let reason = null;
@@ -229,6 +233,18 @@ export const analyzeAllPendingProfiles = async (req, res) => {
         created_at: notifResult.rows[0].created_at,
         verification_status: newStatus,
         is_verified: newStatus === "verified",
+        rejection_reason: reason,
+        meta: { reason },
+      });
+
+      sendVerificationStatusEmail({
+        email: profile?.email,
+        name: profile?.full_name,
+        role: profile?.role || "account",
+        status: newStatus,
+        reason,
+      }).catch((emailErr) => {
+        console.warn("[Admin] Verification email skipped:", emailErr?.message);
       });
     }
 
@@ -262,7 +278,11 @@ export const updateProfileStatus = async (req, res) => {
 
     const profileCheck = await client.query(
       `
-      SELECT LOWER(role::TEXT) AS role
+      SELECT
+        unique_id,
+        email,
+        name,
+        LOWER(role::TEXT) AS role
       FROM users
       WHERE unique_id = $1
       LIMIT 1
@@ -274,7 +294,7 @@ export const updateProfileStatus = async (req, res) => {
       throw new Error("Profile not found");
     }
 
-    const { role } = profileCheck.rows[0];
+    const { role, email, name } = profileCheck.rows[0];
     const isVerified = status === "verified";
     const rejectionReason =
       status === "rejected"
@@ -328,6 +348,18 @@ export const updateProfileStatus = async (req, res) => {
       created_at: notifResult.rows[0].created_at,
       verification_status: status,
       is_verified: isVerified,
+      rejection_reason: rejectionReason,
+      meta: { reason: rejectionReason },
+    });
+
+    sendVerificationStatusEmail({
+      email,
+      name,
+      role,
+      status,
+      reason: rejectionReason,
+    }).catch((emailErr) => {
+      console.warn("[Admin] Verification email skipped:", emailErr?.message);
     });
 
     return res.json({

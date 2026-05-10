@@ -1,14 +1,29 @@
 import express from "express";
-// 👇 IMPORT THE MIDDLEWARE WE UPDATED
-import { authenticate } from "../middleware/authMiddleware.js"; 
-import { getNotifications, getGlobalCounts, markAsRead, deleteNotification, clearAllNotifications } from "../controllers/notificationsController.js";
+import { authenticate } from "../middleware/authMiddleware.js";
+import {
+  clearAllNotifications,
+  deleteNotification,
+  getGlobalCounts,
+  getNotifications,
+  getUnreadCount,
+  markAllNotificationsRead,
+  markAsRead,
+  markNotificationRead,
+} from "../controllers/notificationsController.js";
 
 const router = express.Router();
 
-// 👇 ENSURE 'authenticate' IS HERE
-router.get("/counts", authenticate, getGlobalCounts); 
+router.get("/counts", authenticate, getGlobalCounts);
+router.get("/unread-count", authenticate, getUnreadCount);
 router.get("/", authenticate, getNotifications);
+
 router.patch("/mark-read", authenticate, markAsRead);
+router.patch("/mark-all/read", authenticate, markAllNotificationsRead);
+router.patch("/:id/read", authenticate, markNotificationRead);
+
+router.put("/read-all", authenticate, markAllNotificationsRead);
+router.put("/:id/read", authenticate, markNotificationRead);
+
 router.delete("/:id", authenticate, deleteNotification);
 router.delete("/", authenticate, clearAllNotifications);
 

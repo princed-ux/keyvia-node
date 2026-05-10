@@ -28,6 +28,20 @@ export const validateListingInput = (req, res, next) => {
   const { title, description, price, bedrooms, bathrooms, property_type } =
     req.body;
 
+  const normalizeNumber = (value) => {
+    if (value === undefined || value === null || value === "") return value;
+    if (typeof value === "number") return value;
+    if (typeof value === "string" && value.trim() !== "") {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : value;
+    }
+    return value;
+  };
+
+  const normalizedPrice = normalizeNumber(price);
+  const normalizedBedrooms = normalizeNumber(bedrooms);
+  const normalizedBathrooms = normalizeNumber(bathrooms);
+
   // Title validation
   if (
     title &&
@@ -38,27 +52,37 @@ export const validateListingInput = (req, res, next) => {
 
   // Price validation
   if (
-    price &&
-    (typeof price !== "number" || price <= 0 || price > 1000000000)
+    normalizedPrice &&
+    (typeof normalizedPrice !== "number" ||
+      normalizedPrice <= 0 ||
+      normalizedPrice > 1000000000)
   ) {
     return res.status(400).json({ error: "Invalid price (max: 1B)" });
   }
 
   // Bedrooms validation
   if (
-    bedrooms &&
-    (typeof bedrooms !== "number" || bedrooms < 0 || bedrooms > 100)
+    normalizedBedrooms &&
+    (typeof normalizedBedrooms !== "number" ||
+      normalizedBedrooms < 0 ||
+      normalizedBedrooms > 100)
   ) {
     return res.status(400).json({ error: "Invalid bedrooms count" });
   }
 
   // Bathrooms validation
   if (
-    bathrooms &&
-    (typeof bathrooms !== "number" || bathrooms < 0 || bathrooms > 100)
+    normalizedBathrooms &&
+    (typeof normalizedBathrooms !== "number" ||
+      normalizedBathrooms < 0 ||
+      normalizedBathrooms > 100)
   ) {
     return res.status(400).json({ error: "Invalid bathrooms count" });
   }
+
+  if (price !== undefined) req.body.price = normalizedPrice;
+  if (bedrooms !== undefined) req.body.bedrooms = normalizedBedrooms;
+  if (bathrooms !== undefined) req.body.bathrooms = normalizedBathrooms;
 
   next();
 };

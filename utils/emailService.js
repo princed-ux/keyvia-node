@@ -105,3 +105,118 @@ export const sendEmailNotification = async (email, subject, message) => {
     return false;
   }
 };
+
+const getNotificationFromAddress = (displayName = "Keyvia Notifications") => {
+  const fromAddress =
+    process.env.NOTIFICATION_EMAIL_FROM ||
+    process.env.NOTIFY_EMAIL_FROM ||
+    process.env.ALERTS_EMAIL_FROM ||
+    EMAIL_USER;
+
+  return `"${displayName}" <${fromAddress}>`;
+};
+
+export const sendNotificationEmail = async ({
+  to,
+  subject,
+  title,
+  message,
+  actionUrl = null,
+  actionLabel = "Open Keyvia",
+  fromName = "Keyvia Notifications",
+} = {}) => {
+  if (!to || !subject || !message) return false;
+
+  try {
+    const safeActionUrl = actionUrl || CLIENT_URL || "https://getkeyvia.com";
+    const htmlContent = emailWrapper(
+      title || subject,
+      `<p class="text">${message}</p>
+       <a href="${safeActionUrl}" class="btn">${actionLabel}</a>`,
+    );
+
+    const info = await transporter.sendMail({
+      from: getNotificationFromAddress(fromName),
+      to,
+      subject,
+      text: message,
+      html: htmlContent,
+    });
+
+    console.log(`Keyvia notification email sent: ${info.messageId}`);
+    return true;
+  } catch (error) {
+    console.error("Keyvia notification email failed:", error.message);
+    return false;
+  }
+};
+
+export const sendWelcomeRoleEmail = async ({
+  email,
+  name,
+  role = "member",
+} = {}) => {
+  const displayName = name || "there";
+  const normalizedRole = String(role || "member")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+  return sendNotificationEmail({
+    to: email,
+    subject: "Welcome to Keyvia",
+    title: `Welcome to Keyvia, ${displayName}`,
+    fromName: "Keyvia",
+    message: `Your ${normalizedRole} workspace is ready. You can continue your setup, manage your profile, and start using the Keyvia tools built for your role.`,
+    actionUrl: `${CLIENT_URL || "https://getkeyvia.com"}/login`,
+    actionLabel: "Open Keyvia",
+  });
+};
+
+export const sendVerificationSubmittedEmail = async ({
+  email,
+  name,
+  role = "account",
+} = {}) => {
+  const displayName = name || "there";
+  const normalizedRole = String(role || "account")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+  return sendNotificationEmail({
+    to: email,
+    subject: "Your Keyvia verification is under review",
+    title: "Verification submitted",
+    fromName: "Keyvia",
+    message: `Hi ${displayName}, your ${normalizedRole} verification has been submitted. We are reviewing your account details and documents now. This can take a few minutes, and we will notify you once it is approved or if anything needs attention.`,
+    actionUrl: `${CLIENT_URL || "https://getkeyvia.com"}/login`,
+    actionLabel: "Open Keyvia",
+  });
+};
+
+export const sendVerificationStatusEmail = async ({
+  email,
+  name,
+  status,
+  reason = null,
+  role = "account",
+} = {}) => {
+  const normalizedStatus = String(status || "").toLowerCase();
+  const approved = normalizedStatus === "verified" || normalizedStatus === "approved";
+  const displayName = name || "there";
+  const subject = approved
+    ? "Your Keyvia verification was approved"
+    : "Your Keyvia verification needs attention";
+  const message = approved
+    ? `Hi ${displayName}, your ${role} verification has been approved. You can now access the approved account features available to your role.`
+    : `Hi ${displayName}, your ${role} verification was not approved yet.${reason ? ` Reason: ${reason}` : " Please review the reason in your dashboard and submit corrected details."}`;
+
+  return sendNotificationEmail({
+    to: email,
+    subject,
+    title: approved ? "Verification approved" : "Verification needs attention",
+    fromName: "Keyvia",
+    message,
+    actionUrl: `${CLIENT_URL || "https://getkeyvia.com"}/login`,
+    actionLabel: "Open Keyvia",
+  });
+};

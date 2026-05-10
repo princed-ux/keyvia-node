@@ -11,7 +11,10 @@ import {
 import {
   goLive,
   endLive,
+  getLiveNowTours,
   getLiveTour,
+  getMyActiveTours,
+  reportLiveTour,
   purchaseAccess,
 } from "../controllers/ivsController.js";
 
@@ -30,14 +33,32 @@ router.post("/go-live", authenticateToken, goLive);
 router.post("/end-live/:tour_id", authenticateToken, endLive);
 
 /**
+ * GET /api/ivs/my-active
+ * Host restores active live rooms in studio
+ */
+router.get("/my-active", authenticateToken, getMyActiveTours);
+
+/**
+ * GET /api/ivs/live-now
+ * Safe discovery list for buyers and other roles
+ */
+router.get("/live-now", optionalAuth, getLiveNowTours);
+
+/**
  * GET /api/ivs/tour/:tour_id
  * Get tour details and check viewer access
  */
 router.get("/tour/:tour_id", optionalAuth, getLiveTour);
 
 /**
+ * POST /api/ivs/tour/:tour_id/report
+ * User/public safety report for suspicious live tours
+ */
+router.post("/tour/:tour_id/report", optionalAuth, reportLiveTour);
+
+/**
  * POST /api/ivs/purchase-access/:tour_id
- * Viewer pays coins to watch tour
+ * Disabled until live-tour payments pass compliance review
  */
 router.post("/purchase-access/:tour_id", authenticateToken, purchaseAccess);
 

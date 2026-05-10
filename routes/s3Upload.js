@@ -101,6 +101,21 @@ const buildPublicFileUrl = (key) => {
   return `${MEDIA_CDN_URL.replace(/\/$/, "")}/${key}`;
 };
 
+
+const buildPrivateStorageUrl = (key) => {
+  return `s3://${S3_BUCKET}/${key}`;
+};
+
+const getStoredFileUrl = (key, privateFile) => {
+  return privateFile ? buildPrivateStorageUrl(key) : buildPublicFileUrl(key);
+};
+
+const getResponseFileUrl = (storedFileUrl, privateFile) => {
+  return privateFile ? null : storedFileUrl;
+};
+
+
+
 const getFolder = (resourceType) => {
   if (resourceType === "listing") return "listings";
   if (resourceType === "profile") return "profiles";
@@ -165,7 +180,7 @@ const insertUploadRecord = async ({
     draftListingId ||
     normalizeProductIdOrNull(resourceId);
 
-  await pool.query(
+  const result = await pool.query(
     `
     INSERT INTO s3_uploads (
       uploader_id,
@@ -193,6 +208,7 @@ const insertUploadRecord = async ({
       $10::uuid,
       $11
     )
+    RETURNING id, s3_url, s3_key, visibility
     `,
     [
       userId,
@@ -208,6 +224,8 @@ const insertUploadRecord = async ({
       visibility,
     ],
   );
+
+  return result.rows[0];
 };
 
 router.post("/generate-presigned-url", async (req, res) => {
@@ -284,32 +302,39 @@ router.post("/generate-presigned-url", async (req, res) => {
       expiresIn: 900,
     });
 
-    const fileUrl = privateFile ? null : buildPublicFileUrl(s3Key);
+    const storedFileUrl = getStoredFileUrl(s3Key, privateFile);
+const responseFileUrl = getResponseFileUrl(storedFileUrl, privateFile);
 
-    await insertUploadRecord({
-      userId,
-      s3Key,
-      fileUrl,
-      fileName: file_name,
-      fileType: file_type,
-      resourceType: resource_type,
-      resourceId: resource_id,
-      productId: product_id,
-      draftListingId: draft_listing_id,
-      listingUuid: listing_uuid,
-      visibility,
-    });
+const uploadRecord = await insertUploadRecord({
+  userId,
+  s3Key,
+  fileUrl: storedFileUrl,
+  fileName: file_name,
+  fileType: file_type,
+  resourceType: resource_type,
+  resourceId: resource_id,
+  productId: product_id,
+  draftListingId: draft_listing_id,
+  listingUuid: listing_uuid,
+  visibility,
+});
 
-    return res.json({
-      presigned_url: presignedUrl,
-      s3_key: s3Key,
-      s3_url: fileUrl,
-      upload_id: uuidv4(),
-      expires_in: 900,
-      bucket: S3_BUCKET,
-      visibility,
-      cdn_enabled: Boolean(MEDIA_CDN_URL),
-    });
+return res.json({
+  success: true,
+  presigned_url: presignedUrl,
+  s3_key: s3Key,
+
+  // Public files get CDN/public URL. Private files return null.
+  s3_url: responseFileUrl,
+
+  // This is now the real DB upload row ID.
+  upload_id: uploadRecord.id,
+
+  expires_in: 900,
+  bucket: S3_BUCKET,
+  visibility,
+  cdn_enabled: Boolean(MEDIA_CDN_URL),
+});
   } catch (error) {
     console.error("S3 Presigned URL Error:", error);
     return res.status(500).json({

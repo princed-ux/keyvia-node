@@ -7,6 +7,13 @@ import { performFullAnalysis } from "../services/analysisService.js";
 import { COUNTRY_ISO_MAP } from "../utils/countryMap.js";
 import { evaluateListingRisk } from "../services/listingRiskService.js";
 import { enforceListingLimit } from "../services/subscriptionService.js";
+import { resolvePublicProfilePayload } from "./profileController.js";
+import {
+  createNotification,
+  notifyListingAssigned,
+  notifyListingStatusUpdate,
+  notifyListingSubmitted,
+} from "./notificationsController.js";
 
 /* ----------------- helpers ----------------- */
 async function generateUniqueProductId() {
@@ -105,6 +112,340 @@ const normalizePhotosForResponse = (photosValue) => {
     url: photo.url || photo,
     type: photo.type || "image",
   }));
+};
+
+const NEW_LISTING_DAYS = Number(process.env.NEW_LISTING_DAYS || 14);
+
+const isFutureDate = (value) => {
+  if (!value) return false;
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+
+  return date.getTime() > Date.now();
+};
+
+const getListingReferenceDate = (listing = {}) =>
+  listing.published_at ||
+  listing.listed_at ||
+  listing.activated_at ||
+  listing.created_at ||
+  null;
+
+const getListingAgeDays = (listing = {}) => {
+  const referenceDate = getListingReferenceDate(listing);
+  if (!referenceDate) return null;
+
+  const date = new Date(referenceDate);
+  if (Number.isNaN(date.getTime())) return null;
+
+  return Math.max(
+    0,
+    Math.floor((Date.now() - date.getTime()) / (1000 * 60 * 60 * 24)),
+  );
+};
+
+const getListingTypeLabel = (listingType) => {
+  const type = String(listingType || "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+
+  if (["sale", "buy", "for_sale", "for sale"].includes(type)) {
+    return "For Sale";
+  }
+
+  if (["rent", "rental", "for_rent", "for rent"].includes(type)) {
+    return "For Rent";
+  }
+
+  if (["lease", "long_lease", "commercial_lease", "long lease"].includes(type)) {
+    return "For Lease";
+  }
+
+  if (
+    [
+      "shortlet",
+      "short_let",
+      "short let",
+      "short stay",
+      "short_let_stay",
+    ].includes(type)
+  ) {
+    return "Short Let";
+  }
+
+  return listingType
+    ? String(listingType)
+        .replace(/[_-]+/g, " ")
+        .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    : "Listing";
+};
+
+const isPriceDropListing = (listing = {}) => {
+  const currentPrice = Number(listing.price || 0);
+  const referencePrice = Number(
+    listing.previous_price ||
+      listing.original_price ||
+      listing.old_price ||
+      listing.price_before_discount ||
+      0,
+  );
+
+  return (
+    listing.is_price_drop === true ||
+    listing.price_drop === true ||
+    Boolean(listing.price_drop_amount || listing.price_cut) ||
+    (currentPrice > 0 && referencePrice > currentPrice)
+  );
+};
+
+const computeListingBadges = (
+  listing = {},
+  { photos = [], floorPlans = [], stagingPhotos = [], panoramaPhotos = [] } = {},
+) => {
+  const listingAgeDays = getListingAgeDays(listing);
+  const listingTypeLabel = getListingTypeLabel(
+    listing.listing_type || listing.transaction_type || listing.category,
+  );
+
+  const isNew =
+    listingAgeDays !== null &&
+    listingAgeDays >= 0 &&
+    listingAgeDays <= NEW_LISTING_DAYS;
+
+  const hasFeaturedExpiry = Boolean(listing.featured_until);
+  const hasShowcaseExpiry = Boolean(listing.showcase_until);
+
+  const isFeatured = hasFeaturedExpiry
+    ? isFutureDate(listing.featured_until)
+    : listing.is_featured === true ||
+      listing.featured === true ||
+      listing.featured_listing === true ||
+      listing.featured_status === "active";
+
+  const isShowcase = hasShowcaseExpiry
+    ? isFutureDate(listing.showcase_until)
+    : listing.is_showcase === true ||
+      listing.showcase === true ||
+      listing.showcase_enabled === true ||
+      listing.showcase_status === "active";
+
+  const isLive =
+    listing.is_live === true ||
+    listing.live_now === true ||
+    listing.live_tour_live === true ||
+    String(listing.live_tour_status || "").toLowerCase() === "live";
+
+  const isPriceDrop = isPriceDropListing(listing);
+
+  const badgeLabels = [];
+  if (isShowcase) badgeLabels.push("Showcase");
+  if (isFeatured) badgeLabels.push("Featured");
+  if (isNew) badgeLabels.push("New");
+  if (listing.title_verified === true) badgeLabels.push("Verified");
+  if (isPriceDrop) badgeLabels.push("Price Drop");
+  if (isLive) badgeLabels.push("Live Tour");
+  if (listing.three_d_home_url) badgeLabels.push("3D Tour");
+  if (listing.virtual_tour_url || listing.virtual_tour_file) {
+    badgeLabels.push("Virtual Tour");
+  }
+  if (Array.isArray(floorPlans) && floorPlans.length > 0) {
+    badgeLabels.push("Floor Plan");
+  }
+  if (Array.isArray(stagingPhotos) && stagingPhotos.length > 0) {
+    badgeLabels.push("Virtual Staging");
+  }
+  if (
+    (Array.isArray(photos) && photos.length >= 5) ||
+    (Array.isArray(panoramaPhotos) && panoramaPhotos.length > 0)
+  ) {
+    badgeLabels.push("Photo Tour");
+  }
+
+  return {
+    is_new: isNew,
+    is_featured: isFeatured,
+    is_showcase: isShowcase,
+    is_price_drop: isPriceDrop,
+    is_live: isLive,
+    listing_age_days: listingAgeDays,
+    listing_type_label: listingTypeLabel,
+    badge_labels: [...new Set(badgeLabels)],
+  };
+};
+
+const hashAnalyticsValue = (value) =>
+  crypto
+    .createHash("sha256")
+    .update(String(value || "unknown"))
+    .digest("hex");
+
+const getRequestIp = (req) => {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+
+  return req.ip || req.socket?.remoteAddress || "unknown";
+};
+
+const recordListingView = async ({ req, productId, viewerId }) => {
+  if (!productId) return { counted: false, viewsCount: null };
+
+  try {
+    const viewerHash = hashAnalyticsValue(getRequestIp(req));
+    const userAgentHash = hashAnalyticsValue(req.headers["user-agent"] || "");
+
+    const insertResult = await pool.query(
+      `
+      INSERT INTO listing_view_events (
+        product_id,
+        viewer_id,
+        viewer_hash,
+        user_agent_hash,
+        viewed_on,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, CURRENT_DATE, NOW())
+      ON CONFLICT DO NOTHING
+      RETURNING id
+      `,
+      [productId, viewerId ? String(viewerId) : null, viewerHash, userAgentHash],
+    );
+
+    if (!insertResult.rowCount) {
+      return { counted: false, viewsCount: null };
+    }
+
+    const updateResult = await pool.query(
+      `
+      UPDATE listings
+      SET views_count = COALESCE(views_count, 0) + 1,
+          updated_at = COALESCE(updated_at, NOW())
+      WHERE product_id = $1
+      RETURNING views_count
+      `,
+      [productId],
+    );
+
+    return {
+      counted: true,
+      viewsCount: updateResult.rows[0]?.views_count ?? null,
+    };
+  } catch (err) {
+    console.warn("[Listings] View analytics skipped:", err?.message);
+    return { counted: false, viewsCount: null };
+  }
+};
+
+const buildListingAnalytics = (listing = {}, badgeMeta = {}) => {
+  const views = Number(listing.views_count || 0);
+  const saves = Number(listing.saves_count || listing.saved_count || 0);
+  const shares = Number(listing.shares_count || 0);
+  const contacts = Number(listing.contact_count || 0);
+  const tours = Number(listing.tour_request_count || 0);
+  const currentPrice = Number(listing.price || 0);
+  const previousPrice = Number(
+    listing.previous_price ||
+      listing.original_price ||
+      listing.old_price ||
+      listing.price_before_discount ||
+      0,
+  );
+  const computedDrop =
+    previousPrice > currentPrice && currentPrice > 0
+      ? previousPrice - currentPrice
+      : Number(listing.price_drop_amount || listing.price_cut || 0);
+  const priceDropPercent =
+    previousPrice > currentPrice && previousPrice > 0
+      ? Number((((previousPrice - currentPrice) / previousPrice) * 100).toFixed(1))
+      : Number(listing.price_drop_percent || 0);
+  const daysOnMarket =
+    badgeMeta.listing_age_days !== null && badgeMeta.listing_age_days !== undefined
+      ? Math.max(0, Number(badgeMeta.listing_age_days))
+      : Number(listing.days_on_market || 0);
+
+  return {
+    views_count: views,
+    saves_count: saves,
+    shares_count: shares,
+    contact_count: contacts,
+    tour_request_count: tours,
+    engagement_total: views + saves + shares + contacts + tours,
+    views_per_day:
+      daysOnMarket > 0 ? Number((views / daysOnMarket).toFixed(1)) : views,
+    save_rate:
+      views > 0 ? Number(((saves / views) * 100).toFixed(1)) : 0,
+    contact_rate:
+      views > 0 ? Number(((contacts / views) * 100).toFixed(1)) : 0,
+    previous_price: previousPrice || null,
+    price_drop_amount: computedDrop > 0 ? computedDrop : 0,
+    price_drop_percent: priceDropPercent > 0 ? priceDropPercent : 0,
+    is_price_drop: badgeMeta.is_price_drop || computedDrop > 0,
+    last_price_drop_at: listing.last_price_drop_at || null,
+  };
+};
+
+const LISTING_TYPE_FILTER_GROUPS = {
+  buy: ["sale", "buy", "for_sale", "for sale"],
+  sale: ["sale", "buy", "for_sale", "for sale"],
+  rent: ["rent", "rental", "for_rent", "for rent"],
+  lease: ["lease", "long_lease", "commercial_lease", "long lease"],
+  shortlet: [
+    "shortlet",
+    "short-let",
+    "short_let",
+    "short let",
+    "short stay",
+    "short_let_stay",
+  ],
+};
+
+const normalizeFilterToken = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+
+const parseCsv = (value) =>
+  String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const getListingTypeFilterValues = ({
+  category,
+  listing_type_group,
+  listing_types,
+  type,
+}) => {
+  const values = [];
+
+  parseCsv(listing_types).forEach((item) => values.push(item));
+
+  const groupKey = normalizeFilterToken(listing_type_group);
+  if (LISTING_TYPE_FILTER_GROUPS[groupKey]) {
+    values.push(...LISTING_TYPE_FILTER_GROUPS[groupKey]);
+  } else if (listing_type_group) {
+    values.push(listing_type_group);
+  }
+
+  if (type) values.push(type);
+  if (category) values.push(category);
+
+  return [...new Set(values.map(normalizeFilterToken).filter(Boolean))];
+};
+
+const getNumericQueryValue = (value) => {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
+};
+
+const getLimitedResultCount = (value) => {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) return 500;
+  return Math.min(Math.max(Math.floor(numberValue), 1), 1000);
 };
 
 /* ----------------- AWS S3 MEDIA HELPERS ----------------- */
@@ -263,17 +604,30 @@ const uploadPhotosWithLimit = async (
 
 const processGeolocation = async (address, city, state, country, zip) => {
   const userAgent = "KeyviaApp/1.0";
-  const queryParts = [address, city, state, zip, country].filter(Boolean);
-  if (!queryParts.length) return null;
+  const compact = (...parts) =>
+    parts
+      .map((part) => String(part || "").trim())
+      .filter(Boolean)
+      .join(", ");
+  const queries = [
+    compact(address, city, state, zip, country),
+    compact(address, city, state, country),
+    compact(address, city, country),
+    compact(city, state, country),
+    compact(state, country),
+  ].filter(Boolean);
+  const queryMap = new Map();
+  queries.forEach((query) => queryMap.set(query.toLowerCase(), query));
+  const uniqueQueries = Array.from(queryMap.values());
 
-  const query = queryParts.join(", ");
+  if (!uniqueQueries.length) return null;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= Math.min(5, uniqueQueries.length); attempt++) {
     try {
       await sleep(1000 * attempt);
 
       const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
-        query,
+        uniqueQueries[Math.min(attempt - 1, uniqueQueries.length - 1)],
       )}&addressdetails=1&limit=1`;
 
       const res = await axios.get(url, {
@@ -299,7 +653,7 @@ const processGeolocation = async (address, city, state, country, zip) => {
         );
       } else {
         console.error("❌ Geocoding API Error:", error.message);
-        if (attempt === 3) return null;
+        if (attempt === Math.min(5, uniqueQueries.length)) return null;
       }
     }
   }
@@ -637,7 +991,10 @@ export const createListing = async (req, res) => {
         is_verified_agent,
         is_banned,
         subscription_plan,
-        subscription_status
+        subscription_status,
+        linked_agency_id,
+        is_solo_agent,
+        brokerage_name
       FROM users
       WHERE unique_id = $1::uuid
       LIMIT 1;
@@ -769,6 +1126,55 @@ export const createListing = async (req, res) => {
       b.virtual_tour_public_id ||
       null;
 
+    const isBrokerageCreator = ["brokerage", "brokerage_owner"].includes(role);
+    const isAgencyAgentCreator =
+      role === "agent" &&
+      (currentUser.is_solo_agent === false || currentUser.linked_agency_id);
+    const listingAgencyId =
+      b.agency_id ||
+      b.agencyId ||
+      (isBrokerageCreator
+        ? String(userId)
+        : isAgencyAgentCreator
+          ? currentUser.linked_agency_id
+          : null);
+    let assignedAgentId = b.assigned_agent_id || b.assignedAgentId || null;
+
+    if (assignedAgentId) {
+      if (!isBrokerageCreator || !listingAgencyId) {
+        return res.status(403).json({
+          message: "Only brokerages can assign a listing to an agency agent.",
+          code: "ASSIGNMENT_NOT_ALLOWED",
+        });
+      }
+
+      const assignedCheck = await pool.query(
+        `
+        SELECT u.unique_id
+        FROM users u
+        LEFT JOIN agent_profiles ap
+          ON ap.unique_id::text = u.unique_id::text
+        WHERE u.unique_id::text = $1::text
+          AND LOWER(u.role::text) IN ('agent', 'agency_agent', 'agencyagent', 'brokerage_agent')
+          AND (
+            u.linked_agency_id::text = $2::text
+            OR ap.linked_agency_id::text = $2::text
+          )
+        LIMIT 1
+        `,
+        [assignedAgentId, listingAgencyId],
+      );
+
+      if (!assignedCheck.rows.length) {
+        return res.status(400).json({
+          message: "Assigned agent is not connected to this brokerage.",
+          code: "INVALID_ASSIGNED_AGENT",
+        });
+      }
+
+      assignedAgentId = assignedCheck.rows[0].unique_id;
+    }
+
     const result = await pool.query(
       `
       INSERT INTO listings (
@@ -778,6 +1184,7 @@ export const createListing = async (req, res) => {
         created_by,
         agent_unique_id,
         agency_id,
+        assigned_agent_id,
 
         title,
         description,
@@ -909,7 +1316,7 @@ export const createListing = async (req, res) => {
         updated_at
       )
       VALUES (
-        $1,$2,$3::uuid,$3::uuid,$3::uuid,$4,
+        $1,$2,$3::uuid,$3::uuid,$3::uuid,$4,$104::uuid,
 
         $5,$6,
 
@@ -963,7 +1370,7 @@ export const createListing = async (req, res) => {
         product_id,
         b.draft_listing_id || b.draftListingId || product_id,
         String(userId),
-        b.agency_id || null,
+        listingAgencyId,
 
         b.title,
         b.description || null,
@@ -1081,10 +1488,23 @@ export const createListing = async (req, res) => {
 
         JSON.stringify(featuresArr),
         JSON.stringify(amenitiesArr),
+        assignedAgentId,
       ],
     );
 
     const listing = result.rows[0];
+
+    notifyListingSubmitted(listing, { io: req.io });
+
+    if (assignedAgentId) {
+      notifyListingAssigned({
+        listing,
+        agentId: assignedAgentId,
+        brokerageId: listingAgencyId || userId,
+        brokerageName: creator.brokerage_name || creator.name || "Keyvia Brokerage",
+        io: req.io,
+      });
+    }
 
     return res.status(201).json({
       success: true,
@@ -1147,6 +1567,23 @@ export const updateListing = async (req, res) => {
 
     if (String(listingOwnerId) !== String(userId)) {
       return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const currentStatus = String(listing.status || "").toLowerCase();
+    const reviewLockedStatuses = new Set([
+      "pending",
+      "under_review",
+      "reviewing",
+      "processing",
+    ]);
+
+    if (reviewLockedStatuses.has(currentStatus)) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "This listing is already under review. You can edit it after the admin verdict.",
+        code: "LISTING_UNDER_REVIEW",
+      });
     }
 
     const b = req.body;
@@ -1288,6 +1725,84 @@ export const updateListing = async (req, res) => {
           ? b.virtual_tour_public_id
           : listing.virtual_tour_public_id;
 
+    const hasChanged = (incoming, previous) => {
+      if (incoming === undefined || incoming === null) return false;
+      return String(incoming).trim() !== String(previous ?? "").trim();
+    };
+
+    const majorChangedFields = [];
+    [
+      ["price", b.price, listing.price],
+      ["listing_type", b.listing_type || b.listingType, listing.listing_type],
+      ["property_type", b.property_type || b.propertyType, listing.property_type],
+      [
+        "property_subtype",
+        b.property_subtype || b.propertySubtype,
+        listing.property_subtype,
+      ],
+      ["address", newAddr, listing.address],
+      ["city", newCity, listing.city],
+      ["state", newState, listing.state],
+      ["country", newCountry, listing.country],
+      ["latitude", latitude, listing.latitude],
+      ["longitude", longitude, listing.longitude],
+      ["bedrooms", b.bedrooms, listing.bedrooms],
+      ["bathrooms", b.bathrooms, listing.bathrooms],
+      ["year_built", b.year_built || b.yearBuilt, listing.year_built],
+      [
+        "square_footage",
+        b.square_footage || b.squareFootage || b.area_sqft,
+        listing.square_footage,
+      ],
+      ["lot_size", b.lot_size || b.lotSize || b.land_area_sqft, listing.lot_size],
+    ].forEach(([field, incoming, previous]) => {
+      if (hasChanged(incoming, previous)) majorChangedFields.push(field);
+    });
+
+    const floorPlansChanged =
+      (b.floor_plans || b.floorPlans) &&
+      JSON.stringify(safeJsonParse(b.floor_plans || b.floorPlans, [])) !==
+        JSON.stringify(safeJsonParse(listing.floor_plans, []));
+    const videoChanged = hasChanged(
+      b.video?.url ?? b.video_url,
+      listing.video_url,
+    );
+    const virtualTourChanged = hasChanged(
+      b.virtual_tour?.url ?? b.virtual_tour_url ?? b.virtualTourUrl,
+      listing.virtual_tour_url,
+    );
+    const threeDChanged = hasChanged(
+      b.three_d_home_url ?? b.threeDHomeUrl,
+      listing.three_d_home_url,
+    );
+
+    if (
+      incomingPhotos.length > 0 ||
+      removeList.length > 0 ||
+      floorPlansChanged ||
+      videoChanged ||
+      virtualTourChanged ||
+      threeDChanged ||
+      b.title_document_file
+    ) {
+      majorChangedFields.push("media");
+    }
+
+    const wasApproved = ["approved", "live", "published"].includes(
+      currentStatus,
+    );
+    const keepLiveAfterEdit = wasApproved && majorChangedFields.length === 0;
+    const nextStatus = keepLiveAfterEdit ? listing.status : "pending";
+    const nextIsActive = keepLiveAfterEdit ? listing.is_active : false;
+    const nextModerationStatus = keepLiveAfterEdit
+      ? listing.moderation_status || "approved"
+      : "pending";
+    const nextModerationReason = keepLiveAfterEdit
+      ? "Minor listing edit auto-checked."
+      : `Listing edited after submission; review required for: ${[
+          ...new Set(majorChangedFields),
+        ].join(", ") || "updated listing details"}.`;
+
     const query = `
       UPDATE listings SET
         title=$1,
@@ -1322,10 +1837,13 @@ export const updateListing = async (req, res) => {
         contact_email=$30,
         contact_phone=$31,
         contact_method=$32,
-        status='pending',
-        is_active=false,
+        status=$33,
+        is_active=$34,
+        moderation_status=$35,
+        moderation_reason=$36,
+        last_updated_at=NOW(),
         updated_at=NOW()
-      WHERE product_id=$33
+      WHERE product_id=$37
       RETURNING *;
     `;
 
@@ -1368,6 +1886,10 @@ export const updateListing = async (req, res) => {
       b.contact_email || b.contactEmail || listing.contact_email,
       b.contact_phone || b.contactPhone || listing.contact_phone,
       b.contact_method || b.contactMethod || listing.contact_method,
+      nextStatus,
+      nextIsActive,
+      nextModerationStatus,
+      nextModerationReason,
       product_id,
     ];
 
@@ -1375,7 +1897,12 @@ export const updateListing = async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Listing updated successfully and sent for review.",
+      outcome: keepLiveAfterEdit ? "updated_live" : "pending_review",
+      requires_review: !keepLiveAfterEdit,
+      changed_fields: [...new Set(majorChangedFields)],
+      message: keepLiveAfterEdit
+        ? "Listing updated successfully."
+        : "Listing updated successfully and sent for review.",
       listing: result.rows[0],
     });
   } catch (err) {
@@ -1502,27 +2029,111 @@ export const getListings = async (req, res) => {
       minLng,
       maxLng,
       type,
+      listing_type_group,
+      listing_types,
       minPrice,
       maxPrice,
       city,
+      country,
+      property_type,
+      propertyType,
+      property_types,
+      bedrooms,
+      bathrooms,
+      minBedrooms,
+      minBathrooms,
+      minSqft,
+      maxSqft,
+      limit,
       polygon,
     } = req.query;
 
     let currentUserId = null;
     if (req.user && req.user.unique_id) currentUserId = req.user.unique_id;
+    const listingTypeFilters = getListingTypeFilterValues({
+      category,
+      listing_type_group,
+      listing_types,
+      type,
+    });
+    const propertyTypeFilters = [
+      ...parseCsv(property_types),
+      property_type,
+      propertyType,
+    ]
+      .map(normalizeFilterToken)
+      .filter(Boolean);
+    const minPriceValue = getNumericQueryValue(minPrice);
+    const maxPriceValue = getNumericQueryValue(maxPrice);
+    const minBedroomsValue = getNumericQueryValue(minBedrooms || bedrooms);
+    const minBathroomsValue = getNumericQueryValue(minBathrooms || bathrooms);
+    const minSqftValue = getNumericQueryValue(minSqft);
+    const maxSqftValue = getNumericQueryValue(maxSqft);
+    const requestedLimit = getLimitedResultCount(limit);
 
     let queryText = `
       SELECT
         l.*,
-        u.name as agent_name,
-        u.avatar_url as agent_avatar,
-        u.username as agent_username,
-        u.role as agent_role,
-        u.phone as agent_phone,
+        u.unique_id AS uploader_unique_id,
+        u.name AS agent_name,
+        u.avatar_url AS agent_avatar,
+        u.username AS agent_username,
+        u.email AS agent_email,
+        u.role AS agent_role,
+        u.phone AS agent_phone,
+        u.brokerage_name AS user_brokerage_name,
+        u.is_solo_agent AS user_is_solo_agent,
+        u.verification_status AS user_verification_status,
+        u.is_verified AS user_is_verified,
+        u.is_verified_agent AS user_is_verified_agent,
+        p.full_name AS profile_full_name,
+        p.username AS profile_username,
+        p.avatar_url AS profile_avatar_url,
+        p.phone AS profile_phone,
+        bp.company_name AS brokerage_company_name,
+        assigned_u.unique_id AS assigned_agent_unique_id,
+        assigned_u.name AS assigned_agent_name,
+        assigned_u.username AS assigned_agent_username,
+        assigned_u.avatar_url AS assigned_agent_avatar,
+        assigned_u.role AS assigned_agent_role,
+        assigned_u.verification_status AS assigned_agent_verification_status,
+        assigned_u.is_verified AS assigned_agent_is_verified,
+        assigned_u.is_verified_agent AS assigned_agent_is_verified_agent,
+        assigned_p.full_name AS assigned_agent_full_name,
+        assigned_p.username AS assigned_agent_profile_username,
+        assigned_p.avatar_url AS assigned_agent_profile_avatar,
+        assigned_ap.is_solo_agent AS assigned_agent_is_solo_agent,
+        brokerage_u.unique_id AS listing_brokerage_unique_id,
+        brokerage_u.name AS listing_brokerage_user_name,
+        brokerage_u.username AS listing_brokerage_username,
+        brokerage_u.avatar_url AS listing_brokerage_avatar,
+        brokerage_u.verification_status AS listing_brokerage_verification_status,
+        brokerage_u.is_verified AS listing_brokerage_is_verified,
+        brokerage_u.verified_badge AS listing_brokerage_user_verified_badge,
+        brokerage_bp.company_name AS listing_brokerage_company_name,
+        brokerage_bp.logo_url AS listing_brokerage_logo_url,
+        brokerage_bp.verified_badge AS listing_brokerage_verified_badge,
+        legacy_b.id AS legacy_brokerage_id,
         CASE WHEN f.product_id IS NOT NULL THEN true ELSE false END as is_favorited
       FROM listings l
       JOIN users u ON l.uploaded_by_id = u.unique_id
-      LEFT JOIN favorites f ON l.product_id = f.product_id AND f.user_id = $1
+      LEFT JOIN profiles p ON p.unique_id::text = u.unique_id::text
+      LEFT JOIN brokerage_profiles bp ON bp.unique_id::text = u.unique_id::text
+      LEFT JOIN users assigned_u ON l.assigned_agent_id::text = assigned_u.unique_id::text
+      LEFT JOIN profiles assigned_p ON assigned_p.unique_id::text = assigned_u.unique_id::text
+      LEFT JOIN agent_profiles assigned_ap ON assigned_ap.unique_id::text = assigned_u.unique_id::text
+      LEFT JOIN brokerages legacy_b ON legacy_b.id::text = l.agency_id::text
+      LEFT JOIN users brokerage_u
+        ON brokerage_u.unique_id::text = COALESCE(
+          legacy_b.owner_id::text,
+          CASE
+            WHEN LOWER(u.role::text) IN ('brokerage_owner', 'brokerage') THEN u.unique_id::text
+            ELSE u.linked_agency_id::text
+          END,
+          l.agency_id::text
+        )
+      LEFT JOIN brokerage_profiles brokerage_bp ON brokerage_bp.unique_id::text = brokerage_u.unique_id::text
+      LEFT JOIN favorites f ON l.product_id = f.product_id AND f.user_id::text = $1::text
       WHERE l.status = 'approved'
       AND l.is_active = true
     `;
@@ -1541,6 +2152,8 @@ export const getListings = async (req, res) => {
         queryText += `
           AND l.longitude IS NOT NULL
           AND l.latitude IS NOT NULL
+          AND l.longitude::text ~ '^-?[0-9]+(\\.[0-9]+)?$'
+          AND l.latitude::text ~ '^-?[0-9]+(\\.[0-9]+)?$'
           AND ST_Intersects(
             ST_SetSRID(ST_GeomFromGeoJSON($${paramCounter}), 4326),
             ST_SetSRID(ST_MakePoint(l.longitude::float, l.latitude::float), 4326)
@@ -1553,15 +2166,13 @@ export const getListings = async (req, res) => {
       }
     }
 
-    if (category && category !== "undefined") {
-      queryText += ` AND (category ILIKE $${paramCounter} OR listing_type ILIKE $${paramCounter})`;
-      queryParams.push(category);
-      paramCounter++;
-    }
-
-    if (type) {
-      queryText += ` AND l.listing_type = $${paramCounter}`;
-      queryParams.push(type.toLowerCase());
+    if (listingTypeFilters.length > 0) {
+      queryText += `
+        AND (
+          regexp_replace(LOWER(COALESCE(l.listing_type::text, '')), '[\\s-]+', '_', 'g') = ANY($${paramCounter}::text[])
+          OR regexp_replace(LOWER(COALESCE(l.category::text, '')), '[\\s-]+', '_', 'g') = ANY($${paramCounter}::text[])
+        )`;
+      queryParams.push(listingTypeFilters);
       paramCounter++;
     }
 
@@ -1571,15 +2182,68 @@ export const getListings = async (req, res) => {
       paramCounter++;
     }
 
-    if (minPrice) {
-      queryText += ` AND l.price >= $${paramCounter}`;
-      queryParams.push(minPrice);
+    if (country) {
+      queryText += ` AND l.country ILIKE $${paramCounter}`;
+      queryParams.push(`%${country}%`);
       paramCounter++;
     }
 
-    if (maxPrice) {
+    if (propertyTypeFilters.length > 0) {
+      queryText += `
+        AND regexp_replace(LOWER(COALESCE(l.property_type::text, '')), '[\\s-]+', '_', 'g') = ANY($${paramCounter}::text[])`;
+      queryParams.push([...new Set(propertyTypeFilters)]);
+      paramCounter++;
+    }
+
+    if (minPriceValue !== null) {
+      queryText += ` AND l.price >= $${paramCounter}`;
+      queryParams.push(minPriceValue);
+      paramCounter++;
+    }
+
+    if (maxPriceValue !== null) {
       queryText += ` AND l.price <= $${paramCounter}`;
-      queryParams.push(maxPrice);
+      queryParams.push(maxPriceValue);
+      paramCounter++;
+    }
+
+    if (minBedroomsValue !== null) {
+      queryText += ` AND COALESCE(l.bedrooms, 0) >= $${paramCounter}`;
+      queryParams.push(minBedroomsValue);
+      paramCounter++;
+    }
+
+    if (minBathroomsValue !== null) {
+      queryText += ` AND COALESCE(l.bathrooms, 0) >= $${paramCounter}`;
+      queryParams.push(minBathroomsValue);
+      paramCounter++;
+    }
+
+    if (minSqftValue !== null) {
+      queryText += `
+        AND COALESCE(
+          l.building_area_sqft,
+          l.area_sqft,
+          l.square_footage,
+          l.land_area_sqft,
+          l.lot_size,
+          0
+        ) >= $${paramCounter}`;
+      queryParams.push(minSqftValue);
+      paramCounter++;
+    }
+
+    if (maxSqftValue !== null) {
+      queryText += `
+        AND COALESCE(
+          l.building_area_sqft,
+          l.area_sqft,
+          l.square_footage,
+          l.land_area_sqft,
+          l.lot_size,
+          0
+        ) <= $${paramCounter}`;
+      queryParams.push(maxSqftValue);
       paramCounter++;
     }
 
@@ -1589,7 +2253,11 @@ export const getListings = async (req, res) => {
         l.address ILIKE $${paramCounter} OR
         l.state ILIKE $${paramCounter} OR
         l.country ILIKE $${paramCounter} OR
-        l.zip_code ILIKE $${paramCounter}
+        l.zip_code ILIKE $${paramCounter} OR
+        l.neighborhood ILIKE $${paramCounter} OR
+        l.estate_name ILIKE $${paramCounter} OR
+        l.landmark ILIKE $${paramCounter} OR
+        l.property_type ILIKE $${paramCounter}
       )`;
       queryParams.push(`%${search}%`);
       paramCounter++;
@@ -1601,46 +2269,632 @@ export const getListings = async (req, res) => {
       maxLat &&
       minLng &&
       maxLng &&
-      !isNaN(Number(minLat))
+      [minLat, maxLat, minLng, maxLng].every(
+        (value) => getNumericQueryValue(value) !== null,
+      )
     ) {
       queryText += `
+        AND l.latitude IS NOT NULL
+        AND l.longitude IS NOT NULL
+        AND l.latitude::text ~ '^-?[0-9]+(\\.[0-9]+)?$'
+        AND l.longitude::text ~ '^-?[0-9]+(\\.[0-9]+)?$'
         AND l.latitude::numeric >= $${paramCounter}
         AND l.latitude::numeric <= $${paramCounter + 1}
         AND l.longitude::numeric >= $${paramCounter + 2}
         AND l.longitude::numeric <= $${paramCounter + 3}
       `;
-      queryParams.push(minLat, maxLat, minLng, maxLng);
+      queryParams.push(
+        getNumericQueryValue(minLat),
+        getNumericQueryValue(maxLat),
+        getNumericQueryValue(minLng),
+        getNumericQueryValue(maxLng),
+      );
       paramCounter += 4;
     }
 
-    queryText += " ORDER BY l.activated_at DESC NULLS LAST LIMIT 500";
+    queryText += ` ORDER BY COALESCE(l.activated_at, l.created_at) DESC NULLS LAST LIMIT $${paramCounter}`;
+    queryParams.push(requestedLimit);
 
     const result = await pool.query(queryText, queryParams);
+
+    const getRoleLabel = (role, isSoloAgent) => {
+      const r = String(role || "").toLowerCase();
+
+      if (r === "agent") {
+        return isSoloAgent === false ? "Agency Agent" : "Real Estate Agent";
+      }
+
+      if (r === "brokerage" || r === "brokerage_owner")
+        return "Brokerage Company";
+      if (r === "owner" || r === "landlord") return "Property Owner";
+      if (r === "admin" || r === "super_admin") return "Admin";
+
+      return role || "Keyvia Member";
+    };
 
     const listings = result.rows.map((listing) => {
       const photos = normalizePhotosForResponse(listing.photos);
       const features = safeJsonParse(listing.features, []);
+      const floorPlans = safeJsonParse(listing.floor_plans, []);
+      const stagingPhotos = safeJsonParse(listing.staging_photos, []);
+      const panoramaPhotos = safeJsonParse(listing.panorama_photos, []);
+      const amenities = safeJsonParse(listing.amenities, []);
+      const verificationStatus = String(
+        listing.user_verification_status || "",
+      ).toLowerCase();
+      const isVerified =
+        listing.user_is_verified === true ||
+        listing.user_is_verified_agent === true ||
+        verificationStatus === "approved" ||
+        verificationStatus === "verified";
+      const companyName =
+        listing.listing_brokerage_company_name ||
+        listing.brokerage_company_name ||
+        listing.user_brokerage_name ||
+        listing.company_name ||
+        null;
+      const publicPhone =
+        listing.show_contact_phone === true
+          ? listing.contact_phone ||
+            listing.profile_phone ||
+            listing.agent_phone
+          : null;
+      const brokerageIsVerified =
+        listing.listing_brokerage_is_verified === true ||
+        listing.listing_brokerage_verified_badge === true ||
+        listing.listing_brokerage_user_verified_badge === true ||
+        ["approved", "verified"].includes(
+          String(
+            listing.listing_brokerage_verification_status || "",
+          ).toLowerCase(),
+        );
+      const brokerageSummary =
+        listing.listing_brokerage_unique_id || companyName
+          ? {
+              id:
+                listing.legacy_brokerage_id ||
+                listing.listing_brokerage_unique_id ||
+                null,
+              unique_id: listing.listing_brokerage_unique_id || null,
+              name:
+                listing.listing_brokerage_company_name ||
+                listing.listing_brokerage_user_name ||
+                companyName,
+              company_name:
+                listing.listing_brokerage_company_name ||
+                listing.listing_brokerage_user_name ||
+                companyName,
+              username: listing.listing_brokerage_username || null,
+              avatar_url:
+                listing.listing_brokerage_logo_url ||
+                listing.listing_brokerage_avatar ||
+                null,
+              logo_url:
+                listing.listing_brokerage_logo_url ||
+                listing.listing_brokerage_avatar ||
+                null,
+              role: "brokerage",
+              role_label: "Brokerage Company",
+              is_verified: brokerageIsVerified,
+              verification_status: brokerageIsVerified
+                ? "verified"
+                : listing.listing_brokerage_verification_status || "unverified",
+            }
+          : null;
+      const assignedVerificationStatus = String(
+        listing.assigned_agent_verification_status || "",
+      ).toLowerCase();
+      const assignedAgentIsVerified =
+        listing.assigned_agent_is_verified === true ||
+        listing.assigned_agent_is_verified_agent === true ||
+        assignedVerificationStatus === "approved" ||
+        assignedVerificationStatus === "verified";
+      const assignedAgent = listing.assigned_agent_unique_id
+        ? {
+            unique_id: listing.assigned_agent_unique_id,
+            name:
+              listing.assigned_agent_full_name || listing.assigned_agent_name,
+            full_name:
+              listing.assigned_agent_full_name || listing.assigned_agent_name,
+            avatar_url:
+              listing.assigned_agent_profile_avatar ||
+              listing.assigned_agent_avatar,
+            avatar:
+              listing.assigned_agent_profile_avatar ||
+              listing.assigned_agent_avatar,
+            username:
+              listing.assigned_agent_profile_username ||
+              listing.assigned_agent_username,
+            role: listing.assigned_agent_role || "agent",
+            role_label: getRoleLabel(
+              listing.assigned_agent_role || "agent",
+              listing.assigned_agent_is_solo_agent,
+            ),
+            is_solo_agent: listing.assigned_agent_is_solo_agent,
+            company_name: companyName,
+            agency_name: companyName,
+            brokerage_name: brokerageSummary?.company_name || companyName,
+            verification_status: assignedAgentIsVerified
+              ? "verified"
+              : listing.assigned_agent_verification_status || "unverified",
+            is_verified: assignedAgentIsVerified,
+            is_verified_agent:
+              listing.assigned_agent_is_verified_agent === true,
+          }
+        : null;
+      const uploaderAgent = {
+        unique_id: listing.uploader_unique_id || listing.uploaded_by_id,
+        name: listing.profile_full_name || listing.agent_name,
+        full_name: listing.profile_full_name || listing.agent_name,
+        avatar_url: listing.profile_avatar_url || listing.agent_avatar,
+        avatar: listing.profile_avatar_url || listing.agent_avatar,
+        username: listing.profile_username || listing.agent_username,
+        email: listing.agent_email,
+        phone: publicPhone,
+        role: listing.agent_role,
+        role_label: getRoleLabel(
+          listing.agent_role,
+          listing.user_is_solo_agent,
+        ),
+        is_solo_agent: listing.user_is_solo_agent,
+        company_name: companyName,
+        agency_name:
+          String(listing.agent_role || "").toLowerCase() === "agent" &&
+          listing.user_is_solo_agent === false
+            ? companyName
+            : null,
+        brokerage_name: ["brokerage", "brokerage_owner"].includes(
+          String(listing.agent_role || "").toLowerCase(),
+        )
+          ? companyName
+          : null,
+        verification_status: isVerified
+          ? "verified"
+          : listing.user_verification_status || "unverified",
+        is_verified: isVerified,
+        is_verified_agent: listing.user_is_verified_agent === true,
+      };
+      const primaryAgent = assignedAgent || uploaderAgent;
+      const badgeMeta = computeListingBadges(listing, {
+        photos,
+        floorPlans: Array.isArray(floorPlans) ? floorPlans : [],
+        stagingPhotos: Array.isArray(stagingPhotos) ? stagingPhotos : [],
+        panoramaPhotos: Array.isArray(panoramaPhotos) ? panoramaPhotos : [],
+      });
 
       return {
         ...listing,
+        ...badgeMeta,
         photos,
+        floor_plans: Array.isArray(floorPlans) ? floorPlans : [],
+        staging_photos: Array.isArray(stagingPhotos) ? stagingPhotos : [],
+        panorama_photos: Array.isArray(panoramaPhotos) ? panoramaPhotos : [],
         features,
+        amenities,
+        title_document_file: null,
         latitude: listing.latitude ? parseFloat(listing.latitude) : null,
         longitude: listing.longitude ? parseFloat(listing.longitude) : null,
-        agent: {
-          name: listing.agent_name,
-          avatar: listing.agent_avatar,
-          username: listing.agent_username,
-          role: listing.agent_role,
-          agency: listing.agency_name,
-        },
+        uploaded_by_id: listing.uploaded_by_id,
+        agent_unique_id: listing.agent_unique_id || listing.uploaded_by_id,
+        created_by: listing.created_by || listing.uploaded_by_id,
+        price_currency: listing.price_currency || listing.currency || "USD",
+        building_area_sqft:
+          listing.building_area_sqft ||
+          listing.area_sqft ||
+          listing.square_footage ||
+          null,
+        land_area_sqft: listing.land_area_sqft || listing.lot_size || null,
+        agent: primaryAgent,
+        creator: uploaderAgent,
+        submitter: uploaderAgent,
+        assigned_agent: assignedAgent,
+        brokerage: brokerageSummary,
       };
     });
 
-    res.json(listings);
+    res.json({
+      success: true,
+      data: listings,
+      listings,
+      count: listings.length,
+      filters: {
+        listing_types: listingTypeFilters,
+        property_types: [...new Set(propertyTypeFilters)],
+        min_price: minPriceValue,
+        max_price: maxPriceValue,
+        min_bedrooms: minBedroomsValue,
+        min_bathrooms: minBathroomsValue,
+      },
+    });
   } catch (err) {
     console.error("❌ CRITICAL ERROR in getListings:", err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch public listings.",
+    });
+  }
+};
+
+export const reportListing = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const reporterId = req.user?.unique_id || null;
+    const { reason } = req.body || {};
+
+    if (!product_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Listing product ID is required.",
+      });
+    }
+
+    if (!reason || !String(reason).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Please include a reason for the report.",
+      });
+    }
+
+    const listingResult = await pool.query(
+      `SELECT id, product_id, title, uploaded_by_id FROM listings WHERE product_id = $1 LIMIT 1`,
+      [product_id],
+    );
+
+    const listing = listingResult.rows[0];
+
+    if (!listing) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing not found.",
+      });
+    }
+
+    try {
+      await pool.query(
+        `
+        INSERT INTO listing_reports (
+          product_id,
+          listing_id,
+          reporter_id,
+          listing_owner_id,
+          reason,
+          status,
+          created_at
+        )
+        VALUES ($1, $2, $3::uuid, $4, $5, 'open', NOW())
+        `,
+        [
+          product_id,
+          listing.id,
+          reporterId ? String(reporterId) : null,
+          listing.uploaded_by_id,
+          String(reason).trim(),
+        ],
+      );
+    } catch (reportErr) {
+      console.warn(
+        "[ReportListing] listing_reports insert failed, falling back to admin_notes:",
+        reportErr?.message,
+      );
+
+      await pool.query(
+        `
+        UPDATE listings
+        SET admin_notes = CONCAT(
+          COALESCE(admin_notes || E'\n', ''),
+          '[Public report] ',
+          $1,
+          ' - ',
+          NOW()::text
+        )
+        WHERE product_id = $2
+        `,
+        [String(reason).trim(), product_id],
+      );
+    }
+
+    pool
+      .query(
+        `
+        SELECT unique_id
+        FROM users
+        WHERE LOWER(role::text) IN ('admin', 'super_admin')
+           OR is_admin = true
+           OR is_super_admin = true
+        `,
+      )
+      .then(async ({ rows }) => {
+        await Promise.allSettled(
+          rows.map((admin) =>
+            createNotification({
+              recipientId: admin.unique_id,
+              type: "listing_reported",
+              title: "Listing Report Submitted",
+              message: `A public report was submitted for "${listing.title || product_id}".`,
+              entityType: "listing",
+              entityId: product_id,
+              productId: product_id,
+              actionUrl: "/admin/listings",
+              actionLabel: "Review Listing",
+              data: {
+                product_id,
+                reporter_id: reporterId,
+                reason: String(reason).trim(),
+              },
+            }),
+          ),
+        );
+      })
+      .catch((notifyErr) => {
+        console.warn(
+          "[ReportListing] Admin notification failed:",
+          notifyErr?.message,
+        );
+      });
+
+    return res.status(201).json({
+      success: true,
+      message: "Report submitted for review.",
+    });
+  } catch (err) {
+    console.error("[ReportListing] Error:", err);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to submit listing report.",
+      details: err?.message,
+    });
+  }
+};
+
+const getListingInteractionRecipient = (listing = {}) =>
+  listing.assigned_agent_id ||
+  listing.agent_unique_id ||
+  listing.uploaded_by_id ||
+  listing.created_by ||
+  null;
+
+const getTourTypeLabel = (tourType) => {
+  const type = String(tourType || "").toLowerCase();
+
+  if (type === "video") return "video tour";
+  if (type === "live") return "live tour";
+
+  return "property tour";
+};
+
+const getInteractionListing = async (productId) => {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM listings
+    WHERE product_id = $1
+    LIMIT 1
+    `,
+    [productId],
+  );
+
+  return result.rows[0] || null;
+};
+
+const ensureBuyerInteraction = (req, res) => {
+  const userId = req.user?.unique_id;
+  const role = String(req.user?.role || "").toLowerCase();
+
+  if (!userId) {
+    res.status(401).json({ success: false, message: "Please sign in first." });
+    return false;
+  }
+
+  if (role !== "buyer") {
+    res.status(403).json({
+      success: false,
+      message: "Switch to a buyer profile to use this action.",
+    });
+    return false;
+  }
+
+  return true;
+};
+
+const isListingAvailableForBuyerInteraction = (listing = {}) =>
+  String(listing.status || "").toLowerCase() === "approved" &&
+  listing.is_active === true;
+
+export const requestListingTour = async (req, res) => {
+  try {
+    if (!ensureBuyerInteraction(req, res)) return;
+
+    const { product_id } = req.params;
+    const {
+      requested_date,
+      requested_time,
+      tour_type = "in_person",
+      note = null,
+    } = req.body || {};
+
+    if (!product_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Listing product ID is required.",
+      });
+    }
+
+    const listing = await getInteractionListing(product_id);
+
+    if (!listing || !isListingAvailableForBuyerInteraction(listing)) {
+      return res.status(404).json({
+        success: false,
+        message: "This listing is not available for tour requests.",
+      });
+    }
+
+    const normalizedTourType = String(tour_type || "in_person").toLowerCase();
+
+    if (listing.allow_tour_requests === false) {
+      return res.status(400).json({
+        success: false,
+        message: "Tour requests are not enabled for this listing.",
+      });
+    }
+
+    if (normalizedTourType === "video" && listing.allow_video_tour === false) {
+      return res.status(400).json({
+        success: false,
+        message: "Video tours are not enabled for this listing.",
+      });
+    }
+
+    if (
+      normalizedTourType === "in_person" &&
+      listing.allow_in_person_tour === false
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "In-person tours are not enabled for this listing.",
+      });
+    }
+
+    const recipientId = getListingInteractionRecipient(listing);
+    const buyerId = req.user.unique_id;
+
+    if (!recipientId) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing contact is not available.",
+      });
+    }
+
+    if (String(recipientId) === String(buyerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot request a tour for your own listing.",
+      });
+    }
+
+    await pool
+      .query(
+        `
+        UPDATE listings
+        SET tour_request_count = COALESCE(tour_request_count, 0) + 1,
+            contact_count = COALESCE(contact_count, 0) + 1
+        WHERE product_id = $1
+        `,
+        [product_id],
+      )
+      .catch(() => null);
+
+    await createNotification({
+      io: req.io,
+      recipientId,
+      senderId: buyerId,
+      type: "tour_request",
+      title: "Tour Request Received",
+      message: `${req.user?.name || "A buyer"} requested a ${getTourTypeLabel(normalizedTourType)} for "${listing.title || listing.address || product_id}".`,
+      entityType: "listing",
+      entityId: product_id,
+      productId: product_id,
+      actionUrl: `/listing/${product_id}`,
+      actionLabel: "View Listing",
+      data: {
+        product_id,
+        buyer_id: buyerId,
+        buyer_name: req.user?.name || null,
+        requested_date: requested_date || null,
+        requested_time: requested_time || null,
+        tour_type: normalizedTourType,
+        note,
+      },
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Tour request sent.",
+      data: {
+        product_id,
+        requested_date: requested_date || null,
+        requested_time: requested_time || null,
+        tour_type: normalizedTourType,
+      },
+    });
+  } catch (err) {
+    console.error("[RequestListingTour] Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not send tour request.",
+    });
+  }
+};
+
+export const notifyLiveTourInterest = async (req, res) => {
+  try {
+    if (!ensureBuyerInteraction(req, res)) return;
+
+    const { product_id } = req.params;
+
+    if (!product_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Listing product ID is required.",
+      });
+    }
+
+    const listing = await getInteractionListing(product_id);
+
+    if (!listing || !isListingAvailableForBuyerInteraction(listing)) {
+      return res.status(404).json({
+        success: false,
+        message: "This listing is not available.",
+      });
+    }
+
+    const recipientId = getListingInteractionRecipient(listing);
+    const buyerId = req.user.unique_id;
+
+    if (!recipientId) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing contact is not available.",
+      });
+    }
+
+    if (String(recipientId) === String(buyerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot subscribe to your own live tour.",
+      });
+    }
+
+    await createNotification({
+      io: req.io,
+      recipientId,
+      senderId: buyerId,
+      type: "live_tour_interest",
+      title: "Live Tour Interest",
+      message: `${req.user?.name || "A buyer"} wants to be notified when "${listing.title || listing.address || product_id}" goes live.`,
+      entityType: "listing",
+      entityId: product_id,
+      productId: product_id,
+      actionUrl: `/listing/${product_id}`,
+      actionLabel: "View Listing",
+      data: {
+        product_id,
+        buyer_id: buyerId,
+        buyer_name: req.user?.name || null,
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: "Live tour notification enabled.",
+      data: { product_id },
+    });
+  } catch (err) {
+    console.error("[NotifyLiveTourInterest] Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not enable live tour notification.",
+    });
   }
 };
 
@@ -1784,7 +3038,8 @@ export const getListingByProductId = async (req, res) => {
     }
 
     const parseAnyJson = (value, fallback = null) => {
-      if (value === undefined || value === null || value === "") return fallback;
+      if (value === undefined || value === null || value === "")
+        return fallback;
       if (Array.isArray(value)) return value;
       if (typeof value === "object") return value;
 
@@ -1818,7 +3073,8 @@ export const getListingByProductId = async (req, res) => {
 
       if (r === "agency_agent") return "Agency Agent";
       if (r === "brokerage_agent") return "Brokerage Agent";
-      if (r === "brokerage" || r === "brokerage_owner") return "Brokerage Company";
+      if (r === "brokerage" || r === "brokerage_owner")
+        return "Brokerage Company";
       if (r === "owner" || r === "landlord") return "Property Owner";
       if (r === "admin" || r === "super_admin") return "Admin";
 
@@ -1861,6 +3117,50 @@ export const getListingByProductId = async (req, res) => {
         ap.experience_years AS agent_experience_years,
 
         bp.company_name AS brokerage_company_name,
+        bp.logo_url AS uploader_brokerage_logo_url,
+        bp.verified_badge AS uploader_brokerage_verified_badge,
+
+        assigned_u.unique_id AS assigned_agent_unique_id,
+        assigned_u.name AS assigned_agent_user_name,
+        assigned_u.username AS assigned_agent_user_username,
+        assigned_u.email AS assigned_agent_user_email,
+        assigned_u.phone AS assigned_agent_user_phone,
+        assigned_u.role AS assigned_agent_user_role,
+        assigned_u.avatar_url AS assigned_agent_user_avatar_url,
+        assigned_u.bio AS assigned_agent_user_bio,
+        assigned_u.country AS assigned_agent_user_country,
+        assigned_u.city AS assigned_agent_user_city,
+        assigned_u.verification_status AS assigned_agent_verification_status,
+        assigned_u.is_verified AS assigned_agent_is_verified,
+        assigned_u.is_verified_agent AS assigned_agent_is_verified_agent,
+        assigned_u.created_at AS assigned_agent_created_at,
+        assigned_p.full_name AS assigned_agent_profile_full_name,
+        assigned_p.username AS assigned_agent_profile_username,
+        assigned_p.avatar_url AS assigned_agent_profile_avatar_url,
+        assigned_p.bio AS assigned_agent_profile_bio,
+        assigned_p.email AS assigned_agent_profile_email,
+        assigned_p.phone AS assigned_agent_profile_phone,
+        assigned_ap.experience_years AS assigned_agent_experience_years,
+        assigned_ap.is_solo_agent AS assigned_agent_is_solo_agent,
+
+        brokerage_u.unique_id AS listing_brokerage_unique_id,
+        brokerage_u.name AS listing_brokerage_user_name,
+        brokerage_u.username AS listing_brokerage_user_username,
+        brokerage_u.email AS listing_brokerage_user_email,
+        brokerage_u.phone AS listing_brokerage_user_phone,
+        brokerage_u.avatar_url AS listing_brokerage_user_avatar_url,
+        brokerage_u.verification_status AS listing_brokerage_verification_status,
+        brokerage_u.is_verified AS listing_brokerage_is_verified,
+        brokerage_u.verified_badge AS listing_brokerage_user_verified_badge,
+        brokerage_p.full_name AS listing_brokerage_profile_name,
+        brokerage_p.username AS listing_brokerage_profile_username,
+        brokerage_p.avatar_url AS listing_brokerage_profile_avatar_url,
+        brokerage_bp.company_name AS listing_brokerage_company_name,
+        brokerage_bp.brokerage_address AS listing_brokerage_address,
+        brokerage_bp.website AS listing_brokerage_website,
+        brokerage_bp.logo_url AS listing_brokerage_logo_url,
+        brokerage_bp.verified_badge AS listing_brokerage_verified_badge,
+        legacy_b.id AS legacy_brokerage_id,
 
         CASE
           WHEN $2::uuid IS NOT NULL AND f.product_id IS NOT NULL THEN true
@@ -1880,6 +3180,34 @@ export const getListingByProductId = async (req, res) => {
 
       LEFT JOIN brokerage_profiles bp
         ON bp.unique_id::text = u.unique_id::text
+
+      LEFT JOIN users assigned_u
+        ON l.assigned_agent_id::text = assigned_u.unique_id::text
+
+      LEFT JOIN profiles assigned_p
+        ON assigned_p.unique_id::text = assigned_u.unique_id::text
+
+      LEFT JOIN agent_profiles assigned_ap
+        ON assigned_ap.unique_id::text = assigned_u.unique_id::text
+
+      LEFT JOIN brokerages legacy_b
+        ON legacy_b.id::text = l.agency_id::text
+
+      LEFT JOIN users brokerage_u
+        ON brokerage_u.unique_id::text = COALESCE(
+          legacy_b.owner_id::text,
+          CASE
+            WHEN LOWER(u.role::text) IN ('brokerage_owner', 'brokerage') THEN u.unique_id::text
+            ELSE u.linked_agency_id::text
+          END,
+          l.agency_id::text
+        )
+
+      LEFT JOIN profiles brokerage_p
+        ON brokerage_p.unique_id::text = brokerage_u.unique_id::text
+
+      LEFT JOIN brokerage_profiles brokerage_bp
+        ON brokerage_bp.unique_id::text = brokerage_u.unique_id::text
 
       LEFT JOIN favorites f
         ON f.product_id = l.product_id
@@ -1902,10 +3230,13 @@ export const getListingByProductId = async (req, res) => {
       });
     }
 
-    const ownerId = pick(row.uploaded_by_id, row.agent_unique_id, row.created_by);
+    const ownerId = pick(
+      row.uploaded_by_id,
+      row.agent_unique_id,
+      row.created_by,
+    );
 
-    const isOwner =
-      viewerId && ownerId && String(ownerId) === String(viewerId);
+    const isOwner = viewerId && ownerId && String(ownerId) === String(viewerId);
 
     const isAdmin =
       viewerRole === "admin" ||
@@ -1923,6 +3254,18 @@ export const getListingByProductId = async (req, res) => {
     }
 
     const canViewPrivateAdminFields = isOwner || isAdmin;
+
+    if (isPublicReady && !isOwner && !isAdmin) {
+      const viewResult = await recordListingView({
+        req,
+        productId: row.product_id,
+        viewerId,
+      });
+
+      if (viewResult.viewsCount !== null && viewResult.viewsCount !== undefined) {
+        row.views_count = viewResult.viewsCount;
+      }
+    }
 
     const draftData = parseAnyJson(row.draft_data, {}) || {};
 
@@ -1964,7 +3307,11 @@ export const getListingByProductId = async (req, res) => {
     );
 
     const paymentOptions = parseAnyJson(
-      pick(row.payment_options, draftData.paymentOptions, draftData.payment_options),
+      pick(
+        row.payment_options,
+        draftData.paymentOptions,
+        draftData.payment_options,
+      ),
       [],
     );
 
@@ -2029,6 +3376,7 @@ export const getListingByProductId = async (req, res) => {
     const agentAvatar = pick(row.profile_avatar_url, row.user_avatar_url);
 
     const companyName = pick(
+      row.listing_brokerage_company_name,
       row.brokerage_company_name,
       row.user_brokerage_name,
       draftData.companyName,
@@ -2036,6 +3384,193 @@ export const getListingByProductId = async (req, res) => {
       draftData.agencyName,
       draftData.agency_name,
     );
+
+    const assignedAgentName = pick(
+      row.assigned_agent_profile_full_name,
+      row.assigned_agent_user_name,
+    );
+
+    const assignedAgentVerificationStatus = String(
+      row.assigned_agent_verification_status || "",
+    ).toLowerCase();
+
+    const assignedAgentIsVerified =
+      row.assigned_agent_is_verified === true ||
+      row.assigned_agent_is_verified_agent === true ||
+      assignedAgentVerificationStatus === "approved" ||
+      assignedAgentVerificationStatus === "verified";
+
+    const assignedAgent = row.assigned_agent_unique_id
+      ? {
+          unique_id: row.assigned_agent_unique_id,
+          name: assignedAgentName || "Keyvia Agent",
+          full_name: assignedAgentName || "Keyvia Agent",
+          username: pick(
+            row.assigned_agent_profile_username,
+            row.assigned_agent_user_username,
+          ),
+          avatar_url: pick(
+            row.assigned_agent_profile_avatar_url,
+            row.assigned_agent_user_avatar_url,
+          ),
+          avatar: pick(
+            row.assigned_agent_profile_avatar_url,
+            row.assigned_agent_user_avatar_url,
+          ),
+          bio: pick(
+            row.assigned_agent_profile_bio,
+            row.assigned_agent_user_bio,
+          ),
+          country: row.assigned_agent_user_country,
+          city: row.assigned_agent_user_city,
+          email: pick(
+            row.assigned_agent_profile_email,
+            row.assigned_agent_user_email,
+          ),
+          phone:
+            canViewPrivateAdminFields ||
+            row.show_contact_phone === true ||
+            draftData.showContactPhone === true
+              ? pick(
+                  row.assigned_agent_profile_phone,
+                  row.assigned_agent_user_phone,
+                )
+              : null,
+          role: row.assigned_agent_user_role || "agent",
+          role_label: getRoleLabel(
+            row.assigned_agent_user_role || "agent",
+            row.assigned_agent_is_solo_agent,
+          ),
+          is_solo_agent: row.assigned_agent_is_solo_agent,
+          company_name: companyName,
+          agency_name: companyName,
+          brokerage_name: companyName,
+          experience_years: row.assigned_agent_experience_years || null,
+          verification_status: assignedAgentIsVerified
+            ? "verified"
+            : row.assigned_agent_verification_status || "unverified",
+          is_verified: assignedAgentIsVerified,
+          is_verified_agent: row.assigned_agent_is_verified_agent === true,
+          created_at: row.assigned_agent_created_at,
+        }
+      : null;
+
+    const brokerageName = pick(
+      row.listing_brokerage_company_name,
+      row.listing_brokerage_profile_name,
+      row.listing_brokerage_user_name,
+      ["brokerage", "brokerage_owner"].includes(
+        String(finalRole || "").toLowerCase(),
+      )
+        ? companyName || agentName
+        : null,
+    );
+
+    const brokerageIsVerified =
+      row.listing_brokerage_is_verified === true ||
+      row.listing_brokerage_verified_badge === true ||
+      row.listing_brokerage_user_verified_badge === true ||
+      ["approved", "verified"].includes(
+        String(row.listing_brokerage_verification_status || "").toLowerCase(),
+      ) ||
+      (["brokerage", "brokerage_owner"].includes(
+        String(finalRole || "").toLowerCase(),
+      ) &&
+        isVerified);
+
+    const brokerageSummary =
+      row.listing_brokerage_unique_id || brokerageName
+        ? {
+            id:
+              row.legacy_brokerage_id ||
+              row.listing_brokerage_unique_id ||
+              null,
+            unique_id: row.listing_brokerage_unique_id || null,
+            name: brokerageName,
+            company_name: brokerageName,
+            username: pick(
+              row.listing_brokerage_profile_username,
+              row.listing_brokerage_user_username,
+            ),
+            avatar_url: pick(
+              row.listing_brokerage_logo_url,
+              row.listing_brokerage_profile_avatar_url,
+              row.listing_brokerage_user_avatar_url,
+              row.uploader_brokerage_logo_url,
+            ),
+            logo_url: pick(
+              row.listing_brokerage_logo_url,
+              row.uploader_brokerage_logo_url,
+              row.listing_brokerage_profile_avatar_url,
+              row.listing_brokerage_user_avatar_url,
+            ),
+            address: row.listing_brokerage_address || null,
+            website: row.listing_brokerage_website || null,
+            email: row.listing_brokerage_user_email || null,
+            phone:
+              canViewPrivateAdminFields ||
+              row.show_contact_phone === true ||
+              draftData.showContactPhone === true
+                ? row.listing_brokerage_user_phone || null
+                : null,
+            role: "brokerage",
+            role_label: "Brokerage Company",
+            verification_status: brokerageIsVerified
+              ? "verified"
+              : row.listing_brokerage_verification_status || "unverified",
+            is_verified: brokerageIsVerified,
+          }
+        : null;
+
+    const uploaderAgent = {
+      unique_id: pick(row.uploader_unique_id, row.uploaded_by_id),
+      name: agentName,
+      full_name: agentName,
+      username: pick(row.profile_username, row.user_username),
+      avatar_url: agentAvatar,
+      avatar: agentAvatar,
+      bio: pick(row.profile_bio, row.user_bio),
+      country: pick(row.profile_country, row.user_country),
+      city: pick(row.profile_city, row.user_city),
+
+      // Keep public-safe contact. Do not expose phone unless permitted.
+      email: pick(row.profile_email, row.user_email),
+      phone:
+        canViewPrivateAdminFields ||
+        row.show_contact_phone === true ||
+        draftData.showContactPhone === true
+          ? pick(row.profile_phone, row.user_phone, row.contact_phone)
+          : null,
+
+      role: finalRole,
+      role_label: getRoleLabel(finalRole, row.user_is_solo_agent),
+      is_solo_agent: row.user_is_solo_agent,
+
+      company_name: companyName,
+      agency_name:
+        String(finalRole || "").toLowerCase() === "agent" &&
+        row.user_is_solo_agent === false
+          ? companyName
+          : null,
+      brokerage_name: ["brokerage", "brokerage_owner"].includes(
+        String(finalRole || "").toLowerCase(),
+      )
+        ? companyName
+        : null,
+
+      experience_years: row.agent_experience_years || null,
+
+      verification_status: isVerified
+        ? "verified"
+        : row.user_verification_status || "unverified",
+
+      is_verified: isVerified,
+      is_verified_agent: row.user_is_verified_agent === true,
+      public_badge: publicBadge,
+      created_at: row.user_created_at,
+    };
+
+    const primaryContactProfile = assignedAgent || uploaderAgent;
 
     const latitude = pick(row.latitude, draftData.latitude);
     const longitude = pick(row.longitude, draftData.longitude);
@@ -2056,8 +3591,18 @@ export const getListingByProductId = async (req, res) => {
           title_document_file: null,
         };
 
+    const badgeMeta = computeListingBadges(row, {
+      photos,
+      floorPlans: Array.isArray(floorPlans) ? floorPlans : [],
+      stagingPhotos: Array.isArray(stagingPhotos) ? stagingPhotos : [],
+      panoramaPhotos: Array.isArray(panoramaPhotos) ? panoramaPhotos : [],
+    });
+    const analyticsMeta = buildListingAnalytics(row, badgeMeta);
+
     const response = {
       ...row,
+      ...badgeMeta,
+      analytics: analyticsMeta,
 
       success: true,
 
@@ -2152,11 +3697,7 @@ export const getListingByProductId = async (req, res) => {
         "sqft",
       ),
 
-      land_area_unit: pick(
-        row.land_area_unit,
-        draftData.landAreaUnit,
-        "sqft",
-      ),
+      land_area_unit: pick(row.land_area_unit, draftData.landAreaUnit, "sqft"),
 
       zip_code: pick(row.zip_code, row.postal_code, draftData.zipCode),
       postal_code: pick(row.postal_code, row.zip_code, draftData.zipCode),
@@ -2195,7 +3736,8 @@ export const getListingByProductId = async (req, res) => {
       security_type: pick(row.security_type, draftData.securityType),
 
       generator_available:
-        row.generator_available !== null && row.generator_available !== undefined
+        row.generator_available !== null &&
+        row.generator_available !== undefined
           ? row.generator_available
           : toBool(draftData.generatorAvailable),
 
@@ -2348,7 +3890,8 @@ export const getListingByProductId = async (req, res) => {
       three_d_home_url: pick(row.three_d_home_url, draftData.threeDHomeUrl),
 
       allow_tour_requests:
-        row.allow_tour_requests !== null && row.allow_tour_requests !== undefined
+        row.allow_tour_requests !== null &&
+        row.allow_tour_requests !== undefined
           ? row.allow_tour_requests
           : draftData.allowTourRequests !== false,
 
@@ -2373,18 +3916,29 @@ export const getListingByProductId = async (req, res) => {
         draftData.minimumNoticeHours,
       ),
 
-      contact_name: pick(row.contact_name, draftData.contactName, agentName),
+      contact_name: pick(
+        row.contact_name,
+        draftData.contactName,
+        primaryContactProfile?.name,
+        agentName,
+      ),
 
       // Public contact behavior:
       // - Email is okay if listing chose email/platform contact.
       // - Phone only returns if show_contact_phone is true, unless owner/admin.
-      contact_email: pick(row.contact_email, draftData.contactEmail, row.user_email),
+      contact_email: pick(
+        row.contact_email,
+        draftData.contactEmail,
+        primaryContactProfile?.email,
+        row.user_email,
+      ),
 
       contact_phone:
         canViewPrivateAdminFields ||
         row.show_contact_phone === true ||
         draftData.showContactPhone === true
-          ? pick(row.contact_phone, draftData.contactPhone)
+          ? pick(row.contact_phone, draftData.contactPhone) ||
+            primaryContactProfile?.phone
           : null,
 
       contact_method: pick(row.contact_method, draftData.contactMethod),
@@ -2405,58 +3959,32 @@ export const getListingByProductId = async (req, res) => {
       payment_status: pick(row.payment_status, "unpaid"),
 
       is_favorited: row.is_favorited === true,
+      views_count: analyticsMeta.views_count,
+      saves_count: analyticsMeta.saves_count,
+      shares_count: analyticsMeta.shares_count,
+      contact_count: analyticsMeta.contact_count,
+      tour_request_count: analyticsMeta.tour_request_count,
+      previous_price: analyticsMeta.previous_price,
+      price_drop_amount: analyticsMeta.price_drop_amount,
+      price_drop_percent: analyticsMeta.price_drop_percent,
 
       agent_role: finalRole,
       role: finalRole,
 
       agent: {
-        unique_id: pick(row.uploader_unique_id, row.uploaded_by_id),
-        name: agentName,
-        full_name: agentName,
-        username: pick(row.profile_username, row.user_username),
-        avatar_url: agentAvatar,
-        avatar: agentAvatar,
-        bio: pick(row.profile_bio, row.user_bio),
-        country: pick(row.profile_country, row.user_country),
-        city: pick(row.profile_city, row.user_city),
-
-        // Keep public-safe contact. Do not expose phone unless permitted.
-        email: pick(row.profile_email, row.user_email),
-        phone:
-          canViewPrivateAdminFields ||
-          row.show_contact_phone === true ||
-          draftData.showContactPhone === true
-            ? pick(row.profile_phone, row.user_phone, row.contact_phone)
-            : null,
-
-        role: finalRole,
-        role_label: getRoleLabel(finalRole, row.user_is_solo_agent),
-        is_solo_agent: row.user_is_solo_agent,
-
-        company_name: companyName,
-        agency_name:
-          String(finalRole || "").toLowerCase() === "agent" &&
-          row.user_is_solo_agent === false
-            ? companyName
-            : null,
-        brokerage_name:
-          ["brokerage", "brokerage_owner"].includes(
-            String(finalRole || "").toLowerCase(),
-          )
-            ? companyName
-            : null,
-
-        experience_years: row.agent_experience_years || null,
-
-        verification_status: isVerified
-          ? "verified"
-          : row.user_verification_status || "unverified",
-
-        is_verified: isVerified,
-        is_verified_agent: row.user_is_verified_agent === true,
-        public_badge: publicBadge,
-        created_at: row.user_created_at,
+        ...primaryContactProfile,
+        company_name: pick(primaryContactProfile?.company_name, companyName),
+        brokerage_name: pick(
+          primaryContactProfile?.brokerage_name,
+          brokerageSummary?.company_name,
+          companyName,
+        ),
       },
+      creator: uploaderAgent,
+      submitter: uploaderAgent,
+      assigned_agent: assignedAgent,
+      brokerage: brokerageSummary,
+      contact_profile: primaryContactProfile,
     };
 
     return res.json(response);
@@ -2471,10 +3999,6 @@ export const getListingByProductId = async (req, res) => {
     });
   }
 };
-
-
-
-
 
 /* -------------------------------------------------------
    UPDATE LISTING STATUS - ADMIN
@@ -2496,11 +4020,10 @@ export const updateListingStatus = async (req, res) => {
 
     if (!listing) return res.status(404).json({ message: "Listing not found" });
 
-    const agentId = listing.agent_unique_id;
     let isActiveValue = listing.is_active;
 
     if (status === "approved") {
-      isActiveValue = listing.payment_status === "paid" ? true : false;
+      isActiveValue = true;
     } else if (status === "rejected" || status === "pending") {
       isActiveValue = false;
     }
@@ -2521,25 +4044,25 @@ export const updateListingStatus = async (req, res) => {
     ]);
     const updatedListing = result.rows[0];
 
-    let notifyMsg = `Your listing was ${status}.`;
-    if (status === "approved") {
-      notifyMsg += updatedListing.is_active
-        ? " It is now LIVE on the platform."
-        : " Please proceed to payment to activate it.";
-    }
-
-    await pool.query(
-      `INSERT INTO notifications (receiver_id, product_id, type, title, message)
-       VALUES ($1, $2, 'listing_status', 'Listing Status Update', $3)`,
-      [agentId, product_id, notifyMsg],
-    );
+    await notifyListingStatusUpdate({
+      listing: updatedListing,
+      status,
+      io: req.io,
+    });
 
     if (req.io) {
-      req.io.to(agentId).emit("listingStatusUpdated", {
-        product_id,
-        status,
-        is_active: isActiveValue,
-      });
+      const socketRecipient =
+        updatedListing.uploaded_by_id ||
+        updatedListing.agent_unique_id ||
+        updatedListing.created_by;
+
+      if (socketRecipient) {
+        req.io.to(String(socketRecipient)).emit("listingStatusUpdated", {
+          product_id,
+          status,
+          is_active: isActiveValue,
+        });
+      }
     }
 
     res.json({
@@ -2556,12 +4079,72 @@ export const updateListingStatus = async (req, res) => {
 export const activateListing = async (req, res) => {
   try {
     const { product_id } = req.params;
+    const userId = req.user?.unique_id;
+    const role = String(req.user?.role || "").toLowerCase();
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized.",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const existing = await pool.query(
+      `SELECT * FROM listings WHERE product_id=$1 LIMIT 1`,
+      [product_id],
+    );
+    const listing = existing.rows[0];
+
+    if (!listing) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing not found.",
+        code: "LISTING_NOT_FOUND",
+      });
+    }
+
+    const allowedIds = [
+      listing.uploaded_by_id,
+      listing.agent_unique_id,
+      listing.created_by,
+      listing.assigned_agent_id,
+      listing.agency_id,
+      listing.brokerage_id,
+    ]
+      .filter(Boolean)
+      .map((value) => String(value));
+
+    const canActivate =
+      allowedIds.includes(String(userId)) ||
+      role === "admin" ||
+      role === "super_admin";
+
+    if (!canActivate) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only activate listings you own or manage.",
+        code: "FORBIDDEN",
+      });
+    }
+
+    const status = String(listing.status || "").toLowerCase();
+    if (!["approved", "live", "published"].includes(status)) {
+      return res.status(409).json({
+        success: false,
+        message: "This listing must be approved before it can go live.",
+        code: "LISTING_NOT_APPROVED",
+      });
+    }
 
     const result = await pool.query(
       `
       UPDATE listings
       SET is_active=true,
-          payment_status='paid',
+          payment_status=CASE
+            WHEN payment_status IN ('paid', 'completed') THEN payment_status
+            ELSE 'not_required'
+          END,
           activated_at=NOW()
       WHERE product_id=$1
       RETURNING *;
@@ -2570,7 +4153,8 @@ export const activateListing = async (req, res) => {
     );
 
     res.json({
-      message: "Listing activated",
+      success: true,
+      message: "Listing activated and ready for buyers.",
       listing: result.rows[0],
     });
   } catch (err) {
@@ -2578,9 +4162,6 @@ export const activateListing = async (req, res) => {
     res.status(500).json({ message: "Failed to activate listing" });
   }
 };
-
-
-
 
 /* -------------------------------------------------------
    GET ALL LISTINGS - ADMIN
@@ -2596,7 +4177,8 @@ export const activateListing = async (req, res) => {
 export const getAllListingsAdmin = async (req, res) => {
   try {
     const parseAnyJson = (value, fallback = null) => {
-      if (value === undefined || value === null || value === "") return fallback;
+      if (value === undefined || value === null || value === "")
+        return fallback;
       if (Array.isArray(value)) return value;
       if (typeof value === "object") return value;
 
@@ -2742,7 +4324,11 @@ export const getAllListingsAdmin = async (req, res) => {
       );
 
       const paymentOptions = parseAnyJson(
-        pick(row.payment_options, draftData.paymentOptions, draftData.payment_options),
+        pick(
+          row.payment_options,
+          draftData.paymentOptions,
+          draftData.payment_options,
+        ),
         [],
       );
 
@@ -2934,7 +4520,8 @@ export const getAllListingsAdmin = async (req, res) => {
         power_supply: pick(row.power_supply, draftData.powerSupply),
         water_supply: pick(row.water_supply, draftData.waterSupply),
         internet_available:
-          row.internet_available !== null && row.internet_available !== undefined
+          row.internet_available !== null &&
+          row.internet_available !== undefined
             ? row.internet_available
             : toBool(draftData.internetAvailable),
 
@@ -3116,12 +4703,17 @@ export const getAllListingsAdmin = async (req, res) => {
         ),
 
         contact_name: pick(row.contact_name, draftData.contactName, agentName),
-        contact_email: pick(row.contact_email, draftData.contactEmail, row.user_email),
+        contact_email: pick(
+          row.contact_email,
+          draftData.contactEmail,
+          row.user_email,
+        ),
         contact_phone: pick(row.contact_phone, draftData.contactPhone),
         contact_method: pick(row.contact_method, draftData.contactMethod),
 
         show_contact_phone:
-          row.show_contact_phone !== null && row.show_contact_phone !== undefined
+          row.show_contact_phone !== null &&
+          row.show_contact_phone !== undefined
             ? row.show_contact_phone
             : toBool(draftData.showContactPhone),
 
@@ -3154,12 +4746,11 @@ export const getAllListingsAdmin = async (req, res) => {
           role_label: getRoleLabel(finalRole, row.user_is_solo_agent),
           is_solo_agent: row.user_is_solo_agent,
           company_name: companyName,
-          brokerage_name:
-            ["brokerage", "brokerage_owner"].includes(
-              String(finalRole || "").toLowerCase(),
-            )
-              ? companyName
-              : null,
+          brokerage_name: ["brokerage", "brokerage_owner"].includes(
+            String(finalRole || "").toLowerCase(),
+          )
+            ? companyName
+            : null,
           agency_name:
             String(finalRole || "").toLowerCase() === "agent" &&
             row.user_is_solo_agent === false
@@ -3197,306 +4788,24 @@ export const getAllListingsAdmin = async (req, res) => {
 ------------------------------------------------------- */
 export const getPublicAgentProfile = async (req, res) => {
   try {
-    let { unique_id } = req.params;
-
-    if (!unique_id) {
-      return res.status(400).json({
-        success: false,
-        message: "Profile identifier is required.",
-      });
-    }
-
-    let queryValue = String(unique_id).trim();
-
-    if (queryValue.startsWith("@")) {
-      queryValue = queryValue.substring(1);
-    }
-
-    const isUUID =
-      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        queryValue,
-      );
-
-    const profileWhere = isUUID
-      ? `u.unique_id::text = $1::text`
-      : `
-        (
-          LOWER(u.username) = LOWER($1)
-          OR LOWER(p.username) = LOWER($1)
-          OR LOWER(REPLACE(COALESCE(u.name, ''), ' ', '_')) = LOWER($1)
-          OR LOWER(REPLACE(COALESCE(p.full_name, ''), ' ', '_')) = LOWER($1)
-          OR LOWER(COALESCE(u.name, '')) = LOWER($1)
-          OR LOWER(COALESCE(p.full_name, '')) = LOWER($1)
-        )
-      `;
-
-    const profileQ = await pool.query(
-      `
-      SELECT
-        u.unique_id,
-        COALESCE(p.full_name, u.name, 'Keyvia User') AS full_name,
-        COALESCE(p.username, u.username) AS username,
-        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
-        COALESCE(p.bio, u.bio) AS bio,
-        COALESCE(p.country, u.country) AS country,
-        COALESCE(p.city, u.city) AS city,
-
-        u.role,
-        u.is_solo_agent,
-        u.verification_status,
-        u.is_verified,
-        u.subscription_plan,
-        u.subscription_status,
-        u.created_at,
-
-        ap.experience_years,
-
-        bp.company_name AS brokerage_company_name,
-
-        COALESCE(bp.company_name, u.brokerage_name) AS public_company_name,
-
-        p.social_instagram,
-        p.social_facebook,
-        p.social_twitter,
-        p.social_linkedin,
-        p.social_tiktok
-
-      FROM users u
-
-      LEFT JOIN profiles p
-        ON p.unique_id::text = u.unique_id::text
-
-      LEFT JOIN agent_profiles ap
-        ON ap.unique_id::text = u.unique_id::text
-
-      LEFT JOIN brokerage_profiles bp
-        ON bp.unique_id::text = u.unique_id::text
-
-      WHERE ${profileWhere}
-      LIMIT 1
-      `,
-      [queryValue],
-    );
-
-    if (!profileQ.rows.length) {
-      return res.status(404).json({
-        success: false,
-        message: "Profile not found.",
-      });
-    }
-
-    const rawProfile = profileQ.rows[0];
-
-    const role = String(rawProfile.role || "").toLowerCase();
-
-    const verificationStatus = String(
-      rawProfile.verification_status || "",
-    ).toLowerCase();
-
-    const isIdentityVerified =
-      rawProfile.is_verified === true ||
-      verificationStatus === "verified" ||
-      verificationStatus === "approved";
-
-    const subscriptionPlan = String(
-      rawProfile.subscription_plan || "free",
-    ).toLowerCase();
-
-    const subscriptionStatus = String(
-      rawProfile.subscription_status || "",
-    ).toLowerCase();
-
-    const hasActiveSubscription = subscriptionStatus === "active";
-
-    const isElitePlan =
-      hasActiveSubscription &&
-      [
-        "elite_agent",
-        "elite_owner",
-        "elite_brokerage",
-        "enterprise",
-      ].includes(subscriptionPlan);
-
-    const isProPlan =
-      hasActiveSubscription &&
-      ["pro_agent", "pro_owner", "pro_brokerage"].includes(subscriptionPlan);
-
-    let publicBadge = null;
-
-    if (isIdentityVerified && isElitePlan) {
-      publicBadge = "elite_verified";
-    } else if (isIdentityVerified && isProPlan) {
-      publicBadge = "pro_verified";
-    } else if (isIdentityVerified) {
-      publicBadge = "verified";
-    }
-
-    let roleLabel = "Keyvia Member";
-
-    if (role === "agent") {
-      roleLabel =
-        rawProfile.is_solo_agent === false
-          ? "Agency Agent"
-          : "Real Estate Agent";
-    } else if (role === "owner" || role === "landlord") {
-      roleLabel = "Property Owner";
-    } else if (role === "brokerage" || role === "brokerage_owner") {
-      roleLabel = "Brokerage Company";
-    } else if (role === "buyer") {
-      roleLabel = "Buyer";
-    }
-
-    const countryCode = COUNTRY_ISO_MAP?.[rawProfile.country] || null;
-
-    const agent = {
-      unique_id: rawProfile.unique_id,
-      full_name: rawProfile.full_name,
-      username: rawProfile.username,
-      avatar_url: rawProfile.avatar_url,
-      bio: rawProfile.bio,
-      country: rawProfile.country,
-      country_code: countryCode,
-      city: rawProfile.city,
-
-      role,
-      role_label: roleLabel,
-      is_solo_agent: rawProfile.is_solo_agent,
-
-      verification_status: isIdentityVerified
-        ? "verified"
-        : verificationStatus || "unverified",
-      is_verified: isIdentityVerified,
-
-      // Public display badge only.
-      // Do not expose subscription_plan to frontend users.
-      public_badge: publicBadge,
-
-      experience_years: rawProfile.experience_years || null,
-
-      company_name: rawProfile.public_company_name || null,
-      agency_name:
-        role === "agent" && rawProfile.is_solo_agent === false
-          ? rawProfile.public_company_name || null
-          : null,
-      brokerage_name:
-        role === "brokerage" || role === "brokerage_owner"
-          ? rawProfile.public_company_name || null
-          : null,
-
-      created_at: rawProfile.created_at,
-
-      social_instagram: rawProfile.social_instagram || null,
-      social_facebook: rawProfile.social_facebook || null,
-      social_twitter: rawProfile.social_twitter || null,
-      social_linkedin: rawProfile.social_linkedin || null,
-      social_tiktok: rawProfile.social_tiktok || null,
-    };
-
-    let listings = [];
-
-    if (role !== "buyer") {
-      const listingsQ = await pool.query(
-        `
-        SELECT
-          product_id,
-          title,
-          description,
-
-          property_type,
-          property_subtype,
-          listing_type,
-          category,
-
-          price,
-          currency,
-          price_currency,
-          price_period,
-
-          bedrooms,
-          bathrooms,
-          square_footage,
-          area_sqft,
-          lot_size,
-          year_built,
-
-          address,
-          city,
-          state,
-          country,
-          neighborhood,
-          estate_name,
-          landmark,
-
-          latitude,
-          longitude,
-
-          photos,
-          features,
-          amenities,
-
-          views_count,
-          saves_count,
-          shares_count,
-
-          created_at,
-          listed_at,
-          activated_at,
-          updated_at
-
-        FROM listings
-        WHERE
-          (
-            uploaded_by_id::text = $1::text
-            OR agent_unique_id::text = $1::text
-            OR created_by::text = $1::text
-          )
-          AND status = 'approved'
-          AND is_active = true
-        ORDER BY COALESCE(activated_at, listed_at, created_at) DESC
-        LIMIT 100
-        `,
-        [String(agent.unique_id)],
-      );
-
-      listings = listingsQ.rows.map((listing) => ({
-        ...listing,
-        photos: normalizePhotosForResponse(listing.photos),
-        features: safeJsonParse(listing.features, []),
-        amenities: safeJsonParse(listing.amenities, []),
-        latitude: listing.latitude ? parseFloat(listing.latitude) : null,
-        longitude: listing.longitude ? parseFloat(listing.longitude) : null,
-        price_currency: listing.price_currency || listing.currency || "USD",
-        square_footage: listing.square_footage || listing.area_sqft || null,
-      }));
-    }
-
-    const profileViews = 0;
-
-    const listingViews = listings.reduce(
-      (sum, listing) => sum + Number(listing.views_count || 0),
-      0,
-    );
-
-    return res.json({
-      success: true,
-      agent,
-      listings,
-      analytics: {
-        profile_views: profileViews,
-        listing_views: listingViews,
-      },
-      default_cover:
-        role === "buyer"
-          ? "https://images.unsplash.com/photo-1560518883-ce09059eeffa?q=80&w=1973&auto=format&fit=crop"
-          : null,
+    const payload = await resolvePublicProfilePayload({
+      identifier: req.params.unique_id,
     });
-  } catch (err) {
-    console.error("[GetPublicProfile] Error:", err);
 
-    return res.status(500).json({
+    return res.json(payload);
+  } catch (err) {
+    const status = err.statusCode || 500;
+
+    if (status >= 500) {
+      console.error("[GetPublicProfile] Error:", err);
+    }
+
+    return res.status(status).json({
       success: false,
-      message: "Server Error",
-      details: err.message,
+      message:
+        status === 500
+          ? "Failed to fetch public profile."
+          : err.message || "Profile not found.",
     });
   }
 };
@@ -3663,7 +4972,9 @@ export const batchAnalyzeListings = async (req, res) => {
         const updatedListing = updateQ.rows[0];
 
         const receiverId =
-          listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
+          listing.uploaded_by_id ||
+          listing.agent_unique_id ||
+          listing.created_by;
 
         if (receiverId) {
           let notificationTitle = "Listing Review Update";
@@ -3693,7 +5004,12 @@ export const batchAnalyzeListings = async (req, res) => {
               )
               VALUES ($1::uuid, $2, 'listing_status', $3, $4, NOW())
               `,
-              [String(receiverId), listing.product_id, notificationTitle, notificationMsg],
+              [
+                String(receiverId),
+                listing.product_id,
+                notificationTitle,
+                notificationMsg,
+              ],
             );
           } catch (notifyErr) {
             console.warn(
@@ -3762,9 +5078,6 @@ export const batchAnalyzeListings = async (req, res) => {
   }
 };
 
-
-
-
 export const createListingDraft = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
@@ -3796,6 +5109,30 @@ export const createListingDraft = async (req, res) => {
       });
     }
 
+    const userRes = await pool.query(
+      `
+      SELECT role, linked_agency_id, is_solo_agent
+      FROM users
+      WHERE unique_id = $1::uuid
+      LIMIT 1
+      `,
+      [String(userId)],
+    );
+    const currentUser = userRes.rows[0] || {};
+    const role = String(currentUser.role || req.user?.role || "").toLowerCase();
+    const isBrokerageCreator = ["brokerage", "brokerage_owner"].includes(role);
+    const isAgencyAgentCreator =
+      role === "agent" &&
+      (currentUser.is_solo_agent === false || currentUser.linked_agency_id);
+    const listingAgencyId =
+      b.agency_id ||
+      b.agencyId ||
+      (isBrokerageCreator
+        ? String(userId)
+        : isAgencyAgentCreator
+          ? currentUser.linked_agency_id
+          : null);
+
     const result = await pool.query(
       `
       INSERT INTO listings (
@@ -3804,6 +5141,7 @@ export const createListingDraft = async (req, res) => {
         uploaded_by_id,
         created_by,
         agent_unique_id,
+        agency_id,
 
         title,
         property_type,
@@ -3819,6 +5157,7 @@ export const createListingDraft = async (req, res) => {
         country,
         state,
         city,
+        floor_plans,
 
         status,
         moderation_status,
@@ -3837,6 +5176,7 @@ export const createListingDraft = async (req, res) => {
         $2::uuid,
         $2::uuid,
         $2::uuid,
+        $15::uuid,
 
         $3,
         $4,
@@ -3852,6 +5192,7 @@ export const createListingDraft = async (req, res) => {
         $10,
         $11,
         $12,
+        $16::jsonb,
 
         'draft',
         'draft',
@@ -3885,6 +5226,8 @@ export const createListingDraft = async (req, res) => {
 
         b.current_step || "location",
         JSON.stringify(b.draft_data || b),
+        listingAgencyId,
+        JSON.stringify(b.floor_plans || b.floorPlans || []),
       ],
     );
 
@@ -3973,11 +5316,12 @@ export const updateListingDraft = async (req, res) => {
 
         draft_data = $23::jsonb,
         current_step = COALESCE($24, current_step),
+        floor_plans = COALESCE($25::jsonb, floor_plans),
         autosaved_at = NOW(),
         last_updated_at = NOW(),
         updated_at = NOW()
-      WHERE product_id = $25
-      AND uploaded_by_id = $26::uuid
+      WHERE product_id = $26
+      AND uploaded_by_id = $27::uuid
       AND status = 'draft'
       RETURNING *;
       `,
@@ -4011,6 +5355,9 @@ export const updateListingDraft = async (req, res) => {
 
         JSON.stringify(b.draft_data || b),
         b.current_step || null,
+        b.floor_plans || b.floorPlans
+          ? JSON.stringify(b.floor_plans || b.floorPlans)
+          : null,
 
         product_id,
         String(userId),
@@ -4060,6 +5407,7 @@ export const getMyListingDrafts = async (req, res) => {
         current_step,
         draft_data,
         photos,
+        floor_plans,
         autosaved_at,
         updated_at,
         created_at
@@ -4131,9 +5479,6 @@ export const getListingDraftByProductId = async (req, res) => {
     });
   }
 };
-
-
-
 
 /* -------------------------------------------------------
    SUBMIT LISTING DRAFT
@@ -4644,9 +5989,7 @@ export const submitListingDraft = async (req, res) => {
         toNumberOrNull(b.down_payment_percent || b.downPaymentPercent),
         toNumberOrNull(b.interest_rate_estimate || b.interestRateEstimate),
         toNumberOrNull(b.hoa_fee || b.hoaFee),
-        toNumberOrNull(
-          b.property_tax_estimate || b.propertyTaxEstimate,
-        ),
+        toNumberOrNull(b.property_tax_estimate || b.propertyTaxEstimate),
         toNumberOrNull(b.insurance_estimate || b.insuranceEstimate),
         toNumberOrNull(b.price_per_sqft || b.pricePerSqft),
         typeof b.price_negotiable === "boolean"
@@ -4697,15 +6040,11 @@ export const submitListingDraft = async (req, res) => {
           existing.virtual_tour_public_id ||
           null,
 
-        b.virtual_tour_file
-          ? JSON.stringify(b.virtual_tour_file)
-          : null,
+        b.virtual_tour_file ? JSON.stringify(b.virtual_tour_file) : null,
 
         b.three_d_home_url || b.threeDHomeUrl || null,
 
-        b.title_document_file
-          ? JSON.stringify(b.title_document_file)
-          : null,
+        b.title_document_file ? JSON.stringify(b.title_document_file) : null,
 
         JSON.stringify(featuresArr),
         JSON.stringify(amenitiesArr),
@@ -4764,6 +6103,26 @@ export const submitListingDraft = async (req, res) => {
         success: false,
         message: "Draft could not be submitted.",
         code: "SUBMIT_DRAFT_NOT_UPDATED",
+      });
+    }
+
+    if (shouldAutoPublish) {
+      await notifyListingStatusUpdate({
+        listing,
+        status: "approved",
+        io: req.io,
+      });
+    } else {
+      await notifyListingSubmitted(listing, { io: req.io });
+    }
+
+    if (listing.assigned_agent_id) {
+      await notifyListingAssigned({
+        listing,
+        agentId: listing.assigned_agent_id,
+        brokerageId: listing.agency_id || userId,
+        brokerageName: "Your brokerage",
+        io: req.io,
       });
     }
 
