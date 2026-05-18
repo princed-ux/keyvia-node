@@ -108,6 +108,43 @@ const getInsertValue = (columns, column, value) => {
   return value;
 };
 
+const normalizeCreateNotificationType = (type) => {
+  const value = String(type || "system").toLowerCase().trim();
+
+  const directTypes = new Set([
+    "account_approval",
+    "account_rejection",
+    "brokerage_approval_request",
+    "brokerage_approval_confirmed",
+    "agent_join_request",
+    "agent_join_approved",
+    "listing_published",
+    "listing_flagged",
+    "listing_removed",
+    "listing_view",
+    "message",
+    "offer",
+    "live_tour",
+    "approval",
+    "payment",
+    "system",
+  ]);
+
+  if (directTypes.has(value)) return value;
+
+  if (value.includes("message") || value.includes("inquiry") || value.includes("tour_request")) {
+    return "message";
+  }
+
+  if (value.includes("live_tour")) return "live_tour";
+  if (value.includes("report") || value.includes("flag")) return "system";
+  if (value.includes("approved") || value.includes("rejected") || value.includes("submitted")) {
+    return "approval";
+  }
+
+  return "system";
+};
+
 export const createNotification = async ({
   recipientId,
   userId,
@@ -128,13 +165,15 @@ export const createNotification = async ({
   if (!targetId || !title) return null;
 
   const columns = await getNotificationColumns();
+  const originalType = type || "system";
+  const safeType = normalizeCreateNotificationType(originalType);
   const payload = {
     id: crypto.randomUUID(),
     recipient_id: targetId,
     receiver_id: targetId,
     user_id: targetId,
     sender_id: senderId,
-    type,
+    type: safeType,
     title,
     message,
     product_id: productId || (entityType === "listing" ? entityId : null),
@@ -146,7 +185,10 @@ export const createNotification = async ({
     action_url: actionUrl,
     action_label: actionLabel,
     link: actionUrl,
-    data,
+    data: {
+      ...(data || {}),
+      event_type: originalType,
+    },
     is_read: false,
     created_at: new Date(),
   };
@@ -183,6 +225,15 @@ export const createNotification = async ({
   if (io && targetId) {
     io.to(String(targetId)).emit("notification", notification);
   }
+
+  client.query(
+    `
+    INSERT INTO notification_delivery (notification_id, recipient_id, channel, status, delivered_at)
+    VALUES ($1, $2, 'in_app', 'delivered', NOW())
+    ON CONFLICT DO NOTHING
+    `,
+    [notification.id, targetId],
+  ).catch(() => {});
 
   return notification;
 };
@@ -267,11 +318,21 @@ export const notifyListingStatusUpdate = async ({
 export const notifyListingAssigned = async ({
   listing = {},
   agentId,
+  oldAgentId,
   brokerageId,
   brokerageName,
+  assignedBy,
   io = null,
 } = {}) => {
   if (!agentId || !listing.product_id) return null;
+
+  pool.query(
+    `
+    INSERT INTO agent_assignment_history (listing_id, product_id, old_agent_id, new_agent_id, assigned_by)
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [listing.id || null, listing.product_id, oldAgentId || null, agentId, assignedBy || brokerageId || null],
+  ).catch(() => {});
 
   return createNotification({
     io,

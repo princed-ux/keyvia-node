@@ -7,6 +7,10 @@ import { performFullAnalysis } from "../services/analysisService.js";
 import { COUNTRY_ISO_MAP } from "../utils/countryMap.js";
 import { evaluateListingRisk } from "../services/listingRiskService.js";
 import { enforceListingLimit } from "../services/subscriptionService.js";
+import {
+  getLatestLocationIntelligence,
+  scanLocationIntelligence,
+} from "../services/locationIntelligenceService.js";
 import { resolvePublicProfilePayload } from "./profileController.js";
 import {
   createNotification,
@@ -440,6 +444,18 @@ const getListingTypeFilterValues = ({
 const getNumericQueryValue = (value) => {
   const numberValue = Number(value);
   return Number.isFinite(numberValue) ? numberValue : null;
+};
+
+const getBooleanQueryValue = (value) => {
+  if (value === true || value === "true" || value === "1" || value === 1) {
+    return true;
+  }
+
+  if (value === false || value === "false" || value === "0" || value === 0) {
+    return false;
+  }
+
+  return null;
 };
 
 const getLimitedResultCount = (value) => {
@@ -1313,7 +1329,8 @@ export const createListing = async (req, res) => {
         listed_at,
         last_updated_at,
         created_at,
-        updated_at
+        updated_at,
+        project_id
       )
       VALUES (
         $1,$2,$3::uuid,$3::uuid,$3::uuid,$4,$104::uuid,
@@ -1362,7 +1379,8 @@ export const createListing = async (req, res) => {
         NOW(),
         NOW(),
         NOW(),
-        NOW()
+        NOW(),
+        $105::bigint
       )
       RETURNING *;
       `,
@@ -1489,12 +1507,16 @@ export const createListing = async (req, res) => {
         JSON.stringify(featuresArr),
         JSON.stringify(amenitiesArr),
         assignedAgentId,
+        b.project_id ? Number(b.project_id) : null,
       ],
     );
 
-    const listing = result.rows[0];
+    let listing = result.rows[0];
+    listing = (await updateListingLocationMetadata(product_id, b)) || listing;
+    listing = (await updateListingFinancialMetadata(product_id, b)) || listing;
 
     notifyListingSubmitted(listing, { io: req.io });
+    maybeTriggerLocationScan(listing);
 
     if (assignedAgentId) {
       notifyListingAssigned({
@@ -1894,6 +1916,30 @@ export const updateListing = async (req, res) => {
     ];
 
     const result = await pool.query(query, params);
+    let updatedListing = result.rows[0];
+    updatedListing =
+      (await updateListingLocationMetadata(product_id, b)) || updatedListing;
+    updatedListing =
+      (await updateListingFinancialMetadata(product_id, b)) || updatedListing;
+
+    await recordListingHistory({
+      listing,
+      productId: product_id,
+      changedBy: userId,
+      oldPrice: listing.price,
+      newPrice: updatedListing.price,
+      currency: updatedListing.price_currency || updatedListing.currency,
+      oldStatus: listing.status,
+      newStatus: updatedListing.status,
+      reason: nextModerationReason,
+    });
+
+    const locationChanged = ["address", "city", "state", "country", "latitude", "longitude"].some(
+      (field) => majorChangedFields.includes(field),
+    );
+    if (locationChanged) {
+      maybeTriggerLocationScan(updatedListing);
+    }
 
     return res.json({
       success: true,
@@ -1903,7 +1949,7 @@ export const updateListing = async (req, res) => {
       message: keepLiveAfterEdit
         ? "Listing updated successfully."
         : "Listing updated successfully and sent for review.",
-      listing: result.rows[0],
+      listing: updatedListing,
     });
   } catch (err) {
     console.error("UpdateListing Error:", err);
@@ -2044,6 +2090,23 @@ export const getListings = async (req, res) => {
       minBathrooms,
       minSqft,
       maxSqft,
+      furnishing,
+      furnished,
+      minHoa,
+      maxHoa,
+      minServiceCharge,
+      maxServiceCharge,
+      verifiedOnly,
+      liveToursNow,
+      videoTours,
+      mortgage,
+      installment,
+      rentToOwn,
+      newListings,
+      priceReduced,
+      propertyCondition,
+      amenities,
+      utilities,
       limit,
       polygon,
     } = req.query;
@@ -2069,6 +2132,22 @@ export const getListings = async (req, res) => {
     const minBathroomsValue = getNumericQueryValue(minBathrooms || bathrooms);
     const minSqftValue = getNumericQueryValue(minSqft);
     const maxSqftValue = getNumericQueryValue(maxSqft);
+    const minHoaValue = getNumericQueryValue(minHoa);
+    const maxHoaValue = getNumericQueryValue(maxHoa);
+    const minServiceChargeValue = getNumericQueryValue(minServiceCharge);
+    const maxServiceChargeValue = getNumericQueryValue(maxServiceCharge);
+    const verifiedOnlyValue = getBooleanQueryValue(verifiedOnly);
+    const liveToursNowValue = getBooleanQueryValue(liveToursNow);
+    const videoToursValue = getBooleanQueryValue(videoTours);
+    const mortgageValue = getBooleanQueryValue(mortgage);
+    const installmentValue = getBooleanQueryValue(installment);
+    const rentToOwnValue = getBooleanQueryValue(rentToOwn);
+    const newListingsValue = getBooleanQueryValue(newListings);
+    const priceReducedValue = getBooleanQueryValue(priceReduced);
+    const furnishingValue = normalizeFilterToken(furnishing || furnished);
+    const propertyConditionValue = normalizeFilterToken(propertyCondition);
+    const amenityFilters = parseCsv(amenities).map(normalizeFilterToken);
+    const utilityFilters = parseCsv(utilities).map(normalizeFilterToken);
     const requestedLimit = getLimitedResultCount(limit);
 
     let queryText = `
@@ -2114,6 +2193,10 @@ export const getListings = async (req, res) => {
         brokerage_bp.logo_url AS listing_brokerage_logo_url,
         brokerage_bp.verified_badge AS listing_brokerage_verified_badge,
         legacy_b.id AS legacy_brokerage_id,
+        active_lt.id AS active_live_tour_id,
+        active_lt.current_viewers AS active_live_current_viewers,
+        active_lt.total_viewers AS active_live_total_viewers,
+        active_lt.peak_viewers AS active_live_peak_viewers,
         CASE WHEN f.product_id IS NOT NULL THEN true ELSE false END as is_favorited
       FROM listings l
       JOIN users u ON l.uploaded_by_id = u.unique_id
@@ -2133,6 +2216,14 @@ export const getListings = async (req, res) => {
           l.agency_id::text
         )
       LEFT JOIN brokerage_profiles brokerage_bp ON brokerage_bp.unique_id::text = brokerage_u.unique_id::text
+      LEFT JOIN LATERAL (
+        SELECT id, current_viewers, total_viewers, peak_viewers
+        FROM live_tours
+        WHERE property_id = l.id
+          AND is_live = TRUE
+        ORDER BY started_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1
+      ) active_lt ON TRUE
       LEFT JOIN favorites f ON l.product_id = f.product_id AND f.user_id::text = $1::text
       WHERE l.status = 'approved'
       AND l.is_active = true
@@ -2245,6 +2336,133 @@ export const getListings = async (req, res) => {
         ) <= $${paramCounter}`;
       queryParams.push(maxSqftValue);
       paramCounter++;
+    }
+
+    if (furnishingValue) {
+      queryText += `
+        AND regexp_replace(LOWER(COALESCE(l.furnishing::text, '')), '[\\s-]+', '_', 'g') = $${paramCounter}`;
+      queryParams.push(furnishingValue);
+      paramCounter++;
+    }
+
+    if (propertyConditionValue) {
+      queryText += `
+        AND regexp_replace(LOWER(COALESCE(l.property_condition::text, '')), '[\\s-]+', '_', 'g') = $${paramCounter}`;
+      queryParams.push(propertyConditionValue);
+      paramCounter++;
+    }
+
+    if (minHoaValue !== null) {
+      queryText += ` AND COALESCE(l.hoa_fee, 0) >= $${paramCounter}`;
+      queryParams.push(minHoaValue);
+      paramCounter++;
+    }
+
+    if (maxHoaValue !== null) {
+      queryText += ` AND COALESCE(l.hoa_fee, 0) <= $${paramCounter}`;
+      queryParams.push(maxHoaValue);
+      paramCounter++;
+    }
+
+    if (minServiceChargeValue !== null) {
+      queryText += ` AND COALESCE(l.service_charge, 0) >= $${paramCounter}`;
+      queryParams.push(minServiceChargeValue);
+      paramCounter++;
+    }
+
+    if (maxServiceChargeValue !== null) {
+      queryText += ` AND COALESCE(l.service_charge, 0) <= $${paramCounter}`;
+      queryParams.push(maxServiceChargeValue);
+      paramCounter++;
+    }
+
+    if (verifiedOnlyValue === true) {
+      queryText += `
+        AND (
+          l.title_verified = TRUE
+          OR u.is_verified = TRUE
+          OR u.is_verified_agent = TRUE
+          OR LOWER(COALESCE(u.verification_status::text, '')) IN ('approved', 'verified')
+          OR brokerage_u.is_verified = TRUE
+          OR brokerage_bp.verified_badge = TRUE
+        )`;
+    }
+
+    if (liveToursNowValue === true) {
+      queryText += ` AND active_lt.id IS NOT NULL`;
+    }
+
+    if (videoToursValue === true) {
+      queryText += `
+        AND (
+          COALESCE(l.allow_video_tour, FALSE) = TRUE
+          OR NULLIF(l.video_url, '') IS NOT NULL
+          OR NULLIF(l.virtual_tour_url, '') IS NOT NULL
+          OR NULLIF(l.three_d_home_url, '') IS NOT NULL
+          OR NULLIF(l.video_public_id, '') IS NOT NULL
+          OR NULLIF(l.virtual_tour_public_id, '') IS NOT NULL
+        )`;
+    }
+
+    if (mortgageValue === true) {
+      queryText += ` AND COALESCE(l.mortgage_available, FALSE) = TRUE`;
+    }
+
+    if (installmentValue === true) {
+      queryText += ` AND COALESCE(l.installment_available, FALSE) = TRUE`;
+    }
+
+    if (rentToOwnValue === true) {
+      queryText += ` AND COALESCE(l.rent_to_own_available, FALSE) = TRUE`;
+    }
+
+    if (newListingsValue === true) {
+      queryText += `
+        AND COALESCE(l.published_at, l.activated_at, l.listed_at, l.created_at) >= NOW() - INTERVAL '14 days'`;
+    }
+
+    if (priceReducedValue === true) {
+      queryText += `
+        AND (
+          COALESCE(l.price_drop_amount, 0) > 0
+          OR l.last_price_drop_at IS NOT NULL
+          OR (
+            l.previous_price IS NOT NULL
+            AND l.previous_price > l.price
+          )
+        )`;
+    }
+
+    if (amenityFilters.length > 0) {
+      queryText += `
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(l.amenities::jsonb) = 'array' THEN l.amenities::jsonb
+              ELSE '[]'::jsonb
+            END
+          ) AS amenity(value)
+          WHERE regexp_replace(LOWER(amenity.value), '[\\s-]+', '_', 'g') = ANY($${paramCounter}::text[])
+        )`;
+      queryParams.push([...new Set(amenityFilters)]);
+      paramCounter++;
+    }
+
+    if (utilityFilters.length > 0) {
+      const utilityConditions = {
+        internet: "COALESCE(l.internet_available, FALSE) = TRUE",
+        generator: "COALESCE(l.generator_available, FALSE) = TRUE",
+        borehole: "COALESCE(l.borehole, FALSE) = TRUE",
+        prepaid_meter: "COALESCE(l.prepaid_meter, FALSE) = TRUE",
+      };
+      const selectedUtilityConditions = [...new Set(utilityFilters)]
+        .map((token) => utilityConditions[token])
+        .filter(Boolean);
+
+      if (selectedUtilityConditions.length > 0) {
+        queryText += ` AND (${selectedUtilityConditions.join(" OR ")})`;
+      }
     }
 
     if (search) {
@@ -2478,6 +2696,12 @@ export const getListings = async (req, res) => {
         agent_unique_id: listing.agent_unique_id || listing.uploaded_by_id,
         created_by: listing.created_by || listing.uploaded_by_id,
         price_currency: listing.price_currency || listing.currency || "USD",
+        live_now: Boolean(listing.active_live_tour_id),
+        live_tour_status: listing.active_live_tour_id ? "live" : null,
+        live_tour_id: listing.active_live_tour_id || null,
+        current_viewers: Number(listing.active_live_current_viewers || 0),
+        total_viewers: Number(listing.active_live_total_viewers || 0),
+        peak_viewers: Number(listing.active_live_peak_viewers || 0),
         building_area_sqft:
           listing.building_area_sqft ||
           listing.area_sqft ||
@@ -2504,6 +2728,18 @@ export const getListings = async (req, res) => {
         max_price: maxPriceValue,
         min_bedrooms: minBedroomsValue,
         min_bathrooms: minBathroomsValue,
+        furnishing: furnishingValue || null,
+        property_condition: propertyConditionValue || null,
+        verified_only: verifiedOnlyValue === true,
+        live_tours_now: liveToursNowValue === true,
+        video_tours: videoToursValue === true,
+        mortgage: mortgageValue === true,
+        installment: installmentValue === true,
+        rent_to_own: rentToOwnValue === true,
+        new_listings: newListingsValue === true,
+        price_reduced: priceReducedValue === true,
+        amenities: [...new Set(amenityFilters)],
+        utilities: [...new Set(utilityFilters)],
       },
     });
   } catch (err) {
@@ -2519,7 +2755,7 @@ export const reportListing = async (req, res) => {
   try {
     const { product_id } = req.params;
     const reporterId = req.user?.unique_id || null;
-    const { reason } = req.body || {};
+    const { reason, details, message, email, reporter_email } = req.body || {};
 
     if (!product_id) {
       return res.status(400).json({
@@ -2549,6 +2785,20 @@ export const reportListing = async (req, res) => {
       });
     }
 
+    const reportDetails = [details, message].find((value) =>
+      String(value || "").trim(),
+    );
+    const reporterEmail = [email, reporter_email].find((value) =>
+      String(value || "").trim(),
+    );
+    const reportSummary = [
+      String(reason).trim(),
+      reportDetails ? `Details: ${String(reportDetails).trim()}` : null,
+      reporterEmail ? `Reporter email: ${String(reporterEmail).trim()}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
     try {
       await pool.query(
         `
@@ -2568,7 +2818,7 @@ export const reportListing = async (req, res) => {
           listing.id,
           reporterId ? String(reporterId) : null,
           listing.uploaded_by_id,
-          String(reason).trim(),
+          reportSummary,
         ],
       );
     } catch (reportErr) {
@@ -2589,7 +2839,7 @@ export const reportListing = async (req, res) => {
         )
         WHERE product_id = $2
         `,
-        [String(reason).trim(), product_id],
+        [reportSummary, product_id],
       );
     }
 
@@ -2619,7 +2869,7 @@ export const reportListing = async (req, res) => {
               data: {
                 product_id,
                 reporter_id: reporterId,
-                reason: String(reason).trim(),
+                reason: reportSummary,
               },
             }),
           ),
@@ -2657,8 +2907,9 @@ const getListingInteractionRecipient = (listing = {}) =>
 const getTourTypeLabel = (tourType) => {
   const type = String(tourType || "").toLowerCase();
 
-  if (type === "video") return "video tour";
+  if (type === "video" || type === "video_live") return "video/live tour";
   if (type === "live") return "live tour";
+  if (type === "in_person") return "in-person tour";
 
   return "property tour";
 };
@@ -2709,8 +2960,12 @@ export const requestListingTour = async (req, res) => {
     const {
       requested_date,
       requested_time,
+      preferred_date,
+      preferred_time,
       tour_type = "in_person",
+      message = null,
       note = null,
+      source = "listing_detail",
     } = req.body || {};
 
     if (!product_id) {
@@ -2729,7 +2984,10 @@ export const requestListingTour = async (req, res) => {
       });
     }
 
-    const normalizedTourType = String(tour_type || "in_person").toLowerCase();
+    const normalizedTourType =
+      String(tour_type || "in_person").toLowerCase() === "video_live"
+        ? "video_live"
+        : String(tour_type || "in_person").toLowerCase();
 
     if (listing.allow_tour_requests === false) {
       return res.status(400).json({
@@ -2738,7 +2996,10 @@ export const requestListingTour = async (req, res) => {
       });
     }
 
-    if (normalizedTourType === "video" && listing.allow_video_tour === false) {
+    if (
+      ["video", "video_live", "live"].includes(normalizedTourType) &&
+      listing.allow_video_tour === false
+    ) {
       return res.status(400).json({
         success: false,
         message: "Video tours are not enabled for this listing.",
@@ -2777,12 +3038,55 @@ export const requestListingTour = async (req, res) => {
         `
         UPDATE listings
         SET tour_request_count = COALESCE(tour_request_count, 0) + 1,
-            contact_count = COALESCE(contact_count, 0) + 1
+        contact_count = COALESCE(contact_count, 0) + 1
         WHERE product_id = $1
         `,
         [product_id],
       )
       .catch(() => null);
+
+    await ensureListingInquiriesTable().catch(() => null);
+    await pool
+      .query(
+        `
+        INSERT INTO listing_inquiries (
+          listing_id,
+          product_id,
+          buyer_id,
+          agent_id,
+          owner_id,
+          inquiry_status,
+          crm_status,
+          source,
+          metadata,
+          last_contacted_at
+        )
+        VALUES ($1, $2, $3::uuid, $4::uuid, $5::uuid, 'viewing_scheduled', 'viewing_scheduled', $6, $7::jsonb, NOW())
+        ON CONFLICT (product_id, buyer_id, source)
+        DO UPDATE SET
+          inquiry_status = 'viewing_scheduled',
+          crm_status = 'viewing_scheduled',
+          metadata = listing_inquiries.metadata || EXCLUDED.metadata,
+          last_contacted_at = NOW(),
+          updated_at = NOW()
+        `,
+        [
+          listing.id,
+          product_id,
+          buyerId,
+          recipientId,
+          recipientId,
+          source || "listing_detail",
+          JSON.stringify({
+            inquiry_type: "tour_request",
+            tour_type: normalizedTourType,
+            preferred_date: preferred_date || requested_date || null,
+            preferred_time: preferred_time || requested_time || null,
+            message: message || note || null,
+          }),
+        ],
+      )
+      .catch((err) => console.warn("[RequestListingTour] inquiry tracking skipped:", err?.message));
 
     await createNotification({
       io: req.io,
@@ -2800,10 +3104,11 @@ export const requestListingTour = async (req, res) => {
         product_id,
         buyer_id: buyerId,
         buyer_name: req.user?.name || null,
-        requested_date: requested_date || null,
-        requested_time: requested_time || null,
+        requested_date: preferred_date || requested_date || null,
+        requested_time: preferred_time || requested_time || null,
         tour_type: normalizedTourType,
-        note,
+        note: message || note,
+        source,
       },
     });
 
@@ -2812,8 +3117,8 @@ export const requestListingTour = async (req, res) => {
       message: "Tour request sent.",
       data: {
         product_id,
-        requested_date: requested_date || null,
-        requested_time: requested_time || null,
+        requested_date: preferred_date || requested_date || null,
+        requested_time: preferred_time || requested_time || null,
         tour_type: normalizedTourType,
       },
     });
@@ -2894,6 +3199,719 @@ export const notifyLiveTourInterest = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Could not enable live tour notification.",
+    });
+  }
+};
+
+const tableExists = async (tableName) => {
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_name = $1
+    LIMIT 1
+    `,
+    [tableName],
+  );
+
+  return result.rowCount > 0;
+};
+
+const ensureListingInquiriesTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS listing_inquiries (
+      inquiry_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      listing_id UUID REFERENCES listings(id) ON DELETE SET NULL,
+      product_id VARCHAR(80) NOT NULL,
+      buyer_id UUID REFERENCES users(unique_id) ON DELETE SET NULL,
+      guest_name TEXT,
+      guest_email TEXT,
+      guest_phone TEXT,
+      agent_id UUID REFERENCES users(unique_id) ON DELETE SET NULL,
+      brokerage_id UUID,
+      owner_id UUID,
+      inquiry_status VARCHAR(40) NOT NULL DEFAULT 'new',
+      crm_status VARCHAR(60) NOT NULL DEFAULT 'interested',
+      source VARCHAR(80) NOT NULL DEFAULT 'listing_detail',
+      message_thread_id VARCHAR(120),
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      last_contacted_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(product_id, buyer_id, source)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_listing_inquiries_listing
+      ON listing_inquiries(product_id, created_at DESC);
+  `);
+
+  await pool.query(`
+    ALTER TABLE listing_inquiries
+      ADD COLUMN IF NOT EXISTS guest_name TEXT,
+      ADD COLUMN IF NOT EXISTS guest_email TEXT,
+      ADD COLUMN IF NOT EXISTS guest_phone TEXT;
+  `);
+};
+
+const userCanManageListing = (user = {}, listing = {}) => {
+  const role = String(user?.role || "").toLowerCase();
+  if (["admin", "super_admin", "superadmin"].includes(role)) return true;
+
+  const userId = String(user?.unique_id || user?.id || "");
+  if (!userId) return false;
+
+  return [
+    listing.uploaded_by_id,
+    listing.agent_unique_id,
+    listing.created_by,
+    listing.assigned_agent_id,
+    listing.agency_id,
+    listing.brokerage_id,
+  ]
+    .filter(Boolean)
+    .some((value) => String(value) === userId);
+};
+
+const canViewListingPublicData = (user = {}, listing = {}) => {
+  if (!listing) return false;
+  if (
+    String(listing.status || "").toLowerCase() === "approved" &&
+    listing.is_active === true
+  ) {
+    return true;
+  }
+  return userCanManageListing(user, listing);
+};
+
+const maybeTriggerLocationScan = (listing = {}) => {
+  if (!listing?.product_id || !listing?.latitude || !listing?.longitude) return;
+
+  scanLocationIntelligence({
+    listingId: listing.id || null,
+    productId: listing.product_id,
+    latitude: listing.latitude,
+    longitude: listing.longitude,
+  }).catch((err) => {
+    console.warn("[LocationIntelligence] background scan skipped:", err?.message);
+  });
+};
+
+const recordListingHistory = async ({
+  listing,
+  productId,
+  changedBy,
+  oldPrice,
+  newPrice,
+  currency,
+  oldStatus,
+  newStatus,
+  reason = null,
+} = {}) => {
+  try {
+    if (oldPrice !== undefined && newPrice !== undefined) {
+      const oldValue = toNumberOrNull(oldPrice);
+      const newValue = toNumberOrNull(newPrice);
+      if (newValue !== null && String(oldValue ?? "") !== String(newValue)) {
+        await pool.query(
+          `
+          INSERT INTO listing_price_history (
+            listing_id,
+            product_id,
+            old_price,
+            new_price,
+            currency,
+            changed_by,
+            source
+          )
+          VALUES ($1, $2, $3, $4, $5, $6::uuid, 'listing_update')
+          `,
+          [
+            listing?.id || null,
+            productId,
+            oldValue,
+            newValue,
+            currency || listing?.price_currency || listing?.currency || null,
+            changedBy || null,
+          ],
+        );
+      }
+    }
+
+    if (
+      oldStatus !== undefined &&
+      newStatus !== undefined &&
+      String(oldStatus || "") !== String(newStatus || "")
+    ) {
+      await pool.query(
+        `
+        INSERT INTO listing_status_history (
+          listing_id,
+          product_id,
+          old_status,
+          new_status,
+          changed_by,
+          reason
+        )
+        VALUES ($1, $2, $3, $4, $5::uuid, $6)
+        `,
+        [
+          listing?.id || null,
+          productId,
+          oldStatus || null,
+          newStatus || null,
+          changedBy || null,
+          reason,
+        ],
+      );
+    }
+  } catch (err) {
+    console.warn("[ListingHistory] record skipped:", err?.message);
+  }
+};
+
+const updateListingLocationMetadata = async (productId, body = {}) => {
+  const formattedAddress = body.formatted_address || body.formattedAddress || null;
+  const placeId = body.place_id || body.placeId || null;
+  const locationConfidence = body.location_confidence || body.locationConfidence || null;
+
+  if (!formattedAddress && !placeId && !locationConfidence) return null;
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE listings
+      SET
+        formatted_address = COALESCE($2, formatted_address),
+        place_id = COALESCE($3, place_id),
+        location_confidence = COALESCE($4, location_confidence),
+        updated_at = NOW()
+      WHERE product_id = $1
+      RETURNING *
+      `,
+      [productId, formattedAddress, placeId, locationConfidence],
+    );
+    return result.rows[0] || null;
+  } catch (err) {
+    console.warn("[Listings] location metadata update skipped:", err?.message);
+    return null;
+  }
+};
+
+const updateListingFinancialMetadata = async (productId, body = {}) => {
+  const values = {
+    property_tax_frequency:
+      body.property_tax_frequency || body.propertyTaxFrequency || null,
+    insurance_frequency:
+      body.insurance_frequency || body.insuranceFrequency || null,
+    estate_service_charge:
+      toNumberOrNull(body.estate_service_charge ?? body.estateServiceCharge),
+    estate_service_charge_frequency:
+      body.estate_service_charge_frequency ||
+      body.estateServiceChargeFrequency ||
+      null,
+    service_charge_frequency:
+      body.service_charge_frequency || body.serviceChargeFrequency || null,
+  };
+
+  if (Object.values(values).every((value) => value === null || value === "")) {
+    return null;
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE listings
+      SET
+        property_tax_frequency = COALESCE($2, property_tax_frequency),
+        insurance_frequency = COALESCE($3, insurance_frequency),
+        estate_service_charge = COALESCE($4, estate_service_charge),
+        estate_service_charge_frequency = COALESCE($5, estate_service_charge_frequency),
+        service_charge_frequency = COALESCE($6, service_charge_frequency),
+        updated_at = NOW()
+      WHERE product_id = $1
+      RETURNING *
+      `,
+      [
+        productId,
+        values.property_tax_frequency,
+        values.insurance_frequency,
+        values.estate_service_charge,
+        values.estate_service_charge_frequency,
+        values.service_charge_frequency,
+      ],
+    );
+    return result.rows[0] || null;
+  } catch (err) {
+    console.warn("[Listings] financial metadata update skipped:", err?.message);
+    return null;
+  }
+};
+
+export const createListingInquiry = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const buyerId = req.user?.unique_id || null;
+    const {
+      message = "",
+      source = "listing_detail",
+      contact_method = "keyvia",
+      preferred_contact_method = contact_method,
+      inquiry_type = "general",
+      name = "",
+      email = "",
+      phone = "",
+    } = req.body || {};
+
+    if (!buyerId && !String(email || "").trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Please include your email so the listing contact can reply.",
+      });
+    }
+
+    const listing = await getInteractionListing(product_id);
+    if (!listing || !isListingAvailableForBuyerInteraction(listing)) {
+      return res.status(404).json({
+        success: false,
+        message: "This listing is not available for inquiries.",
+      });
+    }
+
+    const recipientId = getListingInteractionRecipient(listing);
+    if (!recipientId) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing contact is not available.",
+      });
+    }
+
+    if (buyerId && String(recipientId) === String(buyerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot inquire about your own listing.",
+      });
+    }
+
+    await ensureListingInquiriesTable();
+
+    const result = await pool.query(
+      `
+      INSERT INTO listing_inquiries (
+        listing_id,
+        product_id,
+        buyer_id,
+        guest_name,
+        guest_email,
+        guest_phone,
+        agent_id,
+        owner_id,
+        inquiry_status,
+        crm_status,
+        source,
+        metadata,
+        last_contacted_at
+      )
+      VALUES ($1, $2, $3::uuid, $4, $5, $6, $7::uuid, $8::uuid, 'new', 'interested', $9, $10::jsonb, NOW())
+      ON CONFLICT (product_id, buyer_id, source)
+      DO UPDATE SET
+        inquiry_status = 'contacted',
+        crm_status = 'interested',
+        metadata = listing_inquiries.metadata || EXCLUDED.metadata,
+        last_contacted_at = NOW(),
+        updated_at = NOW()
+      RETURNING *
+      `,
+      [
+        listing.id,
+        product_id,
+        buyerId,
+        buyerId ? null : String(name || "").trim() || null,
+        buyerId ? null : String(email || "").trim(),
+        buyerId ? null : String(phone || "").trim() || null,
+        recipientId,
+        recipientId,
+        String(source || "listing_detail"),
+        JSON.stringify({
+          message: String(message || "").trim(),
+          preferred_contact_method,
+          inquiry_type,
+          buyer_name: req.user?.name || name || null,
+          buyer_email: req.user?.email || email || null,
+          buyer_phone: phone || null,
+        }),
+      ],
+    );
+
+    await pool
+      .query(
+        `
+        UPDATE listings
+        SET contact_count = COALESCE(contact_count, 0) + 1
+        WHERE product_id = $1
+        `,
+        [product_id],
+      )
+      .catch(() => null);
+
+    await createNotification({
+      io: req.io,
+      recipientId,
+      senderId: buyerId || null,
+      type: "listing_inquiry",
+      title: "New Listing Inquiry",
+      message: `${req.user?.name || name || "A buyer"} sent an inquiry for "${listing.title || listing.address || product_id}".`,
+      entityType: "listing",
+      entityId: product_id,
+      productId: product_id,
+      actionUrl: `/listing/${product_id}`,
+      actionLabel: "View Listing",
+      data: {
+        product_id,
+        buyer_id: buyerId,
+        guest_email: buyerId ? null : email || null,
+        source,
+      },
+    }).catch((err) => {
+      console.warn("[CreateListingInquiry] notification skipped:", err?.message);
+      return null;
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Inquiry sent.",
+      inquiry: result.rows[0],
+    });
+  } catch (err) {
+    console.error("[CreateListingInquiry] Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not send inquiry.",
+    });
+  }
+};
+
+export const trackListingShare = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+
+    await pool
+      .query(
+        `
+        UPDATE listings
+        SET shares_count = COALESCE(shares_count, 0) + 1
+        WHERE product_id = $1
+        `,
+        [product_id],
+      )
+      .catch(() => null);
+
+    return res.json({ success: true });
+  } catch (err) {
+    return res.json({ success: true });
+  }
+};
+
+export const trackListingContactClick = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+
+    await pool
+      .query(
+        `
+        UPDATE listings
+        SET contact_count = COALESCE(contact_count, 0) + 1
+        WHERE product_id = $1
+        `,
+        [product_id],
+      )
+      .catch(() => null);
+
+    return res.json({ success: true });
+  } catch (err) {
+    return res.json({ success: true });
+  }
+};
+
+export const getListingAnalytics = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const listing = await getInteractionListing(product_id);
+
+    if (!listing) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing not found.",
+      });
+    }
+
+    if (!userCanManageListing(req.user, listing)) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have access to analytics for this listing.",
+      });
+    }
+
+    const hasViewEvents = await tableExists("listing_view_events");
+    const hasInquiries = await tableExists("listing_inquiries");
+    const hasReports = await tableExists("safety_reports");
+
+    const [viewsRes, inquiryRes, reportRes] = await Promise.all([
+      hasViewEvents
+        ? pool.query(
+            `
+            SELECT
+              COUNT(*)::int AS unique_views,
+              viewed_on::date AS day,
+              COUNT(*)::int AS views
+            FROM listing_view_events
+            WHERE product_id = $1
+              AND viewed_on >= CURRENT_DATE - INTERVAL '29 days'
+            GROUP BY viewed_on
+            ORDER BY viewed_on ASC
+            `,
+            [product_id],
+          )
+        : Promise.resolve({ rows: [] }),
+      hasInquiries
+        ? pool.query(
+            `SELECT COUNT(*)::int AS total FROM listing_inquiries WHERE product_id = $1`,
+            [product_id],
+          )
+        : Promise.resolve({ rows: [{ total: 0 }] }),
+      hasReports
+        ? pool.query(
+            `SELECT COUNT(*)::int AS total FROM safety_reports WHERE product_id = $1`,
+            [product_id],
+          )
+        : Promise.resolve({ rows: [{ total: 0 }] }),
+    ]);
+
+    const daily = viewsRes.rows.map((row) => ({
+      date: row.day,
+      views: Number(row.views || 0),
+    }));
+
+    const uniqueViews = daily.reduce((sum, row) => sum + Number(row.views || 0), 0);
+
+    pool.query(
+      `
+      INSERT INTO listing_engagement_snapshots (product_id, views_count, saves_count, shares_count, contact_count, tour_request_count, snapshot_date)
+      VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE)
+      ON CONFLICT (product_id, snapshot_date)
+      DO UPDATE SET
+        views_count = EXCLUDED.views_count,
+        saves_count = EXCLUDED.saves_count,
+        shares_count = EXCLUDED.shares_count,
+        contact_count = EXCLUDED.contact_count,
+        tour_request_count = EXCLUDED.tour_request_count
+      `,
+      [
+        product_id,
+        Number(listing.views_count || 0),
+        Number(listing.saves_count || 0),
+        Number(listing.shares_count || 0),
+        Number(listing.contact_count || 0),
+        Number(listing.tour_request_count || 0),
+      ],
+    ).catch(() => {});
+
+    return res.json({
+      success: true,
+      analytics: {
+        product_id,
+        title: listing.title,
+        status: listing.status,
+        is_active: listing.is_active,
+        last_updated_at: listing.last_updated_at || listing.updated_at,
+        views: Number(listing.views_count || 0),
+        unique_views: uniqueViews,
+        saves: Number(listing.saves_count || 0),
+        shares: Number(listing.shares_count || 0),
+        inquiries: Number(inquiryRes.rows[0]?.total || listing.contact_count || 0),
+        contact_clicks: Number(listing.contact_count || 0),
+        tour_requests: Number(listing.tour_request_count || 0),
+        reports: Number(reportRes.rows[0]?.total || 0),
+        daily,
+      },
+    });
+  } catch (err) {
+    console.error("[GetListingAnalytics] Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Analytics unavailable right now.",
+    });
+  }
+};
+
+export const getListingLocationIntelligence = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const listing = await getInteractionListing(product_id);
+
+    if (!listing || !canViewListingPublicData(req.user || {}, listing)) {
+      return res.status(404).json({
+        success: false,
+        message: "Location intelligence is not available for this listing.",
+      });
+    }
+
+    const snapshot = await getLatestLocationIntelligence(product_id);
+    if (!snapshot) {
+      return res.json({
+        success: true,
+        status: listing.latitude && listing.longitude ? "pending" : "unavailable",
+        location_intelligence: {
+          product_id,
+          status: listing.latitude && listing.longitude ? "pending" : "unavailable",
+          schools: [],
+          hospitals: [],
+          transit: [],
+          groceries_markets: [],
+          restaurants_cafes: [],
+          parks_recreation: [],
+          malls_shopping: [],
+          lifestyle_summary: {},
+          street_view: { available: false },
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      status: snapshot.status,
+      location_intelligence: snapshot,
+    });
+  } catch (err) {
+    console.error("[GetListingLocationIntelligence] Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Neighborhood data is being prepared for this listing.",
+    });
+  }
+};
+
+export const scanListingLocationIntelligence = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const listing = await getInteractionListing(product_id);
+
+    if (!listing) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing not found.",
+      });
+    }
+
+    if (!userCanManageListing(req.user || {}, listing)) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have permission to rescan this listing.",
+      });
+    }
+
+    const latitude = req.body?.latitude ?? listing.latitude;
+    const longitude = req.body?.longitude ?? listing.longitude;
+
+    if (!latitude || !longitude) {
+      return res.status(400).json({
+        success: false,
+        message: "Confirmed listing coordinates are required before scanning nearby places.",
+      });
+    }
+
+    const snapshot = await scanLocationIntelligence({
+      listingId: listing.id,
+      productId: product_id,
+      latitude,
+      longitude,
+      provider: req.body?.provider || "auto",
+    });
+
+    return res.status(201).json({
+      success: true,
+      location_intelligence: snapshot,
+    });
+  } catch (err) {
+    console.error("[ScanListingLocationIntelligence] Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Neighborhood data is being prepared for this listing.",
+    });
+  }
+};
+
+export const getListingMarketHistory = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const listing = await getInteractionListing(product_id);
+
+    if (!listing || !canViewListingPublicData(req.user || {}, listing)) {
+      return res.status(404).json({
+        success: false,
+        message: "Market history is not available for this listing.",
+      });
+    }
+
+    const [priceHistory, statusHistory, engagementSnapshots] = await Promise.all([
+      tableExists("listing_price_history").then((exists) =>
+        exists
+          ? pool.query(
+              `
+              SELECT old_price, new_price, currency, change_type, source, created_at
+              FROM listing_price_history
+              WHERE product_id = $1
+              ORDER BY created_at ASC
+              `,
+              [product_id],
+            )
+          : { rows: [] },
+      ),
+      tableExists("listing_status_history").then((exists) =>
+        exists
+          ? pool.query(
+              `
+              SELECT old_status, new_status, reason, created_at
+              FROM listing_status_history
+              WHERE product_id = $1
+              ORDER BY created_at ASC
+              `,
+              [product_id],
+            )
+          : { rows: [] },
+      ),
+      tableExists("listing_engagement_snapshots").then((exists) =>
+        exists
+          ? pool.query(
+              `
+              SELECT views_count, saves_count, shares_count, contact_count, tour_request_count, snapshot_date
+              FROM listing_engagement_snapshots
+              WHERE product_id = $1
+              ORDER BY snapshot_date ASC
+              LIMIT 60
+              `,
+              [product_id],
+            )
+          : { rows: [] },
+      ),
+    ]);
+
+    return res.json({
+      success: true,
+      market_history: {
+        product_id,
+        price_history: priceHistory.rows,
+        status_history: statusHistory.rows,
+        engagement_snapshots: engagementSnapshots.rows,
+      },
+    });
+  } catch (err) {
+    console.error("[GetListingMarketHistory] Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load listing history right now.",
     });
   }
 };
@@ -3598,11 +4616,13 @@ export const getListingByProductId = async (req, res) => {
       panoramaPhotos: Array.isArray(panoramaPhotos) ? panoramaPhotos : [],
     });
     const analyticsMeta = buildListingAnalytics(row, badgeMeta);
+    const locationIntelligence = await getLatestLocationIntelligence(product_id);
 
     const response = {
       ...row,
       ...badgeMeta,
       analytics: analyticsMeta,
+      location_intelligence: locationIntelligence,
 
       success: true,
 
@@ -4044,6 +5064,23 @@ export const updateListingStatus = async (req, res) => {
     ]);
     const updatedListing = result.rows[0];
 
+    await recordListingHistory({
+      listing,
+      productId: product_id,
+      changedBy: req.user?.unique_id || null,
+      oldStatus: listing.status,
+      newStatus: updatedListing.status,
+      reason: req.body?.reason || null,
+    });
+
+    pool.query(
+      `
+      INSERT INTO user_activity_log (user_id, action, resource_type, resource_id, metadata)
+      VALUES ($1, $2, $3, $4, $5)
+      `,
+      [req.user?.unique_id, 'update_listing_status', 'listing', product_id, JSON.stringify({ old_status: listing.status, new_status: updatedListing.status })],
+    ).catch(() => {});
+
     await notifyListingStatusUpdate({
       listing: updatedListing,
       status,
@@ -4160,6 +5197,81 @@ export const activateListing = async (req, res) => {
   } catch (err) {
     console.error("Activate error:", err);
     res.status(500).json({ message: "Failed to activate listing" });
+  }
+};
+
+export const pauseListing = async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const userId = req.user?.unique_id;
+    const role = String(req.user?.role || "").toLowerCase();
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized.",
+        code: "UNAUTHORIZED",
+      });
+    }
+
+    const existing = await pool.query(
+      `SELECT * FROM listings WHERE product_id=$1 LIMIT 1`,
+      [product_id],
+    );
+    const listing = existing.rows[0];
+
+    if (!listing) {
+      return res.status(404).json({
+        success: false,
+        message: "Listing not found.",
+        code: "LISTING_NOT_FOUND",
+      });
+    }
+
+    const allowedIds = [
+      listing.uploaded_by_id,
+      listing.agent_unique_id,
+      listing.created_by,
+      listing.assigned_agent_id,
+      listing.agency_id,
+      listing.brokerage_id,
+    ]
+      .filter(Boolean)
+      .map((value) => String(value));
+
+    const canPause =
+      allowedIds.includes(String(userId)) ||
+      role === "admin" ||
+      role === "super_admin" ||
+      role === "superadmin";
+
+    if (!canPause) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only pause listings you own or manage.",
+        code: "FORBIDDEN",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE listings
+      SET is_active=false,
+          updated_at=NOW()
+      WHERE product_id=$1
+      RETURNING *;
+      `,
+      [product_id],
+    );
+
+    res.json({
+      success: true,
+      message: "Listing paused. It will not show as live until you reactivate it.",
+      listing: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Pause listing error:", err);
+    res.status(500).json({ message: "Failed to pause listing" });
   }
 };
 
@@ -4790,6 +5902,7 @@ export const getPublicAgentProfile = async (req, res) => {
   try {
     const payload = await resolvePublicProfilePayload({
       identifier: req.params.unique_id,
+      viewer: req.user || null,
     });
 
     return res.json(payload);
@@ -5142,6 +6255,7 @@ export const createListingDraft = async (req, res) => {
         created_by,
         agent_unique_id,
         agency_id,
+        project_id,
 
         title,
         property_type,
@@ -5177,6 +6291,7 @@ export const createListingDraft = async (req, res) => {
         $2::uuid,
         $2::uuid,
         $15::uuid,
+        $17::bigint,
 
         $3,
         $4,
@@ -5228,6 +6343,7 @@ export const createListingDraft = async (req, res) => {
         JSON.stringify(b.draft_data || b),
         listingAgencyId,
         JSON.stringify(b.floor_plans || b.floorPlans || []),
+        b.project_id ? Number(b.project_id) : null,
       ],
     );
 
@@ -5314,6 +6430,8 @@ export const updateListingDraft = async (req, res) => {
         construction_status = COALESCE($21, construction_status),
         ownership_type = COALESCE($22, ownership_type),
 
+        project_id = COALESCE($28::bigint, project_id),
+
         draft_data = $23::jsonb,
         current_step = COALESCE($24, current_step),
         floor_plans = COALESCE($25::jsonb, floor_plans),
@@ -5361,6 +6479,7 @@ export const updateListingDraft = async (req, res) => {
 
         product_id,
         String(userId),
+        b.project_id ? Number(b.project_id) : null,
       ],
     );
 
@@ -5732,16 +6851,26 @@ export const submitListingDraft = async (req, res) => {
       finalLongitude >= -180 &&
       finalLongitude <= 180;
 
+    const role = String(currentUser.role || "").toLowerCase();
+    const isAgencyAgentCreator =
+      role === "agent" &&
+      (currentUser.is_solo_agent === false || currentUser.linked_agency_id);
+
+    const requiresBrokerageApproval =
+      isAgencyAgentCreator || b.approval_status === "pending_brokerage_approval";
+
     const shouldAutoPublish =
+      !requiresBrokerageApproval &&
       userIsVerified &&
       risk.risk_level === "low" &&
       risk.score < 25 &&
       hasPhotos &&
       hasValidCoordinates;
 
-    const finalStatus = shouldAutoPublish ? "approved" : "pending";
+    const finalStatus = requiresBrokerageApproval ? "pending" : shouldAutoPublish ? "approved" : "pending";
     const finalModerationStatus = shouldAutoPublish ? "approved" : "pending";
     const finalIsActive = shouldAutoPublish;
+    const finalBrokerageReviewStatus = requiresBrokerageApproval ? "pending" : "not_required";
 
     const moderationReason = risk.flags?.length
       ? risk.flags.join(" | ")
@@ -5877,6 +7006,9 @@ export const submitListingDraft = async (req, res) => {
         moderation_status = $102,
         moderation_reason = $103,
         admin_notes = NULL,
+        brokerage_review_status = $109,
+
+        project_id = COALESCE($108::bigint, project_id),
 
         status = $104,
         is_active = $105,
@@ -6093,6 +7225,8 @@ export const submitListingDraft = async (req, res) => {
 
         product_id,
         String(userId),
+        b.project_id ? Number(b.project_id) : null,
+        finalBrokerageReviewStatus,
       ],
     );
 
@@ -6105,6 +7239,24 @@ export const submitListingDraft = async (req, res) => {
         code: "SUBMIT_DRAFT_NOT_UPDATED",
       });
     }
+
+    if (existing.brokerage_review_status !== listing.brokerage_review_status) {
+      pool.query(
+        `
+        INSERT INTO brokerage_review_history (listing_id, product_id, old_status, new_status, reviewed_by)
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [listing.id, product_id, existing.brokerage_review_status, listing.brokerage_review_status, userId],
+      ).catch(() => {});
+    }
+
+    pool.query(
+      `
+      INSERT INTO user_activity_log (user_id, action, resource_type, resource_id, metadata)
+      VALUES ($1, $2, $3, $4, $5)
+      `,
+      [userId, 'submit_listing', 'listing', product_id, JSON.stringify({ requires_brokerage_approval: requiresBrokerageApproval, status: finalStatus })],
+    ).catch(() => {});
 
     if (shouldAutoPublish) {
       await notifyListingStatusUpdate({
@@ -6128,10 +7280,12 @@ export const submitListingDraft = async (req, res) => {
 
     return res.json({
       success: true,
-      outcome: shouldAutoPublish ? "auto_approved" : "pending_review",
-      message: shouldAutoPublish
-        ? "Your listing passed our checks and is now live."
-        : "Your listing has been submitted for admin review.",
+      outcome: requiresBrokerageApproval ? "pending_brokerage_approval" : shouldAutoPublish ? "auto_approved" : "pending_review",
+      message: requiresBrokerageApproval
+        ? "Your listing has been submitted to your brokerage for approval."
+        : shouldAutoPublish
+          ? "Your listing passed our checks and is now live."
+          : "Your listing has been submitted for admin review.",
       risk,
       listing: {
         ...listing,

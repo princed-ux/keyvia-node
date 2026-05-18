@@ -282,7 +282,9 @@ export const updateProfileStatus = async (req, res) => {
         unique_id,
         email,
         name,
-        LOWER(role::TEXT) AS role
+        LOWER(role::TEXT) AS role,
+        verification_status,
+        is_verified
       FROM users
       WHERE unique_id = $1
       LIMIT 1
@@ -316,6 +318,17 @@ export const updateProfileStatus = async (req, res) => {
       WHERE unique_id = $4
       `,
       [status, isVerified, rejectionReason, id]
+    );
+
+    const oldStatus = profileCheck.rows[0].verification_status;
+    const oldIsVerified = profileCheck.rows[0].is_verified;
+
+    await client.query(
+      `
+      INSERT INTO verification_history (user_id, changed_by, old_status, new_status, old_is_verified, new_is_verified, rejection_reason)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `,
+      [id, req.user?.unique_id, oldStatus, status, oldIsVerified, isVerified, rejectionReason]
     );
 
     const msg =
