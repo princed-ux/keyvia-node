@@ -17,7 +17,8 @@ import {
 } from "../controllers/authController.js";
 
 // ✅ IMPORT THE MIDDLEWARE
-import { protect } from "../middleware/authMiddleware.js"; 
+import { protect } from "../middleware/authMiddleware.js";
+import { authLimiter } from "../middleware/rateLimiter.js";
 import { upload } from "../middleware/upload.js"
 
 const router = express.Router();
@@ -26,30 +27,30 @@ const router = express.Router();
    1. STANDARD SIGNUP FLOW
 ========================= */
 // Initial Signup (Name, Email, Password, Role -> Sends OTP)
-router.post("/signup", register);
+router.post("/signup", authLimiter, register);
 
 // Verify OTP (Activates Account)
-router.post("/signup/verify", verifySignupOtp);
+router.post("/signup/verify", authLimiter, verifySignupOtp);
 
 // Resend OTP (For the timer logic)
-router.post("/signup/resend", resendSignupOtp);
+router.post("/signup/resend", authLimiter, resendSignupOtp);
 
 
 /* =========================
    2. AUTHENTICATION (Login & Social)
 ========================= */
 // Standard Email/Password login
-router.post("/login", login); 
+router.post("/login", authLimiter, login); 
 
 // Unified Social Auth
-router.post("/social", socialAuth);
+router.post("/social", authLimiter, socialAuth);
 
 
 /* =========================
    3. ROLE & ONBOARDING
 ========================= */
 // Set Role (Kept for Social Auth fallback)
-router.post("/role", setRole); 
+router.post("/role", protect, setRole); 
 
 // Complete Profile (Data + Avatar + Legal Doc) ✅ UPDATED FOR FILES
 router.put(
@@ -65,8 +66,8 @@ router.put(
 /* =========================
    4. PASSWORD RECOVERY
 ========================= */
-router.post("/forgot-password", forgotPassword);
-router.post("/reset-password/:token", resetPassword);
+router.post("/forgot-password", authLimiter, forgotPassword);
+router.post("/reset-password/:token", authLimiter, resetPassword);
 
 
 /* =========================
@@ -86,6 +87,6 @@ router.post("/phone/verify-otp", protect, verifyPhoneOtp);
 
 
 
-router.post("/dev/delete-user", deleteTestUser);
+router.post("/dev/delete-user", protect, deleteTestUser);
 
 export default router;

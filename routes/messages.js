@@ -2,10 +2,22 @@ import express from "express";
 import { pool } from "../db.js";
 import { authenticate } from "../middleware/authMiddleware.js";
 import { createNotification } from "../controllers/notificationsController.js";
+import {
+  getMessageSettings,
+  maybeSendAutoReply,
+  saveMessageSettings,
+} from "../services/messageSettingsService.js";
 
 const router = express.Router();
 
 const getUserId = (req) => (req.user?.unique_id ? String(req.user.unique_id) : null);
+
+const REPORT_REASONS = new Set([
+  "suspicious_payment_request",
+  "impersonation",
+  "fake_listing",
+  "harassment_abuse",
+]);
 
 const getInboxPathForRole = (role) => {
   const normalized = String(role || "").toLowerCase();
@@ -52,6 +64,21 @@ const getUserSummary = async (userId) => {
   );
 
   return result.rows[0] || null;
+};
+
+const getUnreadCountForUser = async (conversationId, userId) => {
+  const result = await pool.query(
+    `
+    SELECT COUNT(*)::int AS count
+    FROM messages
+    WHERE conversation_id = $1
+      AND sender_id::text != $2::text
+      AND COALESCE(seen, false) = FALSE
+    `,
+    [conversationId, userId],
+  );
+
+  return result.rows[0]?.count || 0;
 };
 
 const normalizeRole = (role) => String(role || "").toLowerCase().trim();
@@ -306,11 +333,20 @@ const getGroupsForUser = async (client, context, userId) => {
           ELSE 'No messages yet'
         END
       ) AS last_message,
-      0::int AS unread_count
+      (
+        SELECT COUNT(*)::int
+        FROM brokerage_message_group_messages unread
+        WHERE unread.group_id = g.id
+          AND unread.sender_id::text != $2::text
+          AND unread.created_at > COALESCE(gr.last_read_at, current_member.joined_at, 'epoch'::timestamptz)
+      ) AS unread_count
     FROM brokerage_message_groups g
     JOIN brokerage_message_group_members current_member
       ON current_member.group_id = g.id
      AND current_member.user_id::text = $2::text
+    LEFT JOIN brokerage_message_group_reads gr
+      ON gr.group_id = g.id
+     AND gr.user_id::text = $2::text
     LEFT JOIN LATERAL (
       SELECT message, created_at
       FROM brokerage_message_group_messages
@@ -420,15 +456,46 @@ const notifyMessageRecipient = async ({
   });
 };
 
+router.get("/settings", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+
+  try {
+    const settings = await getMessageSettings(currentUserId);
+    return res.json({ success: true, settings });
+  } catch (err) {
+    console.error("[Messages] Load settings error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load message settings.",
+    });
+  }
+});
+
+router.put("/settings", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+
+  try {
+    const settings = await saveMessageSettings(currentUserId, req.body || {});
+    return res.json({ success: true, settings });
+  } catch (err) {
+    console.error("[Messages] Save settings error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not save message settings.",
+    });
+  }
+});
+
 // Create or get a direct conversation. The server always uses the authenticated
 // user as user1 so callers cannot create chats on behalf of someone else.
-router.post("/conversation", authenticate, async (req, res) => {
+const createOrGetDirectConversation = async (req, res) => {
   const currentUserId = getUserId(req);
   const recipientId =
     req.body?.user2_id ||
     req.body?.recipient_id ||
     req.body?.receiver_id ||
     req.body?.startChatWith;
+  const productId = req.body?.product_id || req.body?.productId || null;
 
   if (!currentUserId) {
     return res.status(401).json({ success: false, message: "Unauthorized" });
@@ -478,10 +545,11 @@ router.post("/conversation", authenticate, async (req, res) => {
             deleted_by_user2 = CASE
               WHEN user2_id::text = $1::text THEN FALSE ELSE deleted_by_user2
             END,
+            product_id = COALESCE($3, product_id),
             updated_at = NOW()
         WHERE conversation_id = $2
         `,
-        [currentUserId, conversation.conversation_id],
+        [currentUserId, conversation.conversation_id, productId],
       );
 
       return res.json({ ...conversation, success: true, conversation });
@@ -489,11 +557,11 @@ router.post("/conversation", authenticate, async (req, res) => {
 
     const created = await pool.query(
       `
-      INSERT INTO conversations (user1_id, user2_id)
-      VALUES ($1, $2)
+      INSERT INTO conversations (user1_id, user2_id, product_id)
+      VALUES ($1, $2, $3)
       RETURNING *
       `,
-      [currentUserId, String(recipientId)],
+      [currentUserId, String(recipientId), productId],
     );
 
     const conversation = created.rows[0];
@@ -505,7 +573,10 @@ router.post("/conversation", authenticate, async (req, res) => {
       message: "Could not start conversation.",
     });
   }
-});
+};
+
+router.post("/conversation", authenticate, createOrGetDirectConversation);
+router.post("/conversations", authenticate, createOrGetDirectConversation);
 
 // Get conversations for the authenticated user. The :id is kept for existing
 // frontend compatibility, but it must match the current user.
@@ -523,6 +594,8 @@ router.get("/user/:id", authenticate, async (req, res) => {
         c.conversation_id,
         c.user1_id,
         c.user2_id,
+        c.product_id AS conversation_product_id,
+        COALESCE(c.product_id, lm.product_id) AS product_id,
         TO_JSON(c.created_at) AS created_at,
         TO_JSON(c.updated_at) AS updated_at,
 
@@ -540,6 +613,13 @@ router.get("/user/:id", authenticate, async (req, res) => {
         lm.message AS last_message,
         TO_JSON(lm.created_at) AS last_message_time,
         lm.sender_id AS last_message_sender,
+        lm.product_id AS last_message_product_id,
+
+        l.title AS listing_title,
+        l.address AS listing_address,
+        l.price AS listing_price,
+        l.price_currency AS listing_price_currency,
+        l.photos AS listing_photos,
 
         CASE WHEN bu.blocker_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_blocked,
 
@@ -562,12 +642,15 @@ router.get("/user/:id", authenticate, async (req, res) => {
         AND (bu.blocked_id::text = c.user1_id::text OR bu.blocked_id::text = c.user2_id::text)
 
       LEFT JOIN LATERAL (
-        SELECT message, created_at, sender_id
+        SELECT message, created_at, sender_id, product_id
         FROM messages
         WHERE conversation_id = c.conversation_id
         ORDER BY created_at DESC
         LIMIT 1
       ) lm ON TRUE
+
+      LEFT JOIN listings l
+        ON l.product_id::text = COALESCE(c.product_id, lm.product_id)::text
 
       WHERE (c.user1_id::text = $1::text AND COALESCE(c.deleted_by_user1, false) = FALSE)
          OR (c.user2_id::text = $1::text AND COALESCE(c.deleted_by_user2, false) = FALSE)
@@ -583,6 +666,95 @@ router.get("/user/:id", authenticate, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Could not load conversations.",
+    });
+  }
+});
+
+router.get("/inquiries", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        c.conversation_id,
+        c.user1_id,
+        c.user2_id,
+        c.product_id AS conversation_product_id,
+        COALESCE(c.product_id, lm.product_id) AS product_id,
+        TO_JSON(c.created_at) AS created_at,
+        TO_JSON(c.updated_at) AS updated_at,
+
+        u1.name AS user1_full_name,
+        u2.name AS user2_full_name,
+        p1.username AS user1_username,
+        p2.username AS user2_username,
+        p1.avatar_url AS user1_avatar,
+        p2.avatar_url AS user2_avatar,
+        p1.email AS user1_email,
+        p2.email AS user2_email,
+        u1.last_active AS user1_last_active,
+        u2.last_active AS user2_last_active,
+
+        lm.message AS last_message,
+        TO_JSON(lm.created_at) AS last_message_time,
+        lm.sender_id AS last_message_sender,
+        lm.product_id AS last_message_product_id,
+
+        l.title AS listing_title,
+        l.address AS listing_address,
+        l.price AS listing_price,
+        l.price_currency AS listing_price_currency,
+        l.photos AS listing_photos,
+
+        CASE WHEN bu.blocker_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_blocked,
+
+        (
+          SELECT COUNT(*)::int
+          FROM messages m2
+          WHERE m2.conversation_id = c.conversation_id
+            AND m2.sender_id::text != $1::text
+            AND COALESCE(m2.seen, false) = FALSE
+        ) AS unread_messages
+
+      FROM conversations c
+      LEFT JOIN users u1 ON u1.unique_id::text = c.user1_id::text
+      LEFT JOIN users u2 ON u2.unique_id::text = c.user2_id::text
+      LEFT JOIN profiles p1 ON p1.unique_id::text = u1.unique_id::text
+      LEFT JOIN profiles p2 ON p2.unique_id::text = u2.unique_id::text
+
+      LEFT JOIN blocked_users bu
+        ON bu.blocker_id::text = $1::text
+        AND (bu.blocked_id::text = c.user1_id::text OR bu.blocked_id::text = c.user2_id::text)
+
+      LEFT JOIN LATERAL (
+        SELECT message, created_at, sender_id, product_id
+        FROM messages
+        WHERE conversation_id = c.conversation_id
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) lm ON TRUE
+
+      LEFT JOIN listings l
+        ON l.product_id::text = COALESCE(c.product_id, lm.product_id)::text
+
+      WHERE (
+          (c.user1_id::text = $1::text AND COALESCE(c.deleted_by_user1, false) = FALSE)
+          OR (c.user2_id::text = $1::text AND COALESCE(c.deleted_by_user2, false) = FALSE)
+        )
+        AND COALESCE(c.product_id, lm.product_id) IS NOT NULL
+
+      ORDER BY lm.created_at DESC NULLS LAST, c.updated_at DESC NULLS LAST
+      `,
+      [currentUserId],
+    );
+
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("[Messages] Fetch property inquiries error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load property inquiries.",
     });
   }
 });
@@ -672,6 +844,15 @@ router.post("/team-groups", authenticate, async (req, res) => {
     await client.query("BEGIN");
 
     const context = await resolveTeamContext(client, currentUserId);
+
+    if (!context.canManageTeam) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        message: "Only brokerage owners or admins can create team groups.",
+      });
+    }
+
     await syncDefaultTeamGroup(client, context);
     const agents = await getTeamAgents(client, context.brokerageId);
     const allowedIds = new Set([
@@ -786,6 +967,20 @@ router.get("/team-groups/:groupId/messages", authenticate, async (req, res) => {
       [req.params.groupId],
     );
 
+    await client.query(
+      `
+      INSERT INTO brokerage_message_group_reads (
+        group_id,
+        user_id,
+        last_read_at
+      )
+      VALUES ($1::uuid, $2::uuid, NOW())
+      ON CONFLICT (group_id, user_id)
+      DO UPDATE SET last_read_at = NOW()
+      `,
+      [req.params.groupId, currentUserId],
+    );
+
     return res.json(result.rows);
   } catch (err) {
     console.error("[Messages] Fetch team group messages error:", err);
@@ -859,6 +1054,20 @@ router.post("/team-groups/:groupId/messages", authenticate, async (req, res) => 
       [req.params.groupId],
     );
 
+    await client.query(
+      `
+      INSERT INTO brokerage_message_group_reads (
+        group_id,
+        user_id,
+        last_read_at
+      )
+      VALUES ($1::uuid, $2::uuid, NOW())
+      ON CONFLICT (group_id, user_id)
+      DO UPDATE SET last_read_at = NOW()
+      `,
+      [req.params.groupId, currentUserId],
+    );
+
     const sender = await getUserSummary(currentUserId);
     const saved = {
       ...result.rows[0],
@@ -867,6 +1076,25 @@ router.post("/team-groups/:groupId/messages", authenticate, async (req, res) => 
     };
 
     req.io?.to(`team_group_${req.params.groupId}`).emit("team_group_message", saved);
+
+    const memberRes = await client.query(
+      `
+      SELECT user_id
+      FROM brokerage_message_group_members
+      WHERE group_id::text = $1::text
+      `,
+      [req.params.groupId],
+    );
+
+    for (const member of memberRes.rows) {
+      req.io?.to(String(member.user_id)).emit("team_group_updated", {
+        group_id: req.params.groupId,
+        last_message: saved.message,
+        updated_at: saved.created_at,
+        sender_id: saved.sender_id,
+        unread_count: String(member.user_id) === String(currentUserId) ? 0 : 1,
+      });
+    }
 
     return res.status(201).json(saved);
   } catch (err) {
@@ -1084,6 +1312,103 @@ router.delete("/team-groups/:groupId", authenticate, async (req, res) => {
   }
 });
 
+router.post("/:conversationId/report", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+  const { conversationId } = req.params;
+  const reasonType = String(req.body?.reason_type || req.body?.reason || "").trim();
+  const details = String(req.body?.details || "").trim();
+  const messageId = req.body?.message_id || req.body?.messageId || null;
+
+  if (!REPORT_REASONS.has(reasonType)) {
+    return res.status(400).json({
+      success: false,
+      message: "Select a valid report reason.",
+      valid_reasons: Array.from(REPORT_REASONS),
+    });
+  }
+
+  try {
+    const conversation = await getConversationForUser(conversationId, currentUserId);
+
+    if (!conversation) {
+      return res.status(404).json({
+        success: false,
+        message: "Conversation not found.",
+      });
+    }
+
+    let reportedUserId =
+      String(conversation.user1_id) === currentUserId
+        ? String(conversation.user2_id)
+        : String(conversation.user1_id);
+
+    if (messageId) {
+      const messageRes = await pool.query(
+        `
+        SELECT sender_id
+        FROM messages
+        WHERE conversation_id::text = $1::text
+          AND message_id::text = $2::text
+        LIMIT 1
+        `,
+        [conversationId, String(messageId)],
+      );
+
+      if (!messageRes.rows.length) {
+        return res.status(404).json({
+          success: false,
+          message: "Message not found in this conversation.",
+        });
+      }
+
+      reportedUserId = String(messageRes.rows[0].sender_id);
+    }
+
+    const reportRes = await pool.query(
+      `
+      INSERT INTO message_reports (
+        conversation_id,
+        message_id,
+        reporter_id,
+        reported_user_id,
+        reason_type,
+        details,
+        created_at,
+        updated_at
+      )
+      VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5, $6, NOW(), NOW())
+      RETURNING *
+      `,
+      [
+        conversationId,
+        messageId ? String(messageId) : null,
+        currentUserId,
+        reportedUserId,
+        reasonType,
+        details || null,
+      ],
+    );
+
+    req.io?.to("admins").emit("message_report_created", {
+      report_id: reportRes.rows[0].id,
+      conversation_id: conversationId,
+      reason_type: reasonType,
+    });
+
+    return res.status(201).json({
+      success: true,
+      report: reportRes.rows[0],
+      message: "Report submitted.",
+    });
+  } catch (err) {
+    console.error("[Messages] Report conversation error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not submit report.",
+    });
+  }
+});
+
 router.get("/:conversationId", authenticate, async (req, res) => {
   const currentUserId = getUserId(req);
 
@@ -1108,6 +1433,10 @@ router.get("/:conversationId", authenticate, async (req, res) => {
         m.sender_id,
         m.message,
         m.seen,
+        m.product_id,
+        m.attachment_url,
+        m.attachment_type,
+        m.is_auto_reply,
         TO_JSON(m.created_at) AS created_at,
         (
           SELECT json_object_agg(user_id, emoji)
@@ -1189,25 +1518,45 @@ router.post("/:conversationId/send", authenticate, async (req, res) => {
       UPDATE conversations
       SET deleted_by_user1 = FALSE,
           deleted_by_user2 = FALSE,
+          product_id = COALESCE($2, product_id),
           updated_at = NOW()
       WHERE conversation_id = $1
       `,
-      [conversationId],
+      [conversationId, productId],
     );
 
     const result = await pool.query(
       `
-      INSERT INTO messages (conversation_id, sender_id, message)
-      VALUES ($1, $2, $3)
+      INSERT INTO messages (
+        conversation_id,
+        sender_id,
+        message,
+        product_id,
+        attachment_url,
+        attachment_type,
+        is_auto_reply
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, FALSE)
       RETURNING
         message_id AS id,
         conversation_id,
         sender_id,
         message,
+        product_id,
+        attachment_url,
+        attachment_type,
+        is_auto_reply,
         seen,
         TO_JSON(created_at) AS created_at
       `,
-      [conversationId, currentUserId, message],
+      [
+        conversationId,
+        currentUserId,
+        message,
+        productId,
+        req.body?.attachment_url || null,
+        req.body?.attachment_type || null,
+      ],
     );
 
     const saved = result.rows[0];
@@ -1241,11 +1590,26 @@ router.post("/:conversationId/send", authenticate, async (req, res) => {
       last_message: saved.message,
       last_message_sender: saved.sender_id,
       last_message_time: saved.created_at,
+      unread_messages: await getUnreadCountForUser(conversationId, recipientId),
     };
 
     req.io?.to(`conv_${conversationId}`).emit("receive_message", socketPayload);
     req.io?.to(String(recipientId)).emit("conversation_updated", socketPayload);
-    req.io?.to(currentUserId).emit("conversation_updated", socketPayload);
+    req.io?.to(currentUserId).emit("conversation_updated", {
+      ...socketPayload,
+      unread_messages: 0,
+    });
+
+    await maybeSendAutoReply({
+      conversationId,
+      recipientId,
+      senderId: currentUserId,
+      productId,
+      io: req.io,
+    }).catch((err) => {
+      console.warn("[Messages] Auto-reply skipped:", err?.message);
+      return null;
+    });
 
     return res.json(saved);
   } catch (err) {

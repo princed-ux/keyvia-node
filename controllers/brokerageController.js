@@ -623,41 +623,77 @@ export const getBrokerage = async (req, res) => {
  * ============================================================================
  * 5. GET BROKERAGE AGENTS (Team Members)
  * ============================================================================
+ * Supports:
+ * GET /api/brokerage/agents
  * GET /api/brokerage/:brokerage_id/agents
  */
 export const getBrokerageAgents = async (req, res) => {
   try {
-    const { brokerage_id } = req.params;
+    const brokerageIdentifier = req.params?.brokerage_id || req.user?.unique_id;
+
+    if (!brokerageIdentifier) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized.",
+      });
+    }
+
+    const ownerCheck = await pool.query(
+      `
+      SELECT u.unique_id
+      FROM users u
+      LEFT JOIN brokerages b
+        ON b.owner_id::text = u.unique_id::text
+      WHERE (
+          u.unique_id::text = $1::text
+          OR b.id::text = $1::text
+        )
+        AND LOWER(u.role::text) IN ('brokerage_owner', 'brokerage')
+      LIMIT 1
+      `,
+      [brokerageIdentifier],
+    );
+
+    if (!ownerCheck.rows.length) {
+      return res.status(403).json({
+        success: false,
+        message: "Only brokerage owners can view brokerage agents.",
+      });
+    }
+
+    const brokerageId = ownerCheck.rows[0].unique_id;
 
     const query = `
-      WITH target AS (
-        SELECT owner.unique_id
-        FROM users owner
-        LEFT JOIN brokerages b
-          ON b.owner_id::text = owner.unique_id::text
-        WHERE (
-            owner.unique_id::text = $1::text
-            OR b.id::text = $1::text
-          )
-          AND LOWER(owner.role::text) IN ('brokerage_owner', 'brokerage')
-        LIMIT 1
-      )
       SELECT
         u.unique_id,
-        COALESCE(p.full_name, u.name) AS name,
+        COALESCE(p.full_name, u.name, u.email, 'Unnamed Agent') AS name,
+        u.email,
         COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
-        u.phone,
+        COALESCE(p.phone, u.phone) AS phone,
+        LOWER(u.role::text) AS role,
+
         COALESCE(ap.license_number, p.license_number, u.license_number) AS license_number,
         COALESCE(ap.experience_years, p.experience_years, u.experience_years) AS experience_years,
         COALESCE(p.bio, u.bio) AS bio,
+
         u.verification_status,
+        u.is_verified,
         u.created_at,
-        COUNT(DISTINCT l.id)::int AS agent_listings,
-        COUNT(DISTINCT CASE WHEN l.status = 'approved' AND l.is_active = TRUE THEN l.id END)::int AS active_listings,
+        u.updated_at,
+
+        COUNT(DISTINCT l.id)::int AS listings_count,
+
+        COUNT(
+          DISTINCT CASE
+            WHEN LOWER(COALESCE(l.status, '')) IN ('approved', 'active', 'published')
+              OR COALESCE(l.is_active, FALSE) = TRUE
+            THEN l.id
+          END
+        )::int AS active_listings,
+
         0::decimal AS agent_rating
-      FROM target t
-      JOIN users u
-        ON TRUE
+
+      FROM users u
       LEFT JOIN profiles p
         ON p.unique_id::text = u.unique_id::text
       LEFT JOIN agent_profiles ap
@@ -669,17 +705,25 @@ export const getBrokerageAgents = async (req, res) => {
           OR l.assigned_agent_id::text = u.unique_id::text
         )
       WHERE (
-          u.linked_agency_id::text = t.unique_id::text
-          OR ap.linked_agency_id::text = t.unique_id::text
+          u.linked_agency_id::text = $1::text
+          OR ap.linked_agency_id::text = $1::text
         )
-        AND LOWER(u.role::text) IN ('agent', 'agency_agent', 'agencyagent', 'brokerage_agent')
+        AND LOWER(u.role::text) IN (
+          'agent',
+          'agency_agent',
+          'agencyagent',
+          'brokerage_agent'
+        )
       GROUP BY
         u.unique_id,
         p.full_name,
         u.name,
+        u.email,
         p.avatar_url,
         u.avatar_url,
+        p.phone,
         u.phone,
+        u.role,
         ap.license_number,
         p.license_number,
         u.license_number,
@@ -689,25 +733,200 @@ export const getBrokerageAgents = async (req, res) => {
         p.bio,
         u.bio,
         u.verification_status,
-        u.created_at
+        u.is_verified,
+        u.created_at,
+        u.updated_at
       ORDER BY u.created_at DESC
     `;
 
-    const result = await pool.query(query, [brokerage_id]);
+    const result = await pool.query(query, [brokerageId]);
 
-    res.json({
+    return res.json({
       success: true,
       agents: result.rows,
       total: result.rows.length,
     });
   } catch (error) {
     console.error("❌ Get Agents Error:", error);
-    res.status(500).json({
+
+    return res.status(500).json({
       success: false,
-      error: "Failed to retrieve agents",
+      message: "Failed to retrieve brokerage agents.",
+      error: error.message,
     });
   }
 };
+
+
+/**
+ * ============================================================================
+ * REMOVE BROKERAGE AGENT
+ * ============================================================================
+ * DELETE /api/brokerage/agents/:agentId
+ *
+ * This does NOT delete the agent account.
+ * It only disconnects the agent from the brokerage team.
+ */
+export const removeBrokerageAgent = async (req, res) => {
+  let client;
+
+  try {
+    const brokerageId = req.user?.unique_id;
+    const { agentId } = req.params;
+
+    if (!brokerageId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized.",
+      });
+    }
+
+    if (!agentId) {
+      return res.status(400).json({
+        success: false,
+        message: "Agent ID is required.",
+      });
+    }
+
+    const ownerCheck = await pool.query(
+      `
+      SELECT unique_id
+      FROM users
+      WHERE unique_id::text = $1::text
+        AND LOWER(role::text) IN ('brokerage_owner', 'brokerage')
+      LIMIT 1
+      `,
+      [brokerageId],
+    );
+
+    if (!ownerCheck.rows.length) {
+      return res.status(403).json({
+        success: false,
+        message: "Only brokerage owners can remove agents.",
+      });
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const agentCheck = await client.query(
+      `
+      SELECT
+        u.unique_id,
+        COALESCE(p.full_name, u.name, u.email, 'Agent') AS name,
+        u.email,
+        u.linked_agency_id,
+        ap.linked_agency_id AS profile_linked_agency_id
+      FROM users u
+      LEFT JOIN profiles p
+        ON p.unique_id::text = u.unique_id::text
+      LEFT JOIN agent_profiles ap
+        ON ap.unique_id::text = u.unique_id::text
+      WHERE u.unique_id::text = $1::text
+        AND LOWER(u.role::text) IN (
+          'agent',
+          'agency_agent',
+          'agencyagent',
+          'brokerage_agent'
+        )
+        AND (
+          u.linked_agency_id::text = $2::text
+          OR ap.linked_agency_id::text = $2::text
+        )
+      LIMIT 1
+      `,
+      [agentId, brokerageId],
+    );
+
+    if (!agentCheck.rows.length) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        message: "Agent was not found in your brokerage team.",
+      });
+    }
+
+    const agent = agentCheck.rows[0];
+
+    await client.query(
+      `
+      UPDATE users
+      SET linked_agency_id = NULL,
+          is_solo_agent = TRUE,
+          updated_at = NOW()
+      WHERE unique_id::text = $1::text
+      `,
+      [agentId],
+    );
+
+    await client.query(
+      `
+      UPDATE agent_profiles
+      SET linked_agency_id = NULL,
+          updated_at = NOW()
+      WHERE unique_id::text = $1::text
+      `,
+      [agentId],
+    ).catch(() => null);
+
+    await client.query(
+      `
+      UPDATE profiles
+      SET linked_agency_id = NULL,
+          brokerage_name = NULL,
+          updated_at = NOW()
+      WHERE unique_id::text = $1::text
+      `,
+      [agentId],
+    ).catch(() => null);
+
+    await client.query(
+      `
+      DELETE FROM brokerage_message_group_members
+      WHERE user_id::text = $1::text
+        AND group_id IN (
+          SELECT id
+          FROM brokerage_message_groups
+          WHERE brokerage_id::text = $2::text
+        )
+      `,
+      [agentId, brokerageId],
+    ).catch(() => null);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "Agent removed from brokerage team.",
+      agent: {
+        unique_id: agent.unique_id,
+        name: agent.name,
+        email: agent.email,
+      },
+    });
+  } catch (error) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("❌ Remove Brokerage Agent Rollback Error:", rollbackError);
+      }
+    }
+
+    console.error("❌ Remove Brokerage Agent Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not remove agent from brokerage team.",
+      error: error.message,
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+
 
 /**
  * ============================================================================
@@ -899,5 +1118,6 @@ export default {
   verifyTeamCode,
   getBrokerage,
   getBrokerageAgents,
+  removeBrokerageAgent,
   updateBrokerage,
 };

@@ -4,7 +4,7 @@
 // ============================================================================
 
 import express from "express";
-import { authenticateToken } from "../middleware/authMiddleware.js";
+import { authenticateToken, verifyAdmin } from "../middleware/authMiddleware.js";
 import {
   getSystemMetrics,
   getEndpointMetrics,
@@ -26,8 +26,8 @@ import {
 
 const router = express.Router();
 
-// Protect all monitoring endpoints with authentication
-router.use(authenticateToken);
+// Protect all monitoring endpoints with authentication + admin guard
+router.use(authenticateToken, verifyAdmin);
 
 // ✅ GET COMPREHENSIVE SYSTEM METRICS (God Mode Dashboard)
 router.get("/system-metrics", getSystemMetrics);

@@ -4,6 +4,38 @@ import { authenticateToken } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
+let favoritesSchemaReady = false;
+
+const normalizeRole = (value) =>
+  String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+
+const canSaveHomes = (user) => {
+  const role = normalizeRole(user?.role || user?.user_role || user?.account_type);
+  return ["buyer", "customer", "renter", "tenant", "user"].includes(role);
+};
+
+const ensureFavoritesProductMode = async (client) => {
+  if (favoritesSchemaReady) return;
+
+  await client.query(`
+    ALTER TABLE favorites
+    ADD COLUMN IF NOT EXISTS product_id TEXT;
+  `);
+
+  await client.query(`
+    ALTER TABLE favorites
+    ALTER COLUMN listing_id DROP NOT NULL;
+  `);
+
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_favorites_user_product_unique
+      ON favorites(user_id, product_id)
+      WHERE product_id IS NOT NULL;
+  `);
+
+  favoritesSchemaReady = true;
+};
+
 // ✅ 1. Toggle Favorite (Like/Unlike)
 router.post("/toggle", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -11,6 +43,14 @@ router.post("/toggle", authenticateToken, async (req, res) => {
   try {
     const { product_id } = req.body;
     const user_id = req.user.unique_id;
+
+    if (!canSaveHomes(req.user)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only buyers and renters can save homes.",
+        code: "SAVE_HOMES_BUYER_ONLY",
+      });
+    }
 
     if (!product_id) {
       return res.status(400).json({
@@ -20,19 +60,48 @@ router.post("/toggle", authenticateToken, async (req, res) => {
     }
 
     await client.query("BEGIN");
+    await ensureFavoritesProductMode(client);
+
+    const listingResult = await client.query(
+      `
+      SELECT id, product_id
+      FROM listings
+      WHERE product_id = $1
+      LIMIT 1
+      `,
+      [product_id],
+    );
+
+    const listing = listingResult.rows[0];
+
+    if (!listing) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Listing not found.",
+      });
+    }
 
     // Check if it already exists
     const check = await client.query(
-      "SELECT * FROM favorites WHERE user_id = $1 AND product_id = $2",
-      [user_id, product_id],
+      `
+      SELECT id
+      FROM favorites
+      WHERE user_id::text = $1::text
+      AND (
+        product_id = $2
+        OR listing_id::text = $3::text
+      )
+      LIMIT 1
+      `,
+      [user_id, listing.product_id, listing.id],
     );
 
     if (check.rows.length > 0) {
       // It exists -> DELETE it (Unlike)
-      await client.query(
-        "DELETE FROM favorites WHERE user_id = $1 AND product_id = $2",
-        [user_id, product_id],
-      );
+      await client.query("DELETE FROM favorites WHERE id = $1", [
+        check.rows[0].id,
+      ]);
 
       const countResult = await client.query(
         `
@@ -41,7 +110,7 @@ router.post("/toggle", authenticateToken, async (req, res) => {
         WHERE product_id = $1
         RETURNING saves_count
         `,
-        [product_id],
+        [listing.product_id],
       );
 
       await client.query("COMMIT");
@@ -54,20 +123,35 @@ router.post("/toggle", authenticateToken, async (req, res) => {
       });
     } else {
       // It doesn't exist -> INSERT it (Like)
-      await client.query(
-        "INSERT INTO favorites (user_id, product_id) VALUES ($1, $2)",
-        [user_id, product_id],
+      const insertResult = await client.query(
+        `
+        INSERT INTO favorites (user_id, listing_id, product_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        `,
+        [user_id, listing.id || null, listing.product_id],
       );
 
-      const countResult = await client.query(
-        `
-        UPDATE listings
-        SET saves_count = COALESCE(saves_count, 0) + 1
-        WHERE product_id = $1
-        RETURNING saves_count
-        `,
-        [product_id],
-      );
+      const countResult =
+        insertResult.rowCount > 0
+          ? await client.query(
+              `
+              UPDATE listings
+              SET saves_count = COALESCE(saves_count, 0) + 1
+              WHERE product_id = $1
+              RETURNING saves_count
+              `,
+              [listing.product_id],
+            )
+          : await client.query(
+              `
+              SELECT COALESCE(saves_count, 0) AS saves_count
+              FROM listings
+              WHERE product_id = $1
+              `,
+              [listing.product_id],
+            );
 
       // OPTIONAL: Notify the Agent here using Socket.IO or Email
       // const listing = await pool.query("SELECT agent_unique_id FROM listings WHERE product_id = $1", [product_id]);
@@ -131,10 +215,15 @@ export default router;
 // ---------------------------
 // Additional Endpoints
 // ---------------------------
-// 3. Get favorites for a specific user (admin or public use)
-router.get("/user/:id", async (req, res) => {
+// 3. Get favorites for a specific user (own or admin only)
+router.get("/user/:id", authenticateToken, async (req, res) => {
   try {
     const user_id = req.params.id;
+    const isOwner = String(req.user.unique_id) === user_id;
+    const isAdmin = req.user.is_admin || req.user.is_super_admin;
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     const result = await pool.query(
       `
       SELECT l.*, true as is_favorited 

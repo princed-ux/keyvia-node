@@ -1,11 +1,13 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
 import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
 import http from "http";
 import path from "path";
 import { Server } from "socket.io";
 import morgan from "morgan";
+import compression from "compression";
 
 import { pool } from "./db.js";
 import { globalErrorHandler } from "./middleware/globalErrorHandler.js";
@@ -16,6 +18,7 @@ import {
 } from "./services/metricsService.js";
 import logger from "./utils/logger.js";
 import { registerSocketHandlers } from "./socket/registerSocketHandlers.js";
+import { authenticateToken } from "./middleware/authMiddleware.js";
 import { startSubscriptionRenewalJob } from "./jobs/subscriptionRenewalJob.js";
 
 // =====================================================
@@ -23,6 +26,26 @@ import { startSubscriptionRenewalJob } from "./jobs/subscriptionRenewalJob.js";
 // =====================================================
 
 dotenv.config();
+
+// =====================================================
+// 1a. PROCESS-LEVEL CRASH SAFETY
+// =====================================================
+
+process.on("uncaughtException", (err) => {
+  logger.error("UNCAUGHT EXCEPTION — shutting down", {
+    message: err.message,
+    stack: err.stack,
+  });
+  setTimeout(() => process.exit(1), 10000).unref();
+});
+
+process.on("unhandledRejection", (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  logger.error("UNHANDLED REJECTION", {
+    message: err.message,
+    stack: err.stack,
+  });
+});
 
 // =====================================================
 // 2. IMPORT ROUTES
@@ -44,6 +67,7 @@ import adminRoutes from "./routes/adminRoutes.js";
 import superAdminRoutes from "./routes/superAdminRoutes.js";
 import applicationRoutes from "./routes/applicationRoutes.js";
 import brokerageRoutes from "./routes/brokerageRoutes.js";
+import buyerRoutes from "./routes/buyerRoutes.js";
 import badgeRoutes from "./routes/badgeRoutes.js";
 import onboardingRoutes from "./routes/onboardingRoutes.js";
 import rekognitionRoutes from "./routes/rekognitionRoutes.js";
@@ -55,6 +79,10 @@ import teamRoutes from "./routes/teamRoutes.js";
 import monitoringRoutes from "./routes/monitoringRoutes.js";
 import subscriptionRoutes from "./routes/subscriptions.js";
 import mediaProcessingRoutes from "./routes/mediaProcessingRoutes.js";
+import settingsRoutes from "./routes/settings.js";
+import trustSafetyRoutes from "./routes/trustSafety.js";
+import locationRoutes from "./routes/locationRoutes.js";
+import paymentsWebhookRoutes from "./routes/paymentsWebhook.js";
 
 // =====================================================
 // 3. APP CONFIG
@@ -129,6 +157,8 @@ const isSafeReadRequest = (req) => {
   const safeReadPrefixes = [
     "/api/profile",
     "/api/subscriptions/me",
+    "/api/settings",
+    "/api/trust-safety/copy",
     "/api/notifications/counts",
     "/api/notifications",
     "/api/listings/public",
@@ -183,7 +213,9 @@ const morganWrapper = morgan("combined", {
 // 6. CORE MIDDLEWARE
 // =====================================================
 
-app.use(
+app.use(helmet({ contentSecurityPolicy: false }));
+
+app.use(compression());app.use(
   cors({
     origin: CLIENT_URL,
     credentials: true,
@@ -193,6 +225,23 @@ app.use(
 );
 
 app.use(cookieParser());
+
+// Capture raw body for webhook signature verification (before express.json())
+app.use(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  (req, _res, next) => {
+    req.rawBody = Buffer.isBuffer(req.body)
+      ? req.body.toString("utf8")
+      : JSON.stringify(req.body);
+    try {
+      req.body = JSON.parse(req.rawBody);
+    } catch {
+      req.body = {};
+    }
+    next();
+  },
+);
 
 app.use(express.json({ limit: "10mb" }));
 
@@ -240,6 +289,10 @@ app.use("/users", usersRoutes);
 
 app.use("/api/payments", paymentsRoutes);
 
+// Webhook routes — raw body required for signature verification
+// Imported after express.json() so we install raw-body parser only on the webhook sub-path
+app.use("/api/payments/webhook", paymentsWebhookRoutes);
+
 app.use("/api/wallet", walletRoutes);
 
 app.use("/agents", agentRoutes);
@@ -254,6 +307,12 @@ app.use("/api/super-admin", superAdminRoutes);
 
 app.use("/api/subscriptions", subscriptionRoutes);
 
+app.use("/api/settings", settingsRoutes);
+
+app.use("/api/trust-safety", trustSafetyRoutes);
+
+app.use("/api/location", locationRoutes);
+
 app.use("/api/media-processing", mediaProcessingRoutes);
 
 app.use("/api/media", s3UploadRoutes);
@@ -261,6 +320,7 @@ app.use("/api/media", s3UploadRoutes);
 app.use("/api/applications", applicationRoutes);
 
 app.use("/api/brokerage", brokerageRoutes);
+app.use("/api/buyer", buyerRoutes);
 
 app.use("/api/badges", badgeRoutes);
 
@@ -278,7 +338,59 @@ app.use("/api/team", teamRoutes);
 
 app.use("/api/monitoring", monitoringRoutes);
 
+// =====================================================
+// 9a. ROUTE ALIASES (frontend → backend path fixes)
+// =====================================================
+
+// Frontend calls /api/agency/my-brokerage → return agent's linked brokerage
+app.get("/api/agency/my-brokerage", authenticateToken, async (req, res) => {
+  try {
+    const userKey = String(req.user?.unique_id || "");
+    const result = await pool.query(
+      `SELECT b.id, b.name, b.logo_url, b.banner_url, b.location, b.city, b.state, b.country,
+              b.email, b.phone, b.website, b.is_verified, b.status, b.created_at AS joined_at
+       FROM brokerages b
+       JOIN users u ON u.linked_agency_id::text = b.id::text
+       WHERE u.unique_id = $1
+       LIMIT 1`,
+      [userKey]
+    );
+    const brokerage = result.rows[0] || null;
+    let stats = { active_listings: 0, team_agents: 0, assigned_listings: 0, live_tours: 0 };
+    if (brokerage) {
+      const [listingsRes, agentsRes] = await Promise.all([
+        pool.query(`SELECT COUNT(*)::int AS count FROM listings l WHERE l.uploaded_by_id::text = $1 AND COALESCE(l.is_active, false) = true`, [userKey]),
+        pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE linked_agency_id::text = $1`, [brokerage.id]),
+      ]);
+      stats.active_listings = listingsRes.rows[0]?.count || 0;
+      stats.team_agents = agentsRes.rows[0]?.count || 0;
+    }
+    return res.json({ success: true, data: brokerage ? { ...brokerage, stats } : null });
+  } catch (err) {
+    console.error("Agency brokerage fetch error:", err.message);
+    return res.status(500).json({ success: false, message: "Failed to load brokerage info" });
+  }
+});
+
 app.get("/metrics", metricsEndpoint);
+
+app.get("/health", async (req, res) => {
+  let dbOk = false;
+  try {
+    const client = await pool.connect();
+    await client.query("SELECT 1");
+    client.release();
+    dbOk = true;
+  } catch { /* db down */ }
+  const uptime = process.uptime();
+  res.json({
+    status: dbOk ? "ok" : "degraded",
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(uptime),
+    database: dbOk ? "connected" : "disconnected",
+    memory: process.memoryUsage(),
+  });
+});
 
 app.get("/", (req, res) => {
   res.send("✅ Keyvia backend running with Socket.io 🚀");
@@ -313,12 +425,15 @@ app.use((req, res, next) => {
 app.use(globalErrorHandler);
 
 // =====================================================
-// 13. START SERVER
+// 13. START SERVER WITH DB RETRY
 // =====================================================
 
-pool
-  .connect()
-  .then((client) => {
+const MAX_DB_RETRIES = 5;
+const DB_RETRY_DELAY = 3000;
+
+const connectWithRetry = async (attempt = 1) => {
+  try {
+    const client = await pool.connect();
     console.log("✅ Connected to PostgreSQL");
     client.release();
 
@@ -334,8 +449,46 @@ pool
       startSubscriptionRenewalJob();
       console.log("🔁 Subscription renewal job started");
     });
-  })
-  .catch((err) => {
-    console.error("❌ Failed to connect to PostgreSQL:", err.stack);
+  } catch (err) {
+    console.error(`❌ Failed to connect to PostgreSQL (attempt ${attempt}/${MAX_DB_RETRIES}):`, err.message);
+    if (attempt < MAX_DB_RETRIES) {
+      console.log(`Retrying in ${DB_RETRY_DELAY / 1000}s...`);
+      setTimeout(() => connectWithRetry(attempt + 1), DB_RETRY_DELAY);
+    } else {
+      console.error("❌ All database connection attempts exhausted. Exiting.");
+      process.exit(1);
+    }
+  }
+};
+
+connectWithRetry();
+
+// =====================================================
+// 14. GRACEFUL SHUTDOWN (SIGTERM / SIGINT)
+// =====================================================
+
+const gracefulShutdown = async (signal) => {
+  logger.info(`${signal} received — starting graceful shutdown`);
+  try {
+    io.close();
+    server.close(async () => {
+      try {
+        await pool.end();
+        logger.info("Database pool closed");
+      } catch (err) {
+        logger.error("Error closing pool", { message: err.message });
+      }
+      process.exit(0);
+    });
+  } catch (err) {
+    logger.error("Error during shutdown", { message: err.message });
     process.exit(1);
-  });
+  }
+  setTimeout(() => {
+    logger.error("Forced shutdown after timeout");
+    process.exit(1);
+  }, 30000).unref();
+};
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));

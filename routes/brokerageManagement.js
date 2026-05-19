@@ -1,13 +1,13 @@
 import express from "express";
-import {
-  authenticateToken,
-} from "../middleware/authMiddleware.js";
+import { authenticateToken } from "../middleware/authMiddleware.js";
+
 import {
   createBrokerage,
   generateNewTeamCode,
   verifyTeamCode,
   getBrokerage,
   getBrokerageAgents,
+  removeBrokerageAgent,
   updateBrokerage,
 } from "../controllers/brokerageController.js";
 
@@ -32,6 +32,18 @@ router.get("/public/:brokerage_id/agents", getBrokerageAgents);
 
 // POST /api/brokerage/manage/create
 router.post("/create", authenticateToken, createBrokerage);
+
+// GET /api/brokerage/manage/agents
+// Brokerage owner gets their own connected agents.
+router.get("/agents", authenticateToken, getBrokerageAgents);
+
+// DELETE /api/brokerage/manage/agents/:agentId
+// Disconnects agent from brokerage. Does not delete agent account.
+router.delete("/agents/:agentId", authenticateToken, removeBrokerageAgent);
+
+// GET /api/brokerage/manage/:brokerage_id/agents
+// Optional compatibility route if another page still uses brokerage_id.
+router.get("/:brokerage_id/agents", authenticateToken, getBrokerageAgents);
 
 // PUT /api/brokerage/manage/:brokerage_id
 router.put("/:brokerage_id", authenticateToken, updateBrokerage);

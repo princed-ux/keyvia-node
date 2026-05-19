@@ -4,6 +4,15 @@ import {
   analyzeAgentProfile,
   analyzeAllPendingProfiles,
   updateProfileStatus,
+  getApprovalsUsers,
+  getApprovalsBrokerages,
+  getFlaggedListings,
+  getAdminStats,
+  getAdminAnalytics,
+  patchApprovalUser,
+  deleteFlaggedListing,
+  getAiModerationSettings,
+  updateAiModerationSetting,
 } from "../controllers/adminController.js";
 
 import {
@@ -13,32 +22,23 @@ import {
 
 const router = express.Router();
 
-router.get(
-  "/profiles/pending",
-  authenticate,
-  verifyAdmin,
-  getPendingProfiles
-);
+// --- Verification / KYC ---
+router.get("/profiles/pending", authenticate, verifyAdmin, getPendingProfiles);
+router.post("/profiles/:id/analyze", authenticate, verifyAdmin, analyzeAgentProfile);
+router.put("/profiles/:id/status", authenticate, verifyAdmin, updateProfileStatus);
+router.post("/profiles/analyze-all", authenticate, verifyAdmin, analyzeAllPendingProfiles);
 
-router.post(
-  "/profiles/:id/analyze",
-  authenticate,
-  verifyAdmin,
-  analyzeAgentProfile
-);
+// --- Dashboard ---
+router.get("/approvals/users", authenticate, verifyAdmin, getApprovalsUsers);
+router.get("/approvals/brokerages", authenticate, verifyAdmin, getApprovalsBrokerages);
+router.get("/listings/flagged", authenticate, verifyAdmin, getFlaggedListings);
+router.get("/stats", authenticate, verifyAdmin, getAdminStats);
+router.get("/analytics", authenticate, verifyAdmin, getAdminAnalytics);
+router.patch("/approvals/users/:userId", authenticate, verifyAdmin, patchApprovalUser);
+router.delete("/listings/:listingId", authenticate, verifyAdmin, deleteFlaggedListing);
 
-router.put(
-  "/profiles/:id/status",
-  authenticate,
-  verifyAdmin,
-  updateProfileStatus
-);
-
-router.post(
-  "/profiles/analyze-all",
-  authenticate,
-  verifyAdmin,
-  analyzeAllPendingProfiles
-);
+// --- AI Moderation Settings ---
+router.get("/ai-settings", authenticate, verifyAdmin, getAiModerationSettings);
+router.put("/ai-settings", authenticate, verifyAdmin, updateAiModerationSetting);
 
 export default router;

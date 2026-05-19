@@ -143,6 +143,72 @@ const columnExists = async (client, tableName, columnName) => {
   return result.rowCount > 0;
 };
 
+let publicProfileViewsReady = false;
+
+const ensurePublicProfileViewsTable = async (client) => {
+  if (publicProfileViewsReady) return;
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public_profile_views (
+      id BIGSERIAL PRIMARY KEY,
+      profile_owner_id TEXT NOT NULL,
+      viewer_id TEXT NULL,
+      viewer_role TEXT NULL,
+      source TEXT NOT NULL DEFAULT 'public_profile',
+      viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_public_profile_views_owner_viewed
+      ON public_profile_views (profile_owner_id, viewed_at DESC);
+  `);
+
+  publicProfileViewsReady = true;
+};
+
+const recordPublicProfileView = async (client, profileOwnerId, viewer = null) => {
+  if (!profileOwnerId) return;
+
+  const viewerId = viewer?.unique_id ? String(viewer.unique_id) : null;
+  const viewerRole = viewer?.role ? String(viewer.role).toLowerCase() : null;
+  const isSelfView = viewerId && viewerId === String(profileOwnerId);
+  const isAdminView = ["admin", "super_admin", "superadmin"].includes(viewerRole);
+
+  if (isSelfView || isAdminView) return;
+
+  await ensurePublicProfileViewsTable(client);
+
+  await client.query(
+    `
+    INSERT INTO public_profile_views (
+      profile_owner_id,
+      viewer_id,
+      viewer_role
+    )
+    VALUES ($1, $2, $3)
+    `,
+    [String(profileOwnerId), viewerId, viewerRole],
+  );
+};
+
+const getPublicProfileViewCount = async (client, profileOwnerId) => {
+  if (!profileOwnerId) return 0;
+
+  await ensurePublicProfileViewsTable(client);
+
+  const result = await client.query(
+    `
+    SELECT COUNT(*)::int AS total
+    FROM public_profile_views
+    WHERE profile_owner_id = $1
+    `,
+    [String(profileOwnerId)],
+  );
+
+  return Number(result.rows[0]?.total || 0);
+};
+
 const updateUsersOptionalColumns = async (client, uniqueId, patch = {}) => {
   const allowedColumns = [
     "username",
@@ -246,10 +312,18 @@ const normalizeProfileResponse = (base = {}, roleData = {}) => {
           : null,
 
     role_data: roleData || {},
+
+    preferred_location: roleData.preferred_location || "",
+    budget_min: roleData.budget_min || null,
+    budget_max: roleData.budget_max || null,
+    property_type_preference: roleData.property_type_preference || "",
+    move_in_date: roleData.move_in_date || null,
   };
 
   if (role === "agent") {
-    response.license_number = roleData.license_number || "";
+    const isOwnProfile = viewer && String(viewer.unique_id) === String(base.unique_id);
+    const isAdmin = viewer && (viewer.is_admin || viewer.is_super_admin);
+    response.license_number = isOwnProfile || isAdmin ? (roleData.license_number || "") : undefined;
     response.experience_years = roleData.experience_years || null;
     response.experience = roleData.experience_years || null;
     response.agency_name = roleData.brokerage_name || "";
@@ -800,6 +874,7 @@ export const resolvePublicProfilePayload = async ({
   identifier,
   expectedRole = null,
   client = pool,
+  viewer = null,
 } = {}) => {
   const queryValue = cleanPublicIdentifier(identifier);
 
@@ -993,6 +1068,14 @@ export const resolvePublicProfilePayload = async ({
     throw makePublicProfileError("Profile not found for this role.", 404);
   }
 
+  const viewerRole = String(viewer?.role || "").toLowerCase();
+  const canViewPrivateAnalytics =
+    Boolean(viewer?.unique_id) &&
+    (String(viewer.unique_id) === String(row.unique_id) ||
+      ["admin", "super_admin", "superadmin"].includes(viewerRole));
+
+  await recordPublicProfileView(client, row.unique_id, viewer);
+
   const [listings, brokerage, teamAgents] = await Promise.all([
     role !== "buyer"
       ? getPublicListingsForProfile(client, agent, listingColumns)
@@ -1025,6 +1108,9 @@ export const resolvePublicProfilePayload = async ({
     (sum, listing) => sum + Number(listing.views_count || 0),
     0,
   );
+  const profileViews = canViewPrivateAnalytics
+    ? await getPublicProfileViewCount(client, row.unique_id)
+    : null;
 
   agent.listing_count = listings.length;
   agent.active_listings_count = listings.length;
@@ -1038,7 +1124,8 @@ export const resolvePublicProfilePayload = async ({
     team_agents: teamAgents,
     brokerage,
     analytics: {
-      profile_views: 0,
+      profile_views: profileViews,
+      can_view_profile_views: canViewPrivateAnalytics,
       listing_views: listingViews,
       listings_count: listings.length,
       team_agents_count: teamAgents.length,
@@ -1058,6 +1145,7 @@ const sendPublicProfilePayload = async (req, res, options = {}) => {
     const payload = await resolvePublicProfilePayload({
       identifier,
       expectedRole: options.expectedRole || null,
+      viewer: req.user || null,
     });
 
     return res.json(payload);

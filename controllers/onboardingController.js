@@ -2,6 +2,8 @@
 import { pool } from "../db.js";
 import { createNotification } from "./notificationsController.js";
 import { sendVerificationSubmittedEmail } from "../utils/emailService.js";
+import { analyzeVerification } from "../services/aiVerificationService.js";
+import { getAiSettings } from "../services/aiSettingsService.js";
 
 /**
  * GET user's onboarding status
@@ -86,6 +88,27 @@ export const updateOnboardingStep = async (req, res) => {
       }
 
       await client.query("COMMIT");
+
+      // Background AI verification scan if step 4 submission
+      if (current_step === 4) {
+        setImmediate(async () => {
+          try {
+            const aiSettings = await getAiSettings();
+            if (aiSettings.ai_auto_scan_verifications) {
+              const userProfile = await pool.query(
+                `SELECT u.unique_id, u.name AS full_name, u.email, u.role, p.avatar_url, p.legal_document_url AS document_url
+                 FROM users u LEFT JOIN profiles p ON p.unique_id = u.unique_id WHERE u.id = $1`,
+                [userId],
+              );
+              if (userProfile.rows[0]) {
+                await analyzeVerification(userProfile.rows[0]);
+              }
+            }
+          } catch {
+            // AI verification scan must never block submission
+          }
+        });
+      }
 
       res.json({
         success: true,
@@ -190,6 +213,25 @@ export const submitOnboarding = async (req, res) => {
           console.warn("[SubmitOnboarding] Review email skipped:", emailErr?.message);
         });
       }
+
+      // Background AI verification scan if enabled
+      setImmediate(async () => {
+        try {
+          const aiSettings = await getAiSettings();
+          if (aiSettings.ai_auto_scan_verifications) {
+            const userProfile = await pool.query(
+              `SELECT u.unique_id, u.name AS full_name, u.email, u.role, p.avatar_url, p.legal_document_url AS document_url
+               FROM users u LEFT JOIN profiles p ON p.unique_id = u.unique_id WHERE u.id = $1`,
+              [userId],
+            );
+            if (userProfile.rows[0]) {
+              await analyzeVerification(userProfile.rows[0]);
+            }
+          }
+        } catch {
+          // AI verification scan must never block submission
+        }
+      });
 
       await client.query("COMMIT");
 

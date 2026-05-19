@@ -1,9 +1,10 @@
 import express from "express";
 import { pool } from "../db.js";
+import { authenticateToken } from "../middleware/authMiddleware.js";
 const router = express.Router();
 
 // 1. Search Users
-router.get("/search", async (req, res) => {
+router.get("/search", authenticateToken, async (req, res) => {
   const query = req.query.query || "";
   const q = `%${query}%`;
 
@@ -29,8 +30,11 @@ router.get("/search", async (req, res) => {
 });
 
 // 2. Get User Profile
-router.get("/:id", async (req, res) => {
+router.get("/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
+  if (String(req.user.unique_id) !== id && !req.user.is_admin && !req.user.is_super_admin) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
   try {
     const { rows } = await pool.query(
       `SELECT u.id, u.name AS full_name, u.email, u.unique_id, u.special_id,
@@ -49,7 +53,7 @@ router.get("/:id", async (req, res) => {
 });
 
 // 3. Last Seen
-router.get("/last-seen/:id", async (req, res) => {
+router.get("/last-seen/:id", authenticateToken, async (req, res) => {
   try {
     const q = await pool.query(
       "SELECT last_active FROM users WHERE unique_id = $1",
@@ -63,9 +67,11 @@ router.get("/last-seen/:id", async (req, res) => {
 });
 
 // 4. Block User
-router.post("/block", async (req, res) => {
-  const { blocker_id, blocked_id } = req.body;
-  if (!blocker_id || !blocked_id) return res.status(400).json({ error: "Missing IDs" });
+router.post("/block", authenticateToken, async (req, res) => {
+  const blocker_id = req.user.unique_id;
+  const { blocked_id } = req.body;
+  if (!blocked_id) return res.status(400).json({ error: "Missing blocked_id" });
+  if (blocker_id === blocked_id) return res.status(400).json({ error: "Cannot block yourself" });
 
   try {
     await pool.query(
@@ -80,9 +86,10 @@ router.post("/block", async (req, res) => {
 });
 
 // 5. Unblock User (✅ ADDED THIS ROUTE)
-router.post("/unblock", async (req, res) => {
-  const { blocker_id, blocked_id } = req.body;
-  if (!blocker_id || !blocked_id) return res.status(400).json({ error: "Missing IDs" });
+router.post("/unblock", authenticateToken, async (req, res) => {
+  const blocker_id = req.user.unique_id;
+  const { blocked_id } = req.body;
+  if (!blocked_id) return res.status(400).json({ error: "Missing blocked_id" });
 
   try {
     await pool.query(

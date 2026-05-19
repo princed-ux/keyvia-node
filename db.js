@@ -6,6 +6,15 @@ dotenv.config();
 
 const { Pool } = pkg;
 
+const NODE_ENV = process.env.NODE_ENV || "development";
+
+// In development, allow self-signed certs by default.
+// Override with DB_SSL_REJECT_UNAUTHORIZED=true in production.
+const rejectUnauthorized =
+  process.env.DB_SSL_REJECT_UNAUTHORIZED !== undefined
+    ? process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false"
+    : NODE_ENV !== "development";
+
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: 20,
@@ -16,7 +25,7 @@ export const pool = new Pool({
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
   ssl: {
-    rejectUnauthorized: false,
+    rejectUnauthorized,
   },
 });
 

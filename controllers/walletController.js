@@ -3,7 +3,7 @@ import { pool } from "../db.js";
 import crypto from "crypto";
 import { convertFromUSD, convertToUSD } from "../utils/exchangeRates.js"; 
 
-const FLW_SECRET_KEY = process.env.FLW_SECRET_KEY;
+const FLW_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || process.env.FLW_SECRET_KEY;
 const FLW_BASE = "https://api.flutterwave.com/v3";
 
 // --- KEYVIA ECONOMY CONFIG ---

@@ -1,5 +1,8 @@
 import express from "express";
-import { authenticateAndAttachUser } from "../middleware/authMiddleware.js";
+import {
+  authenticateAndAttachUser,
+  optionalAuth,
+} from "../middleware/authMiddleware.js";
 import {
   getProfile,
   updateProfile,
@@ -46,14 +49,18 @@ router.put(
 // Example: /api/profile/public/@prince
 // =====================================================
 
-router.get("/public/:username", getPublicProfile);
+router.get("/public/:username", optionalAuth, getPublicProfile);
 
 // Role-specific public social aliases. These reuse the same public-safe
 // resolver and keep the current /public and /agent routes compatible.
-router.get("/social/owner/:identifier", getSocialOwnerProfile);
-router.get("/social/agent/:identifier", getSocialAgentProfile);
-router.get("/social/brokerage/:identifier", getSocialBrokerageProfile);
-router.get("/social/agency-agent/:identifier", getSocialAgencyAgentProfile);
+router.get("/social/owner/:identifier", optionalAuth, getSocialOwnerProfile);
+router.get("/social/agent/:identifier", optionalAuth, getSocialAgentProfile);
+router.get("/social/brokerage/:identifier", optionalAuth, getSocialBrokerageProfile);
+router.get(
+  "/social/agency-agent/:identifier",
+  optionalAuth,
+  getSocialAgencyAgentProfile,
+);
 
 // =====================================================
 // PUBLIC AGENT PROFILE
@@ -62,6 +69,6 @@ router.get("/social/agency-agent/:identifier", getSocialAgencyAgentProfile);
 // Example: /api/profile/agent/@agentusername
 // =====================================================
 
-router.get("/agent/:unique_id", getPublicAgentProfile);
+router.get("/agent/:unique_id", optionalAuth, getPublicAgentProfile);
 
 export default router;

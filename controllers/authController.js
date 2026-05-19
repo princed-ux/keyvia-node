@@ -17,6 +17,8 @@ import {
   RekognitionClient,
   DetectFacesCommand,
 } from "@aws-sdk/client-rekognition";
+import { getAiSettings } from "../services/aiSettingsService.js";
+import { analyzeVerification } from "../services/aiVerificationService.js";
 
 // ================= ENV =================
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
@@ -1627,6 +1629,25 @@ const docColumn =
       role: normalizedRole,
     }).catch((emailErr) => {
       console.warn("[FinishOnboarding] Review email skipped:", emailErr?.message);
+    });
+
+    // Background AI verification scan if enabled
+    setImmediate(async () => {
+      try {
+        const aiSettings = await getAiSettings();
+        if (aiSettings.ai_auto_scan_verifications) {
+          const userProfile = await pool.query(
+            `SELECT u.unique_id, u.name AS full_name, u.email, u.role, p.avatar_url, p.legal_document_url AS document_url
+             FROM users u LEFT JOIN profiles p ON p.unique_id = u.unique_id WHERE u.unique_id = $1`,
+            [userId],
+          );
+          if (userProfile.rows[0]) {
+            await analyzeVerification(userProfile.rows[0]);
+          }
+        }
+      } catch {
+        // AI verification scan must never block submission
+      }
     });
 
     return res.json({

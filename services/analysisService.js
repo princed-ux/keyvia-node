@@ -22,9 +22,10 @@ export const performFullAnalysis = async (listingId) => {
     // 1. Fetch Listing & Agent Profile
     const res = await pool.query(
       `
-      SELECT l.*, p.country as profile_country, p.role as user_role
+      SELECT l.*, p.country as profile_country, u.role as user_role
       FROM listings l
       JOIN profiles p ON l.agent_unique_id = p.unique_id
+      JOIN users u ON l.agent_unique_id = u.unique_id
       WHERE l.product_id = $1
     `,
       [listingId],
@@ -137,19 +138,34 @@ export const performFullAnalysis = async (listingId) => {
   }
 };
 
-// Helper to update DB
+// Helper to update DB — only saves scores/flags, never changes status
 async function saveReport(report, listingId) {
-  let status = "pending";
-  if (report.verdict === "Safe to Approve") status = "approved";
-  if (report.verdict === "Rejected") status = "rejected";
-
   const notes = `AI Score: ${report.score}/100. Flags: ${report.flags.join(". ")}`;
 
+  const riskLevel =
+    report.score >= 60 ? "high" :
+    report.score >= 25 ? "medium" : "low";
+
   await pool.query(
-    `UPDATE listings 
-         SET admin_notes = $1, status = $2 
-         WHERE product_id = $3`,
-    [notes, status, listingId],
+    `UPDATE listings
+     SET
+       admin_notes = $1,
+       risk_score = $2,
+       listing_score = $3,
+       risk_level = $4,
+       risk_flags = $5::jsonb,
+       moderation_reason = $6,
+       reviewed_at = NOW()
+     WHERE product_id = $7`,
+    [
+      notes,
+      Math.max(0, 100 - report.score),
+      report.score,
+      riskLevel,
+      JSON.stringify(report.flags),
+      `AI Analysis: ${report.verdict}. Flags: ${report.flags.join(" | ")}`,
+      listingId,
+    ],
   );
   return report;
 }

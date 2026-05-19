@@ -3,8 +3,8 @@ import { pool } from "../db.js";
 import crypto from "crypto";
 import { convertFromUSD } from "../utils/exchangeRates.js"; // ✅ Import Helper
 
-const FLW_PUBLIC_KEY = process.env.FLW_PUBLIC_KEY; 
-const FLW_SECRET_KEY = process.env.FLW_SECRET_KEY;
+const FLW_PUBLIC_KEY = process.env.FLUTTERWAVE_PUBLIC_KEY || process.env.FLW_PUBLIC_KEY;
+const FLW_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || process.env.FLW_SECRET_KEY;
 const FLW_BASE = process.env.FLW_BASE_URL || "https://api.flutterwave.com/v3";
 
 // ✅ DIRECT PAYMENT COST
@@ -62,6 +62,15 @@ export const verifyPayment = async (req, res) => {
   try {
     const userId = req.user?.unique_id;
     const { tx_ref, transaction_id } = req.body;
+
+    // Idempotency check — skip if already processed
+    const existing = await pool.query(
+      `SELECT id FROM payments WHERE tx_ref = $1 AND status = 'successful'`,
+      [tx_ref]
+    );
+    if (existing.rows.length > 0) {
+      return res.json({ success: true, message: "Payment already verified" });
+    }
 
     const flwRes = await axios.get(`${FLW_BASE}/transactions/${transaction_id}/verify`, {
       headers: { Authorization: `Bearer ${FLW_SECRET_KEY}` },

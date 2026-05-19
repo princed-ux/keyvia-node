@@ -2,22 +2,37 @@ import { pool } from "../db.js";
 
 export const PLAN_LIMITS = {
   free: {
-    max_active_listings: 3,
+    max_active_listings: 1,
     can_use_boosts: false,
     can_assign_agents: false,
   },
   pro_agent: {
-    max_active_listings: 50,
+    max_active_listings: 25,
     can_use_boosts: true,
     can_assign_agents: false,
   },
-  brokerage_starter: {
+  elite_agent: {
     max_active_listings: 100,
+    can_use_boosts: true,
+    can_assign_agents: false,
+  },
+  pro_owner: {
+    max_active_listings: 25,
+    can_use_boosts: true,
+    can_assign_agents: false,
+  },
+  elite_owner: {
+    max_active_listings: 100,
+    can_use_boosts: true,
+    can_assign_agents: false,
+  },
+  pro_brokerage: {
+    max_active_listings: 150,
     can_use_boosts: true,
     can_assign_agents: true,
   },
-  brokerage_pro: {
-    max_active_listings: 500,
+  elite_brokerage: {
+    max_active_listings: 300,
     can_use_boosts: true,
     can_assign_agents: true,
   },
@@ -82,7 +97,7 @@ export const enforceListingLimit = async ({ userId }) => {
 
   const maxListings = subscription.is_active
     ? subscription.limits.max_active_listings
-    : subscription.free_listing_limit;
+    : (PLAN_LIMITS.free?.max_active_listings || subscription.free_listing_limit);
 
   if (currentCount >= maxListings) {
     return {

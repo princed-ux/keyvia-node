@@ -8,6 +8,7 @@ import { IvsClient, CreateChannelCommand } from "@aws-sdk/client-ivs";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 import { pool } from "../db.js";
 import { v4 as uuidv4 } from "uuid";
+import { notifyNewTour } from "../services/buyerAlertService.js";
 
 const ivsClient = new IvsClient({
   region: process.env.AWS_IVS_REGION || process.env.AWS_REGION || "eu-west-1",
@@ -381,6 +382,12 @@ export const goLive = async (req, res) => {
       console.error("❌ Live tour notification failed:", notifyError);
     }
 
+    setImmediate(() => {
+      if (listing?.product_id) {
+        notifyNewTour(req.io, listing, { id: tourId, playback_url: playbackUrl }).catch(() => {});
+      }
+    });
+
     // ------------------------------------------------------------------------
     // Socket broadcast to connected clients
     // ------------------------------------------------------------------------
@@ -409,13 +416,36 @@ export const goLive = async (req, res) => {
   } catch (error) {
     console.error("❌ Go Live Error:", error);
 
+    const awsCode = error?.name || error?.Code || "";
+    const awsMessage = error?.message || "";
+
+    const friendlyMessages = {
+      LimitExceededException:
+        "IVS stream quota reached for this account. Free up an existing stream or contact support to increase your IVS limit.",
+      AccessDeniedException:
+        "Keyvia does not have IVS access. Please check AWS IVS permissions and ensure the IVS service is enabled.",
+      InvalidParameterException:
+        "IVS configuration is invalid. Please check your AWS IVS region and channel settings.",
+      ResourceNotFoundException:
+        "IVS resource was not found. Your AWS IVS setup may need to be reconfigured.",
+      ConflictException:
+        "IVS stream conflict detected. The previous stream may still be active.",
+    };
+
+    const friendlyMessage =
+      friendlyMessages[awsCode] ||
+      (awsMessage.includes("quota") || awsMessage.includes("limit")
+        ? "IVS stream quota reached. Please end an existing live tour before starting a new one."
+        : awsMessage.includes("AccessDenied") || awsMessage.includes("authorization")
+          ? "AWS IVS access was denied. Please check your IVS credentials and permissions."
+          : "Could not start the live tour right now. Please check your connection and try again.");
+
     return res.status(500).json({
       success: false,
       error: "Failed to start live tour",
-      code: error?.name || error?.Code || "IVS_GO_LIVE_FAILED",
-      message:
-        error?.message ||
-        "Could not start the live tour right now. Please check your AWS IVS configuration, then try again.",
+      code: awsCode || "IVS_GO_LIVE_FAILED",
+      message: friendlyMessage,
+      userMessage: friendlyMessage,
     });
   }
 };
@@ -479,6 +509,7 @@ export const getMyActiveTours = async (req, res) => {
       success: false,
       message: "Could not fetch active live tours.",
       code: "ACTIVE_TOURS_FETCH_FAILED",
+      userMessage: "Could not load your active tours. Please refresh and try again.",
     });
   }
 };
@@ -497,13 +528,14 @@ export const getLiveNowTours = async (req, res) => {
         lt.*,
         l.title AS property_title,
         l.product_id,
+        l.photos,
         l.address,
         l.city,
         l.state,
         l.country,
-        COALESCE(u.full_name, u.name, u.email, 'A Keyvia host') AS host_name,
+        COALESCE(u.name, u.email, 'A Keyvia host') AS host_name,
         u.role AS host_role,
-        b.name AS brokerage_name
+        b.company_name AS brokerage_name
       FROM live_tours lt
       JOIN listings l ON lt.property_id = l.id
       LEFT JOIN users u ON lt.host_id = u.unique_id
@@ -525,6 +557,7 @@ export const getLiveNowTours = async (req, res) => {
         }),
         property_title: row.property_title,
         product_id: row.product_id,
+        photos: row.photos,
         address: row.address,
         city: row.city,
         state: row.state,
@@ -541,6 +574,7 @@ export const getLiveNowTours = async (req, res) => {
       success: false,
       message: "Could not load active live tours.",
       code: "LIVE_NOW_FETCH_FAILED",
+      userMessage: "Live tours are not available right now. Please try again.",
     });
   }
 };
@@ -647,6 +681,7 @@ export const endLive = async (req, res) => {
       success: false,
       message: "Failed to end live tour.",
       code: "END_LIVE_FAILED",
+      userMessage: "Could not end the live tour right now. Please try again.",
     });
   }
 };
@@ -673,7 +708,7 @@ export const getLiveTour = async (req, res) => {
     const tourQuery = `
       SELECT
         lt.*,
-        COALESCE(u.full_name, u.name, u.email, 'A Keyvia host') AS host_name,
+        COALESCE(u.name, u.email, 'A Keyvia host') AS host_name,
         u.avatar_url,
         l.title AS property_title,
         l.address AS property_address,
@@ -772,8 +807,9 @@ export const getLiveTour = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch tour.",
+      message: "Failed to fetch tour details.",
       code: "GET_TOUR_FAILED",
+      userMessage: "Could not load the live tour right now. Please try again.",
     });
   }
 };

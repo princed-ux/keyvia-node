@@ -9,6 +9,7 @@ import {
   getListingByProductId,
   updateListingStatus,
   activateListing,
+  pauseListing,
   getAllListingsAdmin,
   getPublicAgentProfile,
   analyzeListing,
@@ -16,6 +17,13 @@ import {
   reportListing,
   requestListingTour,
   notifyLiveTourInterest,
+  createListingInquiry,
+  trackListingShare,
+  trackListingContactClick,
+  getListingAnalytics,
+  getListingLocationIntelligence,
+  scanListingLocationIntelligence,
+  getListingMarketHistory,
 
   createListingDraft,
   updateListingDraft,
@@ -55,7 +63,7 @@ router.get("/public", optionalAuth, getListings);
 router.get("/agent", authenticateToken, getAgentListings);
 
 // Public agent / owner / brokerage profile
-router.get("/public/agent/:unique_id", getPublicAgentProfile);
+router.get("/public/agent/:unique_id", optionalAuth, getPublicAgentProfile);
 
 /* ============================================================
    2. DRAFT / AUTOSAVE ROUTES
@@ -162,11 +170,66 @@ router.put(
   activateListing,
 );
 
-// Buyer/public safety report. Auth keeps reports attributable and rate-limited.
+// Owner/admin visibility pause without deleting or changing approval history.
+router.put(
+  "/:product_id/pause",
+  authenticateToken,
+  pauseListing,
+);
+
+// Buyer/public safety report. Optional auth keeps reports attributable when possible.
 router.post(
   "/:product_id/report",
-  authenticateToken,
+  optionalAuth,
   reportListing,
+);
+
+router.post(
+  "/:product_id/inquiries",
+  optionalAuth,
+  createListingInquiry,
+);
+
+router.post(
+  "/:product_id/share",
+  optionalAuth,
+  trackListingShare,
+);
+
+router.post(
+  "/:product_id/contact-click",
+  optionalAuth,
+  trackListingContactClick,
+);
+
+router.get(
+  "/:product_id/analytics",
+  authenticateToken,
+  getListingAnalytics,
+);
+
+router.post(
+  "/:product_id/location-intelligence/scan",
+  authenticateToken,
+  scanListingLocationIntelligence,
+);
+
+router.get(
+  "/:product_id/location-intelligence",
+  optionalAuth,
+  getListingLocationIntelligence,
+);
+
+router.get(
+  "/:product_id/market-history",
+  optionalAuth,
+  getListingMarketHistory,
+);
+
+router.post(
+  "/:product_id/tour-requests",
+  authenticateToken,
+  requestListingTour,
 );
 
 router.post(

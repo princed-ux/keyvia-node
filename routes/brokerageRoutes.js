@@ -232,15 +232,50 @@ router.get("/stats", async (req, res) => {
       SELECT
         (
           SELECT COUNT(*)
+          FROM brokerage_projects
+          WHERE brokerage_id::text = $1::text
+        ) AS total_projects,
+
+        (
+          SELECT COUNT(*)
           FROM listings
           WHERE uploaded_by_id::text = $1::text
             AND status = 'approved'
             AND is_active = true
-        ) AS active_projects,
+        ) AS live_listings,
+
+        (
+          SELECT COUNT(*)
+          FROM listings
+          WHERE uploaded_by_id::text = $1::text
+             OR agency_id::text = $1::text
+        ) AS total_listings,
+
+        (
+          SELECT COUNT(*)
+          FROM listings
+          WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text)
+            AND status = 'draft'
+        ) AS draft_listings,
+
+        (
+          SELECT COUNT(*)
+          FROM listings
+          WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text)
+            AND LOWER(status::text) IN ('pending', 'under_review', 'reviewing')
+            AND brokerage_review_status = 'pending'
+        ) AS pending_listings,
+
+        (
+          SELECT COUNT(*)
+          FROM listings
+          WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text)
+            AND LOWER(status::text) = 'rejected'
+        ) AS rejected_listings,
 
         (
           SELECT COUNT(DISTINCT u.unique_id)
-          FROM users
+          FROM users u
           LEFT JOIN agent_profiles ap
             ON ap.unique_id::text = u.unique_id::text
           WHERE (
@@ -251,16 +286,9 @@ router.get("/stats", async (req, res) => {
         ) AS total_agents,
 
         (
-          SELECT COUNT(*)
-          FROM listings
-          WHERE uploaded_by_id::text = $1::text
-             OR agency_id::text = $1::text
-        ) AS total_properties,
-
-        (
           SELECT COALESCE(SUM(amount), 0)
           FROM payments
-          WHERE user_id = $1
+          WHERE user_id::text = $1::text
             AND status = 'completed'
             AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM NOW())
         ) AS revenue_ytd
@@ -270,9 +298,14 @@ router.get("/stats", async (req, res) => {
     const stats = rows[0] || {};
 
     return res.json({
-      projects: Number(stats.active_projects || 0),
+      projects: Number(stats.total_projects || 0),
+      totalListings: Number(stats.total_listings || 0),
+      liveListings: Number(stats.live_listings || 0),
+      draftListings: Number(stats.draft_listings || 0),
+      pendingListings: Number(stats.pending_listings || 0),
+      rejectedListings: Number(stats.rejected_listings || 0),
       agents: Number(stats.total_agents || 0),
-      properties: Number(stats.total_properties || 0),
+      properties: Number(stats.total_listings || 0),
       revenue: Number(stats.revenue_ytd || 0),
     });
   } catch (err) {
@@ -292,27 +325,40 @@ router.get("/projects", async (req, res) => {
     const { rows } = await pool.query(
       `
       SELECT
-        id,
-        title AS name,
-        COALESCE(city, state, country, address, 'No location') AS location,
-        status,
-        description,
-        created_at,
-        updated_at
-      FROM listings
-      WHERE uploaded_by_id = $1
-      ORDER BY created_at DESC
+        bp.id,
+        bp.name,
+        bp.location,
+        bp.status,
+        bp.description,
+        bp.project_type,
+        bp.total_units,
+        bp.available_units,
+        bp.assigned_agent_id,
+        bp.created_at,
+        bp.updated_at,
+        (
+          SELECT COUNT(*)
+          FROM listings l
+          WHERE l.project_id = bp.id
+        ) AS listings_count,
+        (
+          SELECT COUNT(*)
+          FROM listings l
+          WHERE l.project_id = bp.id
+            AND LOWER(l.status::text) IN ('pending', 'under_review', 'reviewing')
+        ) AS pending_listings
+      FROM brokerage_projects bp
+      WHERE bp.brokerage_id::text = $1::text
+      ORDER BY bp.created_at DESC
       `,
       [userId]
     );
 
-    const projects = rows.map((p) => ({
+    return res.json(rows.map((p) => ({
       ...p,
       progress: 0,
-      unitsLeft: 0,
-    }));
-
-    return res.json(projects);
+      unitsLeft: p.available_units || 0,
+    })));
   } catch (err) {
     console.error("Get Projects Error:", err);
     return res.status(500).json({ error: "Failed to fetch projects" });
@@ -324,35 +370,59 @@ router.post("/projects", async (req, res) => {
     const userId = requireUser(req, res);
     if (!userId) return;
 
-    const { title, location, description, status } = req.body;
+    const b = req.body;
+    const projectName = b.title || b.name;
 
-    if (!title) {
-      return res.status(400).json({ error: "Title is required" });
+    if (!projectName) {
+      return res.status(400).json({ error: "Project name is required" });
     }
 
     const { rows } = await pool.query(
       `
-      INSERT INTO listings (
-        title,
-        city,
+      INSERT INTO brokerage_projects (
+        brokerage_id,
+        name,
+        location,
         description,
         status,
-        uploaded_by_id,
-        listing_type
+        total_units,
+        available_units,
+        project_type,
+        created_at,
+        updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, 'sale')
+      VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
       RETURNING
         id,
-        title AS name,
-        COALESCE(city, 'No location') AS location,
-        status,
+        name,
+        location,
         description,
-        created_at
+        status,
+        project_type,
+        total_units,
+        available_units,
+        created_at,
+        updated_at
       `,
-      [title, location || null, description || null, status || "draft", userId]
+      [
+        userId,
+        projectName,
+        b.location || null,
+        b.description || null,
+        b.status || "planning",
+        b.total_units || b.totalUnits ? Number(b.total_units || b.totalUnits) : null,
+        b.available_units || b.availableUnits ? Number(b.available_units || b.availableUnits) : null,
+        b.project_type || b.projectType || null,
+      ]
     );
 
-    return res.status(201).json(rows[0]);
+    return res.status(201).json({
+      ...rows[0],
+      listings_count: 0,
+      pending_listings: 0,
+      progress: 0,
+      unitsLeft: rows[0].available_units || 0,
+    });
   } catch (err) {
     console.error("Create Project Error:", err);
     return res.status(500).json({ error: "Failed to create project" });
@@ -365,28 +435,46 @@ router.patch("/projects/:id", async (req, res) => {
     if (!userId) return;
 
     const { id } = req.params;
-    const { title, location, description, status } = req.body;
+    const b = req.body;
+    const projectName = b.title || b.name;
 
     const { rows } = await pool.query(
       `
-      UPDATE listings
+      UPDATE brokerage_projects
       SET
-        title = COALESCE($1, title),
-        city = COALESCE($2, city),
+        name = COALESCE($1, name),
+        location = COALESCE($2, location),
         description = COALESCE($3, description),
         status = COALESCE($4, status),
+        total_units = COALESCE($5, total_units),
+        available_units = COALESCE($6, available_units),
+        project_type = COALESCE($7, project_type),
         updated_at = NOW()
-      WHERE id = $5
-        AND uploaded_by_id = $6
+      WHERE id = $8
+        AND brokerage_id::text = $9::text
       RETURNING
         id,
-        title AS name,
-        COALESCE(city, state, country, address, 'No location') AS location,
-        status,
+        name,
+        location,
         description,
+        status,
+        project_type,
+        total_units,
+        available_units,
+        created_at,
         updated_at
       `,
-      [title, location, description, status, id, userId]
+      [
+        projectName || null,
+        b.location ?? null,
+        b.description ?? null,
+        b.status || null,
+        (b.total_units ?? b.totalUnits) !== undefined ? Number(b.total_units ?? b.totalUnits) : null,
+        (b.available_units ?? b.availableUnits) !== undefined ? Number(b.available_units ?? b.availableUnits) : null,
+        b.project_type ?? b.projectType ?? null,
+        id,
+        userId,
+      ]
     );
 
     if (!rows.length) {
@@ -407,11 +495,16 @@ router.delete("/projects/:id", async (req, res) => {
 
     const { id } = req.params;
 
+    await pool.query(
+      `UPDATE listings SET project_id = NULL WHERE project_id = $1 AND (uploaded_by_id::text = $2::text OR agency_id::text = $2::text)`,
+      [id, userId]
+    );
+
     const result = await pool.query(
       `
-      DELETE FROM listings
+      DELETE FROM brokerage_projects
       WHERE id = $1
-        AND uploaded_by_id = $2
+        AND brokerage_id::text = $2::text
       `,
       [id, userId]
     );
@@ -424,6 +517,265 @@ router.delete("/projects/:id", async (req, res) => {
   } catch (err) {
     console.error("Delete Project Error:", err);
     return res.status(500).json({ error: "Failed to delete project" });
+  }
+});
+
+// ============================================================
+// PROJECT ASSIGN
+// ============================================================
+router.post("/projects/:id/assign", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { id } = req.params;
+    const { agent_id } = req.body;
+
+    if (!agent_id) {
+      return res.status(400).json({ error: "Agent ID is required" });
+    }
+
+    const agentCheck = await pool.query(
+      `
+      SELECT 1
+      FROM users
+      WHERE unique_id::text = $1::text
+        AND linked_agency_id::text = $2::text
+        AND LOWER(role::text) IN ('agent', 'agency_agent', 'agencyagent', 'brokerage_agent')
+      LIMIT 1
+      `,
+      [agent_id, userId]
+    );
+
+    if (!agentCheck.rows.length) {
+      return res.status(404).json({ error: "Agent not found or not linked to this brokerage" });
+    }
+
+    await pool.query(
+      `
+      UPDATE brokerage_projects
+      SET assigned_agent_id = $1::uuid,
+          updated_at = NOW()
+      WHERE id = $2
+        AND brokerage_id::text = $3::text
+      `,
+      [agent_id, id, userId]
+    );
+
+    return res.json({ success: true, message: "Agent assigned to project" });
+  } catch (err) {
+    console.error("Assign Error:", err);
+    return res.status(500).json({ error: "Failed to assign agent" });
+  }
+});
+
+// ============================================================
+// BROKERAGE LISTINGS
+// ============================================================
+router.get("/listings", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        l.product_id,
+        l.title,
+        l.description,
+        l.property_type,
+        l.listing_type,
+        l.price,
+        l.price_currency,
+        l.bedrooms,
+        l.bathrooms,
+        l.address,
+        l.city,
+        l.state,
+        l.country,
+        l.photos,
+        l.status,
+        l.is_active,
+        l.views_count,
+        l.updated_at,
+        l.created_at,
+        l.project_id,
+        l.assigned_agent_id
+      FROM listings l
+      WHERE l.uploaded_by_id::text = $1::text
+         OR l.agency_id::text = $1::text
+      ORDER BY COALESCE(l.updated_at, l.created_at) DESC
+      LIMIT 200
+      `,
+      [userId]
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    console.error("Get Brokerage Listings Error:", err);
+    return res.status(500).json({ error: "Failed to fetch listings" });
+  }
+});
+
+router.get("/activity", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        l.product_id,
+        l.title,
+        l.status,
+        l.updated_at,
+        l.updated_at AS created_at,
+        'listing_update' AS type,
+        CONCAT(
+          COALESCE(l.title, 'A listing'),
+          ' was ',
+          CASE LOWER(l.status::text)
+            WHEN 'approved' THEN 'approved'
+            WHEN 'rejected' THEN 'rejected'
+            WHEN 'pending' THEN 'submitted for review'
+            WHEN 'draft' THEN 'updated'
+            ELSE LOWER(l.status::text)
+          END
+        ) AS message,
+        u.name AS actor_name
+      FROM listings l
+      LEFT JOIN users u ON u.unique_id::text = l.uploaded_by_id::text
+      WHERE (l.agency_id::text = $1::text OR l.uploaded_by_id::text = $1::text)
+      ORDER BY l.updated_at DESC
+      LIMIT 20
+      `,
+      [userId]
+    );
+
+    return res.json({ activities: rows });
+  } catch (err) {
+    console.error("Get Brokerage Activity Error:", err);
+    return res.status(200).json({ activities: [] });
+  }
+});
+
+router.get("/listings/pending", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        l.product_id,
+        l.title,
+        l.description,
+        l.property_type,
+        l.listing_type,
+        l.price,
+        l.price_currency,
+        l.bedrooms,
+        l.bathrooms,
+        l.address,
+        l.city,
+        l.state,
+        l.country,
+        l.photos,
+        l.status,
+        l.is_active,
+        l.created_at,
+        l.updated_at,
+        u.name AS agent_name,
+        u.unique_id AS agent_id
+      FROM listings l
+      LEFT JOIN users u ON u.unique_id::text = l.uploaded_by_id::text
+      WHERE (l.agency_id::text = $1::text OR l.uploaded_by_id::text = $1::text)
+        AND LOWER(l.status::text) IN ('pending', 'under_review', 'reviewing')
+        AND l.brokerage_review_status = 'pending'
+      ORDER BY l.updated_at DESC
+      LIMIT 100
+      `,
+      [userId]
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    console.error("Get Pending Listings Error:", err);
+    return res.status(500).json({ error: "Failed to fetch pending listings" });
+  }
+});
+
+router.post("/listings/:product_id/approve", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { product_id } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE listings
+      SET status = 'approved',
+          is_active = true,
+          brokerage_review_status = 'approved',
+          brokerage_reviewed_by = $1::uuid,
+          brokerage_reviewed_at = NOW(),
+          updated_at = NOW()
+      WHERE product_id = $2
+        AND (agency_id::text = $1::text OR uploaded_by_id::text = $1::text)
+        AND LOWER(status::text) IN ('pending', 'under_review', 'reviewing')
+        AND brokerage_review_status = 'pending'
+      RETURNING product_id, title, status
+      `,
+      [userId, product_id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Listing not found or not pending" });
+    }
+
+    return res.json({ success: true, message: "Listing approved", listing: result.rows[0] });
+  } catch (err) {
+    console.error("Approve Listing Error:", err);
+    return res.status(500).json({ error: "Failed to approve listing" });
+  }
+});
+
+router.post("/listings/:product_id/reject", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { product_id } = req.params;
+    const { reason } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE listings
+      SET status = 'rejected',
+          is_active = false,
+          brokerage_review_status = 'rejected',
+          brokerage_reviewed_by = $1::uuid,
+          brokerage_reviewed_at = NOW(),
+          admin_notes = COALESCE($3, admin_notes),
+          updated_at = NOW()
+      WHERE product_id = $2
+        AND (agency_id::text = $1::text OR uploaded_by_id::text = $1::text)
+        AND LOWER(status::text) IN ('pending', 'under_review', 'reviewing')
+        AND brokerage_review_status = 'pending'
+      RETURNING product_id, title, status
+      `,
+      [userId, product_id, reason || "Rejected by brokerage"]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Listing not found or not pending" });
+    }
+
+    return res.json({ success: true, message: "Listing rejected", listing: result.rows[0] });
+  } catch (err) {
+    console.error("Reject Listing Error:", err);
+    return res.status(500).json({ error: "Failed to reject listing" });
   }
 });
 
@@ -1336,6 +1688,131 @@ router.get("/applications", async (req, res) => {
   } catch (err) {
     console.error("Get Applications Error:", err);
     return res.status(500).json({ error: "Failed to fetch applications" });
+  }
+});
+
+// ============================================================
+// BROKERAGE ANALYTICS
+// ============================================================
+router.get("/analytics", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const [
+      statsRes,
+      agentPerfRes,
+      monthlyRes,
+      typesRes,
+      statusRes,
+    ] = await Promise.all([
+      pool.query(
+        `SELECT
+          (SELECT COUNT(DISTINCT u.unique_id) FROM users u LEFT JOIN agent_profiles ap ON ap.unique_id::text = u.unique_id::text
+            WHERE (u.linked_agency_id::text = $1::text OR ap.linked_agency_id::text = $1::text) AND LOWER(u.role::TEXT) IN ('agent','agency_agent','agencyagent','brokerage_agent'))::int AS agents,
+          (SELECT COUNT(*) FROM listings WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text))::int AS total_listings,
+          (SELECT COUNT(*) FROM listings WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text) AND status = 'approved' AND is_active = true)::int AS active_listings,
+          (SELECT COUNT(*) FROM listings WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text) AND LOWER(status::text) IN ('pending','under_review','reviewing'))::int AS pending_listings,
+          (SELECT COALESCE(SUM(COALESCE(views_count,0)),0) FROM listings WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text))::int AS total_views,
+          (SELECT COALESCE(SUM(COALESCE(saves_count,0)),0) FROM listings WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text))::int AS total_saves,
+          (SELECT COALESCE(SUM(COALESCE(contact_count,0)),0) FROM listings WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text))::int AS total_contacts,
+          (SELECT COALESCE(SUM(amount),0) FROM payments WHERE user_id::text = $1::text AND status = 'completed' AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM NOW()))::float AS revenue_ytd`,
+        [userId],
+      ),
+      pool.query(
+        `SELECT
+          u.unique_id, COALESCE(u.name, u.email) AS name,
+          COUNT(l.id)::int AS listings,
+          COALESCE(SUM(COALESCE(l.views_count,0)),0)::int AS views,
+          COALESCE(SUM(COALESCE(l.saves_count,0)),0)::int AS saves,
+          COALESCE(SUM(COALESCE(l.contact_count,0)),0)::int AS contacts
+        FROM users u
+        LEFT JOIN agent_profiles ap ON ap.unique_id::text = u.unique_id::text
+        LEFT JOIN listings l ON (l.uploaded_by_id::text = u.unique_id::text OR l.agent_unique_id::text = u.unique_id::text)
+        WHERE (u.linked_agency_id::text = $1::text OR ap.linked_agency_id::text = $1::text)
+          AND LOWER(u.role::TEXT) IN ('agent','agency_agent','agencyagent','brokerage_agent')
+        GROUP BY u.unique_id, u.name, u.email
+        ORDER BY views DESC
+        LIMIT 20`,
+        [userId],
+      ),
+      pool.query(
+        `SELECT
+          TO_CHAR(DATE_TRUNC('month', l.created_at), 'YYYY-MM') AS month,
+          COUNT(*)::int AS listings_added,
+          COALESCE(SUM(COALESCE(l.views_count,0)),0)::int AS views,
+          COALESCE(SUM(COALESCE(l.saves_count,0)),0)::int AS saves
+        FROM listings l
+        WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text)
+          AND l.created_at >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '11 months')
+        GROUP BY DATE_TRUNC('month', l.created_at)
+        ORDER BY month ASC`,
+        [userId],
+      ),
+      pool.query(
+        `SELECT COALESCE(NULLIF(l.property_type::text, ''), 'Other') AS label, COUNT(*)::int AS count
+        FROM listings l
+        WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text)
+        GROUP BY label ORDER BY count DESC`,
+        [userId],
+      ),
+      pool.query(
+        `SELECT
+          CASE
+            WHEN COALESCE(l.is_active, false) = true AND LOWER(COALESCE(l.status::text, '')) IN ('approved','live','published','active') THEN 'Live'
+            WHEN LOWER(COALESCE(l.status::text, '')) = 'approved' THEN 'Approved'
+            WHEN LOWER(COALESCE(l.status::text, '')) = 'pending' THEN 'In review'
+            WHEN LOWER(COALESCE(l.status::text, '')) = 'rejected' THEN 'Needs fixes'
+            WHEN LOWER(COALESCE(l.status::text, '')) = 'draft' THEN 'Draft'
+            ELSE 'Unknown'
+          END AS label, COUNT(*)::int AS count
+        FROM listings l
+        WHERE (uploaded_by_id::text = $1::text OR agency_id::text = $1::text)
+        GROUP BY label ORDER BY count DESC`,
+        [userId],
+      ),
+    ]);
+
+    const stats = statsRes.rows[0] || {};
+    const byAgent = agentPerfRes.rows.map((r) => ({
+      agent_id: r.unique_id,
+      name: r.name || "Unknown",
+      listings: Number(r.listings || 0),
+      views: Number(r.views || 0),
+      saves: Number(r.saves || 0),
+      contacts: Number(r.contacts || 0),
+    }));
+    const monthly = monthlyRes.rows.map((r) => ({
+      month: r.month,
+      listings_added: Number(r.listings_added || 0),
+      views: Number(r.views || 0),
+      saves: Number(r.saves || 0),
+    }));
+    const byType = { labels: typesRes.rows.map((r) => r.label), series: typesRes.rows.map((r) => Number(r.count || 0)) };
+    const byStatus = { labels: statusRes.rows.map((r) => r.label), series: statusRes.rows.map((r) => Number(r.count || 0)) };
+
+    return res.json({
+      success: true,
+      analytics: {
+        total: {
+          agents: Number(stats.agents || 0),
+          listings: Number(stats.total_listings || 0),
+          active_listings: Number(stats.active_listings || 0),
+          pending_listings: Number(stats.pending_listings || 0),
+          views: Number(stats.total_views || 0),
+          saves: Number(stats.total_saves || 0),
+          contacts: Number(stats.total_contacts || 0),
+          revenue: Number(stats.revenue_ytd || 0),
+        },
+        byAgent,
+        monthly,
+        byType,
+        byStatus,
+      },
+    });
+  } catch (err) {
+    console.error("Brokerage Analytics Error:", err);
+    return res.status(500).json({ success: false, error: "Failed to load analytics" });
   }
 });
 
