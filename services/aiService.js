@@ -38,6 +38,7 @@ async function analyzeImage(buffer) {
     const modRes = await rekognition.send(modCmd);
     results.moderation = modRes.ModerationLabels || [];
   } catch (err) {
+    if (err.name === "InvalidImageFormatException") throw err;
     console.error("Rekognition moderation error:", err.message);
   }
 
@@ -50,6 +51,7 @@ async function analyzeImage(buffer) {
     const labelRes = await rekognition.send(labelCmd);
     results.labels = labelRes.Labels || [];
   } catch (err) {
+    if (err.name === "InvalidImageFormatException") throw err;
     console.error("Rekognition labels error:", err.message);
   }
 
@@ -86,8 +88,7 @@ function scoreResults(results) {
 }
 
 const VALID_IMAGE_TYPES = new Set([
-  "image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff",
-  "application/octet-stream", "binary/octet-stream",
+  "image/jpeg", "image/png", "image/webp", "image/bmp",
 ]);
 
 const IMAGE_SIGNATURES = {
@@ -95,7 +96,6 @@ const IMAGE_SIGNATURES = {
   "image/png": [[0x89, 0x50, 0x4E, 0x47]],
   "image/webp": [[0x52, 0x49, 0x46, 0x46]],
   "image/bmp": [[0x42, 0x4D]],
-  "image/tiff": [[0x49, 0x49, 0x2A, 0x00], [0x4D, 0x4D, 0x00, 0x2A]],
 };
 
 function isValidImageBuffer(buffer) {
@@ -152,6 +152,10 @@ export const analyzeListingWithPython = async (photoUrls, _title, _description, 
         allFlags.push(...imgFlags);
         filesAnalyzed++;
       } catch (err) {
+        if (err.name === "InvalidImageFormatException") {
+          allFlags.push(`Image ${i}: Rekognition rejected format`);
+          continue;
+        }
         console.error(`Failed to download image ${i}: ${err.message}`);
       }
     }

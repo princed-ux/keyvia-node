@@ -18,7 +18,7 @@ import {
 } from "./services/metricsService.js";
 import logger from "./utils/logger.js";
 import { registerSocketHandlers } from "./socket/registerSocketHandlers.js";
-import { authenticateToken } from "./middleware/authMiddleware.js";
+import { authenticateToken, verifySuperAdmin } from "./middleware/authMiddleware.js";
 import { startSubscriptionRenewalJob } from "./jobs/subscriptionRenewalJob.js";
 
 // =====================================================
@@ -53,6 +53,7 @@ process.on("unhandledRejection", (reason) => {
 
 import authRoutes from "./routes/auth.js";
 import listingsRoutes from "./routes/listings.js";
+import smartSearchRoutes from "./routes/smartSearchRoutes.js";
 import uploadsRoutes from "./routes/uploads.js";
 import messagesRoutes from "./routes/messages.js";
 import notificationsRoutes from "./routes/notifications.js";
@@ -77,12 +78,16 @@ import s3UploadRoutes from "./routes/s3Upload.js";
 import ivsRoutes from "./routes/ivsRoutes.js";
 import teamRoutes from "./routes/teamRoutes.js";
 import monitoringRoutes from "./routes/monitoringRoutes.js";
+import adminMessageRoutes from "./routes/adminMessageRoutes.js";
+import { runSystemChecks } from "./services/systemAlertService.js";
 import subscriptionRoutes from "./routes/subscriptions.js";
 import mediaProcessingRoutes from "./routes/mediaProcessingRoutes.js";
 import settingsRoutes from "./routes/settings.js";
 import trustSafetyRoutes from "./routes/trustSafety.js";
 import locationRoutes from "./routes/locationRoutes.js";
 import paymentsWebhookRoutes from "./routes/paymentsWebhook.js";
+import broadcastRoutes from "./routes/broadcastRoutes.js";
+import offerRoutes from "./routes/offerRoutes.js";
 
 // =====================================================
 // 3. APP CONFIG
@@ -269,6 +274,43 @@ app.use((req, res, next) => {
   next();
 });
 
+// Lockdown / Maintenance Mode Middleware
+const LOCKDOWN_WHITELIST = [
+  "/api/auth/login", "/api/auth/register", "/api/auth/logout",
+  "/api/super-admin/login", "/api/super-admin",
+  "/api/platform-settings/lockdown-status",
+  "/api/monitoring",
+];
+
+app.use(async (req, res, next) => {
+  if (req.path === "/api/platform-settings/lockdown-status") return next();
+
+  const isWhitelisted = LOCKDOWN_WHITELIST.some((p) => req.path.startsWith(p));
+  if (isWhitelisted) return next();
+
+  try {
+    const result = await pool.query(
+      `SELECT value FROM platform_settings WHERE key = 'maintenance_mode'`,
+    );
+    const isLocked = result.rows[0]?.value === "true";
+
+    if (isLocked) {
+      const userRole = req.user?.role;
+      const role = String(userRole || "").trim().toLowerCase();
+      if (role === "super_admin" || role === "superadmin" || req.user?.is_super_admin) {
+        return next();
+      }
+      return res.status(503).json({
+        error: "maintenance",
+        message: "This application is temporarily unavailable. Please check back later.",
+      });
+    }
+  } catch {
+    // If settings table doesn't exist yet, allow through
+  }
+  next();
+});
+
 // =====================================================
 // 9. REGISTER ROUTES
 // =====================================================
@@ -276,6 +318,8 @@ app.use((req, res, next) => {
 app.use("/api/auth", authRoutes);
 
 app.use("/api/listings", listingsRoutes);
+
+app.use("/api/smart-search", smartSearchRoutes);
 
 app.use("/api/uploads", uploadsRoutes);
 
@@ -338,6 +382,44 @@ app.use("/api/team", teamRoutes);
 
 app.use("/api/monitoring", monitoringRoutes);
 
+app.use("/api/broadcasts", broadcastRoutes);
+app.use("/api/admin-messages", adminMessageRoutes);
+app.use("/api/offers", offerRoutes);
+
+// Public lockdown-status endpoint (no auth required)
+app.get("/api/platform-settings/lockdown-status", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT value FROM platform_settings WHERE key = 'maintenance_mode'`,
+    );
+    res.json({ locked: result.rows[0]?.value === "true" });
+  } catch {
+    res.json({ locked: false });
+  }
+});
+
+// Super admin lockdown toggle
+app.put("/api/platform-settings/lockdown", authenticateToken, verifySuperAdmin, async (req, res) => {
+  try {
+    const { locked } = req.body;
+    await pool.query(
+      `INSERT INTO platform_settings (key, value, type, description)
+       VALUES ('maintenance_mode', $1, 'boolean', 'Global app lockdown: blocks all non-admin access')
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW(), updated_by = $2`,
+      [String(!!locked), req.user?.unique_id],
+    );
+
+    if (req.io) {
+      req.io.emit("app:lockdown", { locked: !!locked });
+    }
+
+    res.json({ success: true, locked: !!locked });
+  } catch (err) {
+    console.error("Lockdown toggle error:", err);
+    res.status(500).json({ success: false, message: "Failed to toggle lockdown" });
+  }
+});
+
 // =====================================================
 // 9a. ROUTE ALIASES (frontend → backend path fixes)
 // =====================================================
@@ -347,10 +429,15 @@ app.get("/api/agency/my-brokerage", authenticateToken, async (req, res) => {
   try {
     const userKey = String(req.user?.unique_id || "");
     const result = await pool.query(
-      `SELECT b.id, b.name, b.logo_url, b.banner_url, b.location, b.city, b.state, b.country,
-              b.email, b.phone, b.website, b.is_verified, b.status, b.created_at AS joined_at
-       FROM brokerages b
-       JOIN users u ON u.linked_agency_id::text = b.id::text
+      `SELECT bp.unique_id AS id, bp.company_name AS name,
+              COALESCE(bp.logo_url, owner_u.avatar_url) AS logo_url,
+              bp.website, bp.brokerage_address AS location,
+              owner_p.country, owner_p.city,
+              bp.verified_badge AS is_verified, bp.team_code, bp.created_at AS joined_at
+       FROM brokerage_profiles bp
+       JOIN users u ON u.linked_agency_id::text = bp.unique_id::text
+       JOIN users owner_u ON owner_u.unique_id::text = bp.unique_id::text
+       LEFT JOIN profiles owner_p ON owner_p.unique_id::text = bp.unique_id::text
        WHERE u.unique_id = $1
        LIMIT 1`,
       [userKey]
@@ -358,6 +445,11 @@ app.get("/api/agency/my-brokerage", authenticateToken, async (req, res) => {
     const brokerage = result.rows[0] || null;
     let stats = { active_listings: 0, team_agents: 0, assigned_listings: 0, live_tours: 0 };
     if (brokerage) {
+      // Resolve logo_url from S3 key to full CDN URL
+      if (brokerage.logo_url && !/^https?:\/\//i.test(brokerage.logo_url)) {
+        const cdn = (process.env.MEDIA_CDN_URL || "https://media.getkeyvia.com").replace(/\/+$/, "");
+        brokerage.logo_url = `${cdn}/${brokerage.logo_url.replace(/^\/+/, "")}`;
+      }
       const [listingsRes, agentsRes] = await Promise.all([
         pool.query(`SELECT COUNT(*)::int AS count FROM listings l WHERE l.uploaded_by_id::text = $1 AND COALESCE(l.is_active, false) = true`, [userKey]),
         pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE linked_agency_id::text = $1`, [brokerage.id]),
@@ -428,8 +520,8 @@ app.use(globalErrorHandler);
 // 13. START SERVER WITH DB RETRY
 // =====================================================
 
-const MAX_DB_RETRIES = 5;
-const DB_RETRY_DELAY = 3000;
+const MAX_DB_RETRIES = 10;
+const DB_RETRY_DELAY = 5000;
 
 const connectWithRetry = async (attempt = 1) => {
   try {
@@ -448,6 +540,10 @@ const connectWithRetry = async (attempt = 1) => {
 
       startSubscriptionRenewalJob();
       console.log("🔁 Subscription renewal job started");
+
+      runSystemChecks();
+      setInterval(runSystemChecks, 30 * 60 * 1000);
+      console.log("🔔 System alert checks started (every 30 min)");
     });
   } catch (err) {
     console.error(`❌ Failed to connect to PostgreSQL (attempt ${attempt}/${MAX_DB_RETRIES}):`, err.message);

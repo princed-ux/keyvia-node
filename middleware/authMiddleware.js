@@ -314,6 +314,7 @@ export const verifyAdmin = (req, res, next) => {
   if (
     role === "admin" ||
     role === "superadmin" ||
+    role === "super_admin" ||
     req.user.is_admin === true ||
     req.user.is_super_admin === true
   ) {
@@ -337,7 +338,7 @@ export const verifySuperAdmin = (req, res, next) => {
 
   const role = normalizeRole(req.user.role);
 
-  if (role === "superadmin" || req.user.is_super_admin === true) {
+  if (role === "superadmin" || role === "super_admin" || req.user.is_super_admin === true) {
     return next();
   }
 

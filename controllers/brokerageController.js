@@ -249,16 +249,24 @@ export const createBrokerage = async (req, res) => {
         registration_number,
         team_code,
         website,
+        country,
+        city,
+        state,
+        phone,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
       ON CONFLICT (unique_id) DO UPDATE SET
         company_name = EXCLUDED.company_name,
         brokerage_address = EXCLUDED.brokerage_address,
         registration_number = EXCLUDED.registration_number,
         team_code = EXCLUDED.team_code,
         website = EXCLUDED.website,
+        country = COALESCE(brokerage_profiles.country, EXCLUDED.country),
+        city = COALESCE(brokerage_profiles.city, EXCLUDED.city),
+        state = COALESCE(brokerage_profiles.state, EXCLUDED.state),
+        phone = COALESCE(brokerage_profiles.phone, EXCLUDED.phone),
         updated_at = NOW()
       RETURNING *
       `,
@@ -269,6 +277,10 @@ export const createBrokerage = async (req, res) => {
         registration_number || null,
         teamCode,
         website || null,
+        headquarters_country || null,
+        headquarters_city || null,
+        headquarters_state || null,
+        phone || null,
       ],
     );
 

@@ -464,7 +464,10 @@ const runMigration = async () => {
       CREATE TABLE IF NOT EXISTS applications (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         applicant_id UUID NOT NULL REFERENCES users(unique_id) ON DELETE CASCADE,
+        buyer_id UUID REFERENCES users(unique_id) ON DELETE CASCADE,
         listing_id UUID NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+        product_id TEXT,
+        recipient_id UUID REFERENCES users(unique_id) ON DELETE SET NULL,
         agent_id UUID REFERENCES users(unique_id) ON DELETE SET NULL,
         
         title VARCHAR(255),
@@ -472,7 +475,15 @@ const runMigration = async () => {
         status VARCHAR(50) DEFAULT 'pending',
         
         move_in_date DATE,
+        stay_start_date DATE,
+        stay_end_date DATE,
+        occupants_count INTEGER DEFAULT 1,
+        applicant_name TEXT,
+        applicant_email TEXT,
+        applicant_phone TEXT,
+        annual_income NUMERIC,
         employment_verification TEXT,
+        employment_status TEXT,
         financial_documents JSONB DEFAULT '[]',
         
         created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -481,7 +492,10 @@ const runMigration = async () => {
       );
       
       CREATE INDEX IF NOT EXISTS idx_applications_applicant ON applications(applicant_id);
+      CREATE INDEX IF NOT EXISTS idx_applications_buyer ON applications(buyer_id);
       CREATE INDEX IF NOT EXISTS idx_applications_listing ON applications(listing_id);
+      CREATE INDEX IF NOT EXISTS idx_applications_product ON applications(product_id);
+      CREATE INDEX IF NOT EXISTS idx_applications_recipient ON applications(recipient_id);
       CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);
     `);
     console.log("✅ Applications table created\n");

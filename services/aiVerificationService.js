@@ -36,24 +36,38 @@ async function safeAwsCall(fn, retries = 2, delayMs = 600) {
   }
 }
 
+function getDefaultBucket() {
+  return process.env.AWS_S3_BUCKET || "keyvia-images";
+}
+
 function parseS3Url(url) {
   if (!url) return null;
 
+  const raw = String(url).trim();
+
+  // Plain S3 key (no protocol) — e.g. "documents/owners/uuid.pdf"
+  if (!raw.startsWith("http://") && !raw.startsWith("https://")) {
+    return {
+      bucket: getDefaultBucket(),
+      key: raw.replace(/^\/+/, ""),
+    };
+  }
+
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(raw);
     const host = parsed.hostname;
     const pathname = decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
 
-    // virtual-hosted-style:
-    // https://keyvia-images.s3.eu-west-1.amazonaws.com/folder/file.jpg
-    if (host.startsWith("keyvia-images.s3.")) {
+    // CDN URL: https://media.getkeyvia.com/key
+    if (host.endsWith(".getkeyvia.com")) {
       return {
-        bucket: "keyvia-images",
+        bucket: getDefaultBucket(),
         key: pathname,
       };
     }
 
-    // generic virtual-hosted-style fallback
+    // virtual-hosted-style:
+    // https://bucket.s3.region.amazonaws.com/folder/file.jpg
     if (host.includes(".s3.")) {
       const bucket = host.split(".s3")[0];
       return {
@@ -63,16 +77,20 @@ function parseS3Url(url) {
     }
 
     // path-style:
-    // https://s3.eu-west-1.amazonaws.com/keyvia-images/folder/file.jpg
+    // https://s3.region.amazonaws.com/bucket/folder/file.jpg
     const parts = pathname.split("/");
     const bucket = parts.shift();
     const key = parts.join("/");
 
-    if (!bucket || !key) return null; 
+    if (!bucket || !key) return null;
 
     return { bucket, key };
   } catch {
-    return null;
+    // Invalid URL — treat as plain S3 key
+    return {
+      bucket: getDefaultBucket(),
+      key: raw.replace(/^\/+/, ""),
+    };
   }
 }
 
@@ -233,6 +251,7 @@ function buildVerificationScore({
   fullName,
   companyName,
   documentText,
+  documentTextReason,
   role,
 }) {
   let score = 100;
@@ -260,7 +279,7 @@ function buildVerificationScore({
 
   if (!documentText?.trim()) {
     score -= 20;
-    flags.push("Document text extraction uncertain");
+    flags.push(documentTextReason || "Document text extraction uncertain");
   } else {
     if (fullName && !nameMatches(documentText, fullName)) {
       score -= 20;
@@ -323,7 +342,13 @@ export async function analyzeVerification(profile) {
     const isImageDoc = /\.(jpg|jpeg|png|webp|jfif)(\?|$)/i.test(lowerDoc);
 
     if (avatarUrl && documentUrl && isImageDoc) {
-      faceMatch = await compareFacesFromS3(avatarUrl, documentUrl);
+      const docFace = await detectFaceFromS3(documentUrl);
+
+      if (docFace.ok && docFace.faceCount === 1) {
+        faceMatch = await compareFacesFromS3(avatarUrl, documentUrl);
+      } else if (docFace.ok && docFace.faceCount > 1) {
+        faceMatch = await compareFacesFromS3(avatarUrl, documentUrl);
+      }
     }
 
     const scoreData = buildVerificationScore({
@@ -332,6 +357,7 @@ export async function analyzeVerification(profile) {
       fullName: profile.full_name,
       companyName: profile.company_name,
       documentText: documentTextResult.text,
+      documentTextReason: documentTextResult.reason,
       role: String(profile.role || "").toLowerCase(),
     });
 

@@ -18,9 +18,17 @@ const tableExists = async (tableName) => {
 // =========================================================
 // 1. GET PENDING IDENTITY VERIFICATIONS
 // =========================================================
+const PROFILE_STATUSES = ["pending", "verified", "rejected"];
+
 export const getPendingProfiles = async (req, res) => {
   try {
-    const result = await pool.query(`
+    const status = String(req.query.status || "pending").toLowerCase();
+    const statusFilter = status === "all" ? PROFILE_STATUSES : [status];
+    const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    const offset = Math.max((parseInt(req.query.page, 10) || 1) - 1, 0) * limit;
+
+    const result = await pool.query(
+      `
       SELECT
         u.unique_id,
         COALESCE(p.full_name, u.name) AS full_name,
@@ -51,10 +59,12 @@ export const getPendingProfiles = async (req, res) => {
         ON bp.unique_id::text = u.unique_id::text
       LEFT JOIN agent_profiles ap
         ON ap.unique_id::text = u.unique_id::text
-      WHERE u.verification_status = 'pending'
+      WHERE u.verification_status::text = ANY($1::text[])
       ORDER BY u.created_at DESC
-      LIMIT $1 OFFSET $2
-    `, [Math.min(parseInt(req.query.limit, 10) || 50, 100), Math.max((parseInt(req.query.page, 10) || 1) - 1, 0) * Math.min(parseInt(req.query.limit, 10) || 50, 100)]);
+      LIMIT $2 OFFSET $3
+      `,
+      [statusFilter, limit, offset],
+    );
 
     return res.status(200).json(result.rows);
   } catch (err) {
@@ -164,6 +174,11 @@ export const analyzeAllPendingProfiles = async (req, res) => {
 
     const profiles = pendingRes.rows;
     const reports = await analyzeVerificationBulk(profiles);
+    const aiSettings = await getAiSettings();
+
+    const shouldAutoApprove = aiSettings.ai_auto_approve_low_risk !== false;
+    const shouldAutoReject = aiSettings.ai_auto_reject_high_risk !== false;
+    const requireManualReview = aiSettings.ai_require_manual_review_medium_risk !== false;
 
     let verified = 0;
     let rejected = 0;
@@ -178,11 +193,19 @@ export const analyzeAllPendingProfiles = async (req, res) => {
       let newStatus = "pending";
       let reason = null;
 
-      if (score < 50 || verdict === "Auto-Reject") {
+      const safeVerdicts = ["safe to approve", "verified", "auto-approve"];
+      const rejectVerdicts = ["rejected", "auto-reject", "auto rejected", "reject"];
+
+      if ((safeVerdicts.includes(verdict?.toLowerCase()) || score >= 80) && shouldAutoApprove) {
+        newStatus = "verified";
+        verified++;
+      } else if ((rejectVerdicts.includes(verdict?.toLowerCase()) || score <= 35) && shouldAutoReject) {
         newStatus = "rejected";
         reason = `AI Auto-Reject: ${flags.join(", ") || "Low Confidence"}`;
         rejected++;
-      } else if (score >= 90) {
+      } else if (requireManualReview) {
+        remaining++;
+      } else if (safeVerdicts.includes(verdict?.toLowerCase()) || score >= 80) {
         newStatus = "verified";
         verified++;
       } else {
@@ -736,6 +759,20 @@ const AI_SETTING_KEYS = [
   "ai_require_manual_review_medium_risk",
 ];
 
+const NOTIFICATION_SETTING_KEYS = [
+  "notify_admin_new_listing",
+  "notify_admin_flagged_listing",
+  "notify_admin_verification_submitted",
+  "notify_admin_support_escalation",
+];
+
+const SECURITY_SETTING_KEYS = [
+  "require_admin_reauth_for_sensitive_actions",
+  "log_admin_moderation_actions",
+  "restrict_private_documents_to_admins",
+  "notify_super_admin_on_high_risk_override",
+];
+
 export const getAiModerationSettings = async (req, res) => {
   try {
     const settings = await getAiSettings();
@@ -771,9 +808,144 @@ export const updateAiModerationSetting = async (req, res) => {
       [key, String(value), req.user?.unique_id],
     );
 
-    return res.json({ success: true, message: "AI setting updated" });
+    return res.json({
+      success: true,
+      key,
+      value: String(value),
+      settings: { [key]: String(value) },
+    });
   } catch (err) {
     console.error("[UpdateAiSetting] Error:", err);
     return res.status(500).json({ success: false, message: "Failed to update AI setting" });
+  }
+};
+
+// =========================================================
+// NOTIFICATION SETTINGS
+// =========================================================
+
+const ensureAppSettingsTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      group_name TEXT NOT NULL DEFAULT 'general',
+      description TEXT,
+      updated_by UUID REFERENCES users(unique_id) ON DELETE SET NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+};
+
+export const getNotificationSettings = async (req, res) => {
+  try {
+    await ensureAppSettingsTable();
+
+    const result = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key = ANY($1)`,
+      [NOTIFICATION_SETTING_KEYS],
+    );
+
+    const settings = {};
+    for (const row of result.rows) {
+      settings[row.key] = row.value;
+    }
+
+    for (const key of NOTIFICATION_SETTING_KEYS) {
+      if (settings[key] === undefined) settings[key] = "true";
+    }
+
+    return res.json({ success: true, settings });
+  } catch (err) {
+    console.error("[GetNotificationSettings] Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to load notification settings" });
+  }
+};
+
+export const updateNotificationSetting = async (req, res) => {
+  try {
+    await ensureAppSettingsTable();
+
+    const { key, value } = req.body;
+
+    if (!NOTIFICATION_SETTING_KEYS.includes(key)) {
+      return res.status(400).json({ success: false, message: "Invalid notification setting key" });
+    }
+
+    await pool.query(
+      `INSERT INTO app_settings (key, value, group_name, description)
+       VALUES ($1, $2, 'notifications', '')
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW(), updated_by = $3`,
+      [key, String(value), req.user?.unique_id],
+    );
+
+    return res.json({
+      success: true,
+      key,
+      value: String(value),
+      settings: { [key]: String(value) },
+    });
+  } catch (err) {
+    console.error("[UpdateNotificationSetting] Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to update notification setting" });
+  }
+};
+
+// =========================================================
+// SECURITY SETTINGS
+// =========================================================
+
+export const getSecuritySettings = async (req, res) => {
+  try {
+    await ensureAppSettingsTable();
+
+    const result = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key = ANY($1)`,
+      [SECURITY_SETTING_KEYS],
+    );
+
+    const settings = {};
+    for (const row of result.rows) {
+      settings[row.key] = row.value;
+    }
+
+    for (const key of SECURITY_SETTING_KEYS) {
+      if (settings[key] === undefined) settings[key] = "true";
+    }
+
+    return res.json({ success: true, settings });
+  } catch (err) {
+    console.error("[GetSecuritySettings] Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to load security settings" });
+  }
+};
+
+export const updateSecuritySetting = async (req, res) => {
+  try {
+    await ensureAppSettingsTable();
+
+    const { key, value } = req.body;
+
+    if (!SECURITY_SETTING_KEYS.includes(key)) {
+      return res.status(400).json({ success: false, message: "Invalid security setting key" });
+    }
+
+    await pool.query(
+      `INSERT INTO app_settings (key, value, group_name, description)
+       VALUES ($1, $2, 'security', '')
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW(), updated_by = $3`,
+      [key, String(value), req.user?.unique_id],
+    );
+
+    return res.json({
+      success: true,
+      key,
+      value: String(value),
+      settings: { [key]: String(value) },
+    });
+  } catch (err) {
+    console.error("[UpdateSecuritySetting] Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to update security setting" });
   }
 };

@@ -1348,7 +1348,7 @@ router.post("/:conversationId/report", authenticate, async (req, res) => {
         SELECT sender_id
         FROM messages
         WHERE conversation_id::text = $1::text
-          AND message_id::text = $2::text
+          AND id::text = $2::text
         LIMIT 1
         `,
         [conversationId, String(messageId)],
@@ -1428,7 +1428,7 @@ router.get("/:conversationId", authenticate, async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        m.message_id AS id,
+        m.id,
         m.conversation_id,
         m.sender_id,
         m.message,
@@ -1438,11 +1438,7 @@ router.get("/:conversationId", authenticate, async (req, res) => {
         m.attachment_type,
         m.is_auto_reply,
         TO_JSON(m.created_at) AS created_at,
-        (
-          SELECT json_object_agg(user_id, emoji)
-          FROM message_reactions mr
-          WHERE mr.message_id = m.message_id
-        ) AS reactions
+        NULL::jsonb AS reactions
       FROM messages m
       WHERE m.conversation_id = $1
       ORDER BY m.created_at ASC
@@ -1538,7 +1534,7 @@ router.post("/:conversationId/send", authenticate, async (req, res) => {
       )
       VALUES ($1, $2, $3, $4, $5, $6, FALSE)
       RETURNING
-        message_id AS id,
+        id,
         conversation_id,
         sender_id,
         message,
@@ -1678,8 +1674,8 @@ router.delete("/:id", authenticate, async (req, res) => {
 
   try {
     const check = await pool.query(
-      "SELECT sender_id, conversation_id FROM messages WHERE message_id = $1",
-      [messageId],
+      "SELECT sender_id, conversation_id FROM messages WHERE id::text = $1",
+      [String(messageId)],
     );
 
     if (!check.rows.length) {
@@ -1695,7 +1691,7 @@ router.delete("/:id", authenticate, async (req, res) => {
       });
     }
 
-    await pool.query("DELETE FROM messages WHERE message_id = $1", [messageId]);
+    await pool.query("DELETE FROM messages WHERE id::text = $1", [String(messageId)]);
 
     return res.json({ success: true, conversation_id: message.conversation_id });
   } catch (err) {

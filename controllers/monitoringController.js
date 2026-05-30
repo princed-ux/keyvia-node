@@ -12,11 +12,6 @@ import os from "os";
 // ============================================================================
 export const getSystemMetrics = async (req, res) => {
   try {
-    // Verify admin/super-admin
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const metrics = apmService.getMetrics();
 
     // Get database stats
@@ -65,10 +60,6 @@ export const getSystemMetrics = async (req, res) => {
 // ============================================================================
 export const getEndpointMetrics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const metrics = apmService.getMetrics();
     const endpoints = Object.entries(metrics.endpoints).map(
       ([endpoint, data]) => ({
@@ -94,10 +85,6 @@ export const getEndpointMetrics = async (req, res) => {
 // ============================================================================
 export const getErrorLog = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const metrics = apmService.getMetrics();
     const limit = req.query.limit || 50;
 
@@ -119,10 +106,6 @@ export const getErrorLog = async (req, res) => {
 // ============================================================================
 export const getActiveUsers = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const result = await pool.query(
       `SELECT COUNT(*) as count FROM users WHERE last_active > NOW() - INTERVAL '5 minutes'`,
     );
@@ -198,10 +181,6 @@ export const getHealthCheck = async (req, res) => {
 // ============================================================================
 export const getRealtimeMetrics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const metrics = apmService.getMetrics();
 
     res.json({
@@ -229,10 +208,6 @@ export const getRealtimeMetrics = async (req, res) => {
 // ============================================================================
 export const getPaymentAnalytics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const result = await pool.query(
       `SELECT 
         DATE(created_at) as date,
@@ -260,10 +235,6 @@ export const getPaymentAnalytics = async (req, res) => {
 // ============================================================================
 export const resetMetrics = async (req, res) => {
   try {
-    if (req.user?.role !== "SuperAdmin") {
-      return res.status(403).json({ error: "Super Admin access required" });
-    }
-
     apmService.resetMetrics();
     res.json({ success: true, message: "Metrics reset successfully" });
   } catch (err) {
@@ -280,10 +251,6 @@ import logger from "../utils/logger.js";
 
 export const getCurrentMetrics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const metrics = await monitoringService.getCurrentMetrics();
 
     res.json({
@@ -305,10 +272,6 @@ export const getCurrentMetrics = async (req, res) => {
 // ============================================================================
 export const getHistoricalMetrics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const { hours = 24 } = req.query;
     const metrics = await monitoringService.getHistoricalMetrics(
       parseInt(hours),
@@ -337,10 +300,6 @@ export const getHistoricalMetrics = async (req, res) => {
 // ============================================================================
 export const getSystemHealthSummary = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const health = await monitoringService.getSystemHealthSummary();
 
     res.json({
@@ -361,10 +320,6 @@ export const getSystemHealthSummary = async (req, res) => {
 // ============================================================================
 export const getAdminAuditLog = async (req, res) => {
   try {
-    if (req.user?.role !== "SuperAdmin") {
-      return res.status(403).json({ error: "Super Admin access required" });
-    }
-
     const { adminId, limit = 100 } = req.query;
     const logs = await monitoringService.getAdminAuditLog(
       adminId,
@@ -390,10 +345,6 @@ export const getAdminAuditLog = async (req, res) => {
 // ============================================================================
 export const getRateLimitStats = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const { userId, days = 7 } = req.query;
     const stats = await monitoringService.getRateLimitStats(
       userId,
@@ -423,10 +374,6 @@ export const getRateLimitStats = async (req, res) => {
 // ============================================================================
 export const getErrorAnalytics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const { hours = 24 } = req.query;
     const analytics = await monitoringService.getErrorAnalytics(
       parseInt(hours),
@@ -453,10 +400,6 @@ export const getErrorAnalytics = async (req, res) => {
 // ============================================================================
 export const getPerformanceAnalytics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const { hours = 24 } = req.query;
     const analytics = await monitoringService.getPerformanceAnalytics(
       parseInt(hours),
@@ -483,10 +426,6 @@ export const getPerformanceAnalytics = async (req, res) => {
 // ============================================================================
 export const getMemoryAnalytics = async (req, res) => {
   try {
-    if (!["Admin", "SuperAdmin"].includes(req.user?.role)) {
-      return res.status(403).json({ error: "Admin access required" });
-    }
-
     const { hours = 24 } = req.query;
     const analytics = await monitoringService.getMemoryAnalytics(
       parseInt(hours),

@@ -9,6 +9,8 @@ import logger from "./logger.js";
  * @param {string} targetType - Type of resource being modified (e.g., "user", "listing")
  * @param {string} targetId - ID of the resource being modified
  * @param {object} changes - Object containing the changes made
+ * @param {string|null} adminName - Name of the admin
+ * @param {string|null} ipAddress - IP address of the admin
  */
 export const logAdminAction = async (
   adminId,
@@ -16,6 +18,8 @@ export const logAdminAction = async (
   targetType,
   targetId,
   changes = {},
+  adminName = null,
+  ipAddress = null,
 ) => {
   try {
     await monitoringService.recordAdminAction(
@@ -24,9 +28,11 @@ export const logAdminAction = async (
       targetType,
       targetId,
       changes,
+      adminName,
+      ipAddress,
     );
     logger.info(
-      `📋 Audit: ${action} on ${targetType} ${targetId} by admin ${adminId}`,
+      `Audit: ${action} on ${targetType} ${targetId} by admin ${adminId}`,
     );
   } catch (error) {
     logger.error("Error logging admin action:", error);

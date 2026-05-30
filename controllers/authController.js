@@ -496,6 +496,8 @@ export const socialAuth = async (req, res) => {
         special_id: user.special_id,
         verification_status: user.verification_status || "new",
         is_new_user: userRes.rows.length === 0,
+        linked_agency_id: user.linked_agency_id || null,
+        is_solo_agent: user.is_solo_agent,
       },
     });
   } catch (err) {
@@ -829,6 +831,8 @@ export const login = async (req, res) => {
         phone_verified: user.phone_verified,
         special_id: user.special_id,
         verification_status: user.verification_status || "new",
+        linked_agency_id: user.linked_agency_id || null,
+        is_solo_agent: user.is_solo_agent,
       },
     });
   } catch (err) {
@@ -1504,6 +1508,9 @@ const docColumn =
           brokerage_address,
           registration_number,
           team_code,
+          country,
+          city,
+          phone,
           verified_badge,
           subscription_plan,
           billing_status,
@@ -1513,7 +1520,7 @@ const docColumn =
           updated_at
         )
         VALUES (
-          $1, $2, $3, $4, $5, FALSE, 'free', 'inactive', 5, 0, FALSE, NOW()
+          $1, $2, $3, $4, $5, $6, $7, $8, FALSE, 'free', 'inactive', 5, 0, FALSE, NOW()
         )
         ON CONFLICT (unique_id)
         DO UPDATE SET
@@ -1521,6 +1528,9 @@ const docColumn =
           brokerage_address = COALESCE(EXCLUDED.brokerage_address, brokerage_profiles.brokerage_address),
           registration_number = COALESCE(EXCLUDED.registration_number, brokerage_profiles.registration_number),
           team_code = COALESCE(EXCLUDED.team_code, brokerage_profiles.team_code),
+          country = COALESCE(brokerage_profiles.country, EXCLUDED.country),
+          city = COALESCE(brokerage_profiles.city, EXCLUDED.city),
+          phone = COALESCE(brokerage_profiles.phone, EXCLUDED.phone),
           updated_at = NOW()
         `,
         [
@@ -1529,6 +1539,9 @@ const docColumn =
           brokerage_address || null,
           brokerageRegistrationNumber,
           finalTeamCode || null,
+          country || null,
+          city || null,
+          phone || null,
         ]
       );
     }

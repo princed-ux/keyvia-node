@@ -1031,6 +1031,69 @@ router.post("/join-team", async (req, res) => {
   }
 });
 
+router.post("/exit", async (req, res) => {
+  const agentId = requireUser(req, res);
+  if (!agentId) return;
+
+  const client = await pool.connect();
+
+  try {
+    const me = await client.query(
+      `SELECT unique_id, linked_agency_id, is_solo_agent FROM users WHERE unique_id::text = $1::text LIMIT 1`,
+      [agentId],
+    );
+
+    if (!me.rows.length || !me.rows[0].linked_agency_id) {
+      return res.status(400).json({
+        success: false,
+        message: "You are not linked to any brokerage.",
+      });
+    }
+
+    const brokerageId = me.rows[0].linked_agency_id;
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE users SET linked_agency_id = NULL, is_solo_agent = TRUE, brokerage_name = NULL, updated_at = NOW() WHERE unique_id::text = $1::text`,
+      [agentId],
+    );
+
+    await client.query(
+      `UPDATE agent_profiles SET linked_agency_id = NULL, is_solo_agent = TRUE, updated_at = NOW() WHERE unique_id::text = $1::text`,
+      [agentId],
+    ).catch(() => {});
+
+    await client.query(
+      `UPDATE profiles SET linked_agency_id = NULL, brokerage_name = NULL, is_solo_agent = TRUE, updated_at = NOW() WHERE unique_id::text = $1::text`,
+      [agentId],
+    ).catch(() => {});
+
+    await client.query(
+      `DELETE FROM brokerage_message_group_members WHERE user_id::text = $1::text AND group_id IN (SELECT id FROM brokerage_message_groups WHERE brokerage_id::text = $2::text)`,
+      [agentId, brokerageId],
+    ).catch(() => {});
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "You have exited the brokerage.",
+      is_solo_agent: true,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Exit Brokerage Error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to exit brokerage.",
+      details: err?.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
 router.get("/agents", async (req, res) => {
   try {
     const userId = requireUser(req, res);
@@ -1601,7 +1664,7 @@ router.patch("/profile", async (req, res) => {
     const userId = requireUser(req, res);
     if (!userId) return;
 
-    const { name, phone, company_name, license_number, bio, address } = req.body;
+    const { name, phone, company_name, license_number, bio, address, city, website } = req.body;
 
     await client.query("BEGIN");
 
@@ -1634,15 +1697,17 @@ router.patch("/profile", async (req, res) => {
 
     await client.query(
       `
-      INSERT INTO brokerage_profiles (unique_id, company_name, brokerage_address, updated_at)
-      VALUES ($1, $2, $3, NOW())
+      INSERT INTO brokerage_profiles (unique_id, company_name, brokerage_address, city, website, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
       ON CONFLICT (unique_id)
       DO UPDATE SET
         company_name = COALESCE(EXCLUDED.company_name, brokerage_profiles.company_name),
         brokerage_address = COALESCE(EXCLUDED.brokerage_address, brokerage_profiles.brokerage_address),
+        city = COALESCE(brokerage_profiles.city, EXCLUDED.city),
+        website = COALESCE(brokerage_profiles.website, EXCLUDED.website),
         updated_at = NOW()
       `,
-      [userId, company_name || null, address || null]
+      [userId, company_name || null, address || null, city || null, website || null]
     );
 
     await client.query("COMMIT");

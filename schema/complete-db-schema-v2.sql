@@ -721,7 +721,10 @@ CREATE TABLE applications (
   
   -- Applicant & Property
   applicant_id UUID NOT NULL,
+  buyer_id UUID,
   listing_id UUID NOT NULL,
+  product_id VARCHAR(80),
+  recipient_id UUID,
   
   -- Application Info
   status VARCHAR(20) DEFAULT 'pending',
@@ -731,6 +734,10 @@ CREATE TABLE applications (
   applicant_name VARCHAR(150),
   applicant_email VARCHAR(150),
   applicant_phone VARCHAR(20),
+  move_in_date DATE,
+  stay_start_date DATE,
+  stay_end_date DATE,
+  occupants_count INTEGER DEFAULT 1,
   annual_income DECIMAL(15, 2),
   employment_status VARCHAR(50),
   
@@ -750,7 +757,10 @@ CREATE TABLE applications (
 );
 
 CREATE INDEX idx_applications_applicant_id ON applications(applicant_id);
+CREATE INDEX idx_applications_buyer_id ON applications(buyer_id);
 CREATE INDEX idx_applications_listing_id ON applications(listing_id);
+CREATE INDEX idx_applications_product_id ON applications(product_id);
+CREATE INDEX idx_applications_recipient_id ON applications(recipient_id);
 CREATE INDEX idx_applications_status ON applications(status);
 
 -- ============================================================================

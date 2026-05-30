@@ -78,12 +78,12 @@ class MonitoringService {
   }
 
   // Record admin action
-  async recordAdminAction(adminId, action, targetType, targetId, changes) {
+  async recordAdminAction(adminId, action, targetType, targetId, changes, adminName = null, ipAddress = null) {
     try {
       await pool.query(
-        `INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, changes)
-        VALUES ($1, $2, $3, $4, $5)`,
-        [adminId, action, targetType, targetId, JSON.stringify(changes)],
+        `INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, changes, admin_name, ip_address)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [adminId, action, targetType, targetId, JSON.stringify(changes), adminName, ipAddress],
       );
     } catch (error) {
       logger.error("Error recording admin action:", error);

@@ -3,6 +3,7 @@ import { emitToUser } from "./socketUtils.js";
 import { pool } from "../db.js";
 import { createNotification } from "../controllers/notificationsController.js";
 import { maybeSendAutoReply } from "../services/messageSettingsService.js";
+import { publishMessageToSQS } from "../services/sqsMessagingService.js";
 
 const getUnreadCountForUser = async (conversationId, userId) => {
   const result = await pool.query(
@@ -150,15 +151,17 @@ export const registerSocketHandlers = (io) => {
           `INSERT INTO messages (
              conversation_id,
              sender_id,
+             recipient_id,
+             content,
              message,
              product_id,
              attachment_url,
              attachment_type,
              is_auto_reply
            )
-           VALUES ($1, $2, $3, $4, $5, $6, FALSE)
+           VALUES ($1, $2, $3, $4, $4, $5, $6, $7, FALSE)
            RETURNING
-             message_id AS id,
+             id,
              conversation_id,
              sender_id,
              message,
@@ -171,6 +174,7 @@ export const registerSocketHandlers = (io) => {
           [
             conversationId,
             actualSenderId,
+            recipientId,
             message,
             productId || null,
             attachmentUrl || attachment_url || null,
@@ -233,6 +237,18 @@ export const registerSocketHandlers = (io) => {
           console.warn("[Socket] Auto-reply skipped:", err?.message);
           return null;
         });
+
+        publishMessageToSQS({
+          type: "platform_message",
+          conversation_id: conversationId,
+          sender_id: actualSenderId,
+          recipient_id: recipientId,
+          message,
+          product_id: productId || null,
+          attachment_url: attachmentUrl || attachment_url || null,
+          attachment_type: attachmentType || attachment_type || type || null,
+          created_at: saved?.created_at || new Date().toISOString(),
+        }).catch(() => {});
       } catch (err) {
         console.error("Message error:", err);
       }
@@ -305,7 +321,7 @@ export const registerSocketHandlers = (io) => {
           type: "add",
         });
       } catch (err) {
-        console.error("Reaction add error:", err);
+        console.warn("[Reactions] Add reaction unavailable (schema mismatch):", err.message);
       }
     });
 
@@ -326,7 +342,7 @@ export const registerSocketHandlers = (io) => {
           type: "remove",
         });
       } catch (err) {
-        console.error("Reaction remove error:", err);
+        console.warn("[Reactions] Remove reaction unavailable (schema mismatch):", err.message);
       }
     });
 

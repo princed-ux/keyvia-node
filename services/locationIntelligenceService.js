@@ -58,6 +58,65 @@ const sortPlaces = (items = []) =>
     .sort((a, b) => Number(a.distance_meters ?? 999999) - Number(b.distance_meters ?? 999999))
     .slice(0, 8);
 
+const countNearby = (items = [], maxDist = 1000) =>
+  Array.isArray(items)
+    ? items.filter((i) => Number(i.distance_meters || 999999) <= maxDist).length
+    : 0;
+
+const avgRating = (items = []) => {
+  const rated = items.filter((i) => Number(i.rating) > 0);
+  if (!rated.length) return null;
+  return rated.reduce((s, i) => s + Number(i.rating), 0) / rated.length;
+};
+
+const computeWalkScore = (snapshot = {}) => {
+  let score = 0;
+  const within200 = countNearby(snapshot.groceries_markets, 200);
+  const within500 = countNearby(snapshot.groceries_markets, 500);
+  const restaurants500 = countNearby(snapshot.restaurants_cafes, 500);
+  const parks1k = countNearby(snapshot.parks_recreation, 1000);
+  const transit500 = countNearby(snapshot.transit, 500);
+  const shopping1k = countNearby(snapshot.malls_shopping, 1000);
+  const schools1k = countNearby(snapshot.schools, 1000);
+
+  if (within200 > 0) score += 15;
+  else if (within500 > 0) score += 10;
+  if (restaurants500 >= 2) score += 15;
+  else if (restaurants500 > 0) score += 8;
+  if (parks1k > 0) score += 10;
+  if (transit500 > 0) score += 15;
+  if (shopping1k > 0) score += 10;
+  if (schools1k > 0) score += 10;
+  score += Math.min(within500 * 3, 10);
+  score += Math.min(transit500 * 3, 5);
+
+  return Math.min(Math.round(score), 100);
+};
+
+const computeTransitScore = (snapshot = {}) => {
+  const transit = Array.isArray(snapshot.transit) ? snapshot.transit : [];
+  if (!transit.length) return 0;
+  const within300 = transit.filter((i) => Number(i.distance_meters || 999999) <= 300).length;
+  const within1k = transit.filter((i) => Number(i.distance_meters || 999999) <= 1000).length;
+  let score = Math.min(within300 * 20, 60) + Math.min(within1k * 10, 40);
+  return Math.min(Math.round(score), 100);
+};
+
+const computeSchoolScore = (snapshot = {}) => {
+  const schools = Array.isArray(snapshot.schools) ? snapshot.schools : [];
+  if (!schools.length) return 0;
+  const nearest = Math.min(...schools.map((i) => Number(i.distance_meters || 999999)));
+  const rating = avgRating(schools);
+  let score = 0;
+  if (nearest <= 500) score += 30;
+  else if (nearest <= 1000) score += 20;
+  else if (nearest <= 2000) score += 10;
+  score += Math.min(schools.length * 8, 30);
+  if (rating !== null) score += Math.round((rating / 5) * 40);
+  else score += 15;
+  return Math.min(Math.round(score), 100);
+};
+
 const buildLifestyleSummary = (snapshot = {}) => {
   const nearest = (items) =>
     Array.isArray(items) && items.length
@@ -86,6 +145,10 @@ const buildLifestyleSummary = (snapshot = {}) => {
         ? "Good"
         : "Limited";
 
+  const walkScore = computeWalkScore(snapshot);
+  const transitScore = computeTransitScore(snapshot);
+  const schoolScore = computeSchoolScore(snapshot);
+
   return {
     nearest_school_distance: nearestSchool,
     nearest_hospital_distance: nearestHospital,
@@ -95,6 +158,10 @@ const buildLifestyleSummary = (snapshot = {}) => {
     walkability_label: walkabilityLabel,
     family_friendly_label: familyFriendlyLabel,
     daily_errands_nearby: nearbyDailyErrands > 0,
+    walk_score: walkScore,
+    transit_score: transitScore,
+    school_score: schoolScore,
+    overall_score: Math.round((walkScore + transitScore + schoolScore) / 3),
   };
 };
 
@@ -103,6 +170,99 @@ const getGoogleKey = () =>
   process.env.GOOGLE_MAPS_API_KEY ||
   process.env.VITE_GOOGLE_MAPS_API_KEY ||
   "";
+
+const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+
+const OVERPASS_CATEGORIES = {
+  schools: ['"amenity"="school"', '"amenity"="university"', '"amenity"="college"'],
+  hospitals: ['"amenity"="hospital"', '"amenity"="clinic"', '"amenity"="doctors"'],
+  groceries_markets: ['"shop"="supermarket"', '"shop"="grocery"', '"shop"="market"'],
+  transit: ['"amenity"="bus_station"', '"railway"="station"', '"highway"="bus_stop"'],
+  restaurants_cafes: ['"amenity"="restaurant"', '"amenity"="cafe"'],
+  parks_recreation: ['"leisure"="park"', '"leisure"="garden"', '"leisure"="playground"'],
+  malls_shopping: ['"shop"="mall"', '"shop"="department_store"'],
+};
+
+const buildOverpassQuery = (lat, lng, radius = 3500) => {
+  const filters = Object.values(OVERPASS_CATEGORIES).flat();
+  const parts = filters.map((f) => `  nwr[${f}](around:${radius},${lat},${lng});`);
+  return `[out:json][timeout:20];\n(\n${parts.join("\n")}\n);\nout center 8;`;
+};
+
+const normalizeOverpassPlace = (element, origin) => {
+  const lat = element.lat ?? element.center?.lat ?? null;
+  const lng = element.lon ?? element.center?.lon ?? null;
+  const tags = element.tags || {};
+  const name = tags.name || tags.operator || tags.brand || "Unnamed place";
+
+  let category = "other";
+  for (const [group, filters] of Object.entries(OVERPASS_CATEGORIES)) {
+    if (filters.some((f) => {
+      const [k, v] = f.replace(/"/g, "").split("=");
+      return tags[k] === v;
+    })) {
+      category = group;
+      break;
+    }
+  }
+
+  return {
+    name,
+    category,
+    address: [tags["addr:street"], tags["addr:housenumber"]].filter(Boolean).join(" ") || tags.display_name || "",
+    distance_meters: haversineDistanceMeters(origin.latitude, origin.longitude, lat, lng),
+    rating: null,
+    user_ratings_total: null,
+    latitude: lat,
+    longitude: lng,
+    provider_place_id: `osm-${element.type}-${element.id}`,
+  };
+};
+
+const scanOverpassPlaces = async ({ latitude, longitude, radiusMeters = 3500 }) => {
+  const origin = { latitude, longitude };
+  const query = buildOverpassQuery(latitude, longitude, radiusMeters);
+
+  let response;
+  try {
+    response = await axios.post(OVERPASS_URL, `data=${encodeURIComponent(query)}`, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 25000,
+    });
+  } catch (err) {
+    console.warn("[LocationIntelligence] Overpass scan failed:", err?.message);
+    return { provider: "overpass", status: "failed", street_view: { available: false, provider: "overpass" },
+      error_message: err?.message || "Overpass query failed" };
+  }
+
+  const elements = Array.isArray(response.data?.elements) ? response.data.elements : [];
+  const output = {};
+  for (const [group] of Object.entries(OVERPASS_CATEGORIES)) {
+    output[group] = [];
+  }
+  output.other = [];
+
+  for (const el of elements) {
+    const place = normalizeOverpassPlace(el, origin);
+    if (output[place.category]) {
+      output[place.category].push(place);
+    } else {
+      output.other.push(place);
+    }
+  }
+
+  for (const [group] of Object.entries(OVERPASS_CATEGORIES)) {
+    output[group] = sortPlaces(output[group]);
+  }
+
+  return {
+    provider: "overpass",
+    status: "ready",
+    ...output,
+    lifestyle_summary: buildLifestyleSummary(output),
+    street_view: { available: false, provider: "overpass" },
+  };
+};
 
 const scanGooglePlaces = async ({ latitude, longitude, radiusMeters = 3500 }) => {
   const apiKey = getGoogleKey();
@@ -261,13 +421,20 @@ export const scanLocationIntelligence = async ({
 
   let result;
   try {
-    result = provider === "auto" || provider === "google"
-      ? await scanGooglePlaces({ latitude: lat, longitude: lng })
-      : {
-          provider,
-          status: "unavailable",
-          street_view: { available: false, provider },
-        };
+    if (provider === "auto" || provider === "google") {
+      result = await scanGooglePlaces({ latitude: lat, longitude: lng });
+      if (result.status === "unavailable" && (provider === "auto")) {
+        result = await scanOverpassPlaces({ latitude: lat, longitude: lng });
+      }
+    } else if (provider === "overpass") {
+      result = await scanOverpassPlaces({ latitude: lat, longitude: lng });
+    } else {
+      result = {
+        provider,
+        status: "unavailable",
+        street_view: { available: false, provider },
+      };
+    }
   } catch (err) {
     result = {
       provider,

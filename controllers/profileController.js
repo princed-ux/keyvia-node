@@ -265,7 +265,7 @@ const validatePublicProfileUpdate = ({ username }) => {
   return errors;
 };
 
-const normalizeProfileResponse = (base = {}, roleData = {}) => {
+const normalizeProfileResponse = (base = {}, roleData = {}, viewer = null) => {
   const role = normalizeRole(base.role);
   const status = normalizeVerificationStatus(base.verification_status);
 
@@ -300,6 +300,9 @@ const normalizeProfileResponse = (base = {}, roleData = {}) => {
     raw_verification_status: base.verification_status || null,
     is_verified: status === "verified",
     rejection_reason: base.rejection_reason || "",
+
+    subscription_plan: base.subscription_plan || "",
+    subscription_status: base.subscription_status || "",
 
     special_id: base.special_id || "",
     team_code: base.team_code || roleData.team_code || "",
@@ -1207,6 +1210,8 @@ export const getProfile = async (req, res) => {
         ${selectIfColumn(users, "u", "linked_agency_id", nullableUuid, "linked_agency_id")},
         ${selectIfColumn(users, "u", "is_solo_agent", nullableBool, "is_solo_agent")},
         ${selectIfColumn(users, "u", "phone_verified", nullableBool, "phone_verified")},
+        ${selectIfColumn(users, "u", "subscription_plan", nullableText, "subscription_plan")},
+        ${selectIfColumn(users, "u", "subscription_status", nullableText, "subscription_status")},
 
         COALESCE(${refIfColumn(profiles, "p", "full_name")}, ${refIfColumn(users, "u", "name")}) AS full_name,
         COALESCE(${refIfColumn(profiles, "p", "username")}, ${refIfColumn(users, "u", "username")}) AS username,
@@ -1328,14 +1333,13 @@ export const getProfile = async (req, res) => {
       roleData = result.rows[0] || {};
     }
 
-    return res.json(normalizeProfileResponse(base, roleData));
+    return res.json(normalizeProfileResponse(base, roleData, req.user));
   } catch (err) {
     console.error("[GetProfile] Error:", err);
 
     return res.status(500).json({
       success: false,
       message: "Failed to fetch profile.",
-      details: err.message,
     });
   } finally {
     client.release();
@@ -1652,6 +1656,20 @@ export const updateProfileAvatar = async (req, res) => {
         `
         UPDATE profiles
         SET avatar_url = $1,
+            updated_at = NOW()
+        WHERE unique_id::text = $2::text
+        `,
+        [avatarKey, unique_id],
+      );
+    }
+
+    // Sync logo to brokerage_profiles for brokerage roles
+    const role = String(currentUser.role || "").toLowerCase();
+    if (role.includes("brokerage")) {
+      await client.query(
+        `
+        UPDATE brokerage_profiles
+        SET logo_url = $1,
             updated_at = NOW()
         WHERE unique_id::text = $2::text
         `,

@@ -11,8 +11,8 @@ const AI_KEYS = new Set([
 const DEFAULTS = {
   ai_auto_scan_listings: false,
   ai_auto_scan_verifications: false,
-  ai_auto_approve_low_risk: true,
-  ai_auto_reject_high_risk: true,
+  ai_auto_approve_low_risk: false,
+  ai_auto_reject_high_risk: false,
   ai_require_manual_review_medium_risk: true,
 };
 

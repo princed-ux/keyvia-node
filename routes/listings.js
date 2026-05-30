@@ -32,6 +32,8 @@ import {
   submitListingDraft,
 } from "../controllers/listingsController.js";
 
+import { getCompareListings } from "../controllers/compareController.js";
+
 import {
   authenticateToken,
   optionalAuth,
@@ -245,7 +247,14 @@ router.post(
 );
 
 /* ============================================================
-   6. SINGLE LISTING CRUD
+   6. COMPARE / BULK ROUTES
+   Keep these before "/:product_id" to avoid route conflicts
+============================================================ */
+
+router.get("/compare", optionalAuth, getCompareListings);
+
+/* ============================================================
+   7. SINGLE LISTING CRUD
    Keep these near the bottom because "/:product_id" is dynamic
 ============================================================ */
 

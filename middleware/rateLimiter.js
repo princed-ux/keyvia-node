@@ -17,7 +17,7 @@ export const apiLimiter = rateLimit({
   standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
   skip: (req) => {
     // Skip rate limiting for admin users
-    return req.user && req.user.role === "Admin";
+    return req.user && req.user.role === "admin";
   },
 });
 
@@ -43,7 +43,7 @@ export const messagingLimiter = rateLimit({
   max: 50,
   keyGenerator: (req) => req.user?.unique_id || req.ip,
   message: "Messaging rate limit exceeded",
-  skip: (req) => req.user && req.user.role === "Admin",
+  skip: (req) => req.user && req.user.role === "admin",
 });
 
 // FILE UPLOAD RATE LIMITER - 10 uploads per hour
@@ -76,10 +76,10 @@ export const dynamicLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: (req, res) => {
     if (req.user) {
-      if (req.user.role === "Admin" || req.user.role === "SuperAdmin") {
+      if (req.user.role === "admin" || req.user.role === "super_admin") {
         return 10000; // Unlimited basically
       }
-      if (req.user.role === "Agent" || req.user.role === "Landlord") {
+      if (req.user.role === "agent" || req.user.role === "landlord") {
         return 500;
       }
       return 200; // Regular users
