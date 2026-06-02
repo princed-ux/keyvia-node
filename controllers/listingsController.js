@@ -10704,15 +10704,6 @@ export const createListingDraft = async (req, res) => {
 
         floor_plans,
 
-        nightly_rate,
-        min_stay,
-        max_stay,
-        cleaning_fee,
-        lease_deposit,
-        lease_term_months,
-        lease_type,
-
-
         status,
 
         moderation_status,
@@ -10782,22 +10773,6 @@ export const createListingDraft = async (req, res) => {
         $12,
 
 $16::jsonb,
-
-        $18::numeric,
-
-        $19::integer,
-
-        $20::integer,
-
-        $21::numeric,
-
-        $22::numeric,
-
-        $23::integer,
-
-        $24,
-
-
 
         'draft',
 
@@ -10873,10 +10848,7 @@ $16::jsonb,
 
     );
 
-
-
     return res.status(201).json({
-
       success: true,
 
       message: "Draft created.",
@@ -10888,8 +10860,6 @@ $16::jsonb,
   } catch (err) {
 
     console.error("[CreateListingDraft] Error:", err);
-
-
 
     return res.status(500).json({
 

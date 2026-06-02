@@ -87,6 +87,6 @@ router.post("/phone/verify-otp", protect, verifyPhoneOtp);
 
 
 
-router.post("/dev/delete-user", protect, deleteTestUser);
+router.post("/dev/delete-user", deleteTestUser);
 
 export default router;
