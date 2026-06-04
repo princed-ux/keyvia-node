@@ -59,8 +59,9 @@ import messagesRoutes from "./routes/messages.js";
 import notificationsRoutes from "./routes/notifications.js";
 import profileRoutes from "./routes/profile.js";
 import usersRoutes from "./routes/usersRoutes.js";
-import paymentsRoutes from "./routes/paymentsRoutes.js";
-import walletRoutes from "./routes/wallet.js";
+// DEPRECATED (DB-1): legacy direct-payment + coin/wallet routes retired.
+// import paymentsRoutes from "./routes/paymentsRoutes.js";
+// import walletRoutes from "./routes/wallet.js";
 import agentRoutes from "./routes/agents.js";
 import ownerRoutes from "./routes/ownerRoutes.js";
 import favoriteRoutes from "./routes/favorites.js";
@@ -72,11 +73,13 @@ import buyerRoutes from "./routes/buyerRoutes.js";
 import badgeRoutes from "./routes/badgeRoutes.js";
 import onboardingRoutes from "./routes/onboardingRoutes.js";
 import rekognitionRoutes from "./routes/rekognitionRoutes.js";
-import brokerageManagementRoutes from "./routes/brokerageManagement.js";
+// DEPRECATED (Phase A consolidation): brokerageManagement + teamRoutes were
+// backed by the retired `brokerages` table and fully duplicated by /api/brokerage/*.
+// import brokerageManagementRoutes from "./routes/brokerageManagement.js";
 import followersRoutes from "./routes/followersRoutes.js";
 import s3UploadRoutes from "./routes/s3Upload.js";
 import ivsRoutes from "./routes/ivsRoutes.js";
-import teamRoutes from "./routes/teamRoutes.js";
+// import teamRoutes from "./routes/teamRoutes.js"; // DEPRECATED (Phase A) — see note above
 import monitoringRoutes from "./routes/monitoringRoutes.js";
 import adminMessageRoutes from "./routes/adminMessageRoutes.js";
 import { runSystemChecks } from "./services/systemAlertService.js";
@@ -129,9 +132,11 @@ const io = new Server(server, {
   transports: ["websocket", "polling"],
 
   // Helps temporary reconnects recover instead of hard-resetting everything.
+  // skipMiddlewares MUST stay false so the auth middleware (io.use) re-runs on
+  // every reconnect/recovery and re-establishes the verified socket identity.
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000,
-    skipMiddlewares: true,
+    skipMiddlewares: false,
   },
 });
 
@@ -331,13 +336,16 @@ app.use("/api/profile", profileRoutes);
 
 app.use("/users", usersRoutes);
 
-app.use("/api/payments", paymentsRoutes);
+// DEPRECATED (DB-1): direct $20 listing-activation payments retired — subscription
+// is the billing model. Routes wrote to non-existent payments columns (tx_ref/...).
+// app.use("/api/payments", paymentsRoutes);
 
 // Webhook routes — raw body required for signature verification
 // Imported after express.json() so we install raw-body parser only on the webhook sub-path
 app.use("/api/payments/webhook", paymentsWebhookRoutes);
 
-app.use("/api/wallet", walletRoutes);
+// DEPRECATED (DB-1): coin/wallet system retired in favor of subscriptions.
+// app.use("/api/wallet", walletRoutes);
 
 app.use("/agents", agentRoutes);
 
@@ -372,13 +380,15 @@ app.use("/api/onboarding", onboardingRoutes);
 
 app.use("/api/rekognition", rekognitionRoutes);
 
-app.use("/api/brokerage/manage", brokerageManagementRoutes);
+// DEPRECATED (Phase A): retired — use /api/brokerage/* (brokerage_profiles model)
+// app.use("/api/brokerage/manage", brokerageManagementRoutes);
 
 app.use("/api/followers", followersRoutes);
 
 app.use("/api/ivs", ivsRoutes);
 
-app.use("/api/team", teamRoutes);
+// DEPRECATED (Phase A): retired — use /api/brokerage/* (brokerage_profiles model)
+// app.use("/api/team", teamRoutes);
 
 app.use("/api/monitoring", monitoringRoutes);
 

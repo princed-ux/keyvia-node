@@ -220,3 +220,128 @@ export const sendVerificationStatusEmail = async ({
     actionLabel: "Open Keyvia",
   });
 };
+
+/* ======================================================
+   💳 SUBSCRIPTION BILLING EMAILS (receipt + refund)
+====================================================== */
+const formatMoney = (amount, currency) => {
+  const value = Number(amount || 0);
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: String(currency || "USD").toUpperCase(),
+      maximumFractionDigits: 0,
+    }).format(value);
+  } catch {
+    return `${String(currency || "").toUpperCase()} ${value.toLocaleString()}`;
+  }
+};
+
+const formatLongDate = (value) => {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+};
+
+const receiptTable = (rows) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:12px 0 24px;">
+    ${rows
+      .filter(Boolean)
+      .map(
+        ([label, value]) => `
+      <tr>
+        <td style="padding:10px 0;border-bottom:1px solid #edf2f7;color:#64748b;font-size:14px;text-align:left;">${label}</td>
+        <td style="padding:10px 0;border-bottom:1px solid #edf2f7;color:#1a202c;font-size:14px;font-weight:600;text-align:right;">${value}</td>
+      </tr>`,
+      )
+      .join("")}
+  </table>`;
+
+export const sendSubscriptionReceiptEmail = async ({
+  email,
+  name,
+  planName,
+  amount,
+  currency,
+  reference,
+  periodEnd,
+  billingPath = "/dashboard/subscription",
+} = {}) => {
+  if (!email) return false;
+
+  try {
+    const displayName = name || "there";
+    const link = `${CLIENT_URL || "https://getkeyvia.com"}${billingPath}`;
+    const content = `
+      <p class="text" style="text-align:left;">Hi ${displayName}, your payment was received and your <strong>${planName || "Keyvia"}</strong> plan is now active. Here is your receipt:</p>
+      ${receiptTable([
+        ["Plan", planName || "—"],
+        ["Amount paid", formatMoney(amount, currency)],
+        ["Billing reference", reference || "—"],
+        ["Date", formatLongDate()],
+        ["Renews / expires", periodEnd ? formatLongDate(periodEnd) : "—"],
+        ["Status", "Active"],
+      ])}
+      <p class="text" style="text-align:left;font-size:13px;color:#94a3b8;">Keep this reference for your records. You can view and print this receipt anytime from your billing page.</p>
+      <a href="${link}" class="btn">View billing &amp; receipt</a>`;
+
+    const info = await transporter.sendMail({
+      from: `"Keyvia Billing" <${EMAIL_USER}>`,
+      to: email,
+      subject: `Payment received — ${planName || "Keyvia"} (${reference || "receipt"})`,
+      html: emailWrapper("Payment receipt", content),
+    });
+
+    console.log(`Keyvia subscription receipt email sent: ${info.messageId}`);
+    return true;
+  } catch (error) {
+    console.error("Subscription receipt email failed:", error.message);
+    return false;
+  }
+};
+
+export const sendSubscriptionRefundEmail = async ({
+  email,
+  name,
+  planName,
+  amount,
+  currency,
+  reference,
+  reason = null,
+  billingPath = "/dashboard/subscription",
+} = {}) => {
+  if (!email) return false;
+
+  try {
+    const displayName = name || "there";
+    const link = `${CLIENT_URL || "https://getkeyvia.com"}${billingPath}`;
+    const content = `
+      <p class="text" style="text-align:left;">Hi ${displayName}, we could not confirm your <strong>${planName || "Keyvia"}</strong> subscription payment, so we have <strong>automatically refunded</strong> you. No plan was activated.</p>
+      ${receiptTable([
+        ["Plan attempted", planName || "—"],
+        ["Amount refunded", formatMoney(amount, currency)],
+        ["Billing reference", reference || "—"],
+        ["Date", formatLongDate()],
+        reason ? ["Reason", reason] : null,
+      ])}
+      <p class="text" style="text-align:left;font-size:13px;color:#94a3b8;">Refunds can take a few business days to reflect, depending on your bank. You can try again anytime.</p>
+      <a href="${link}" class="btn">Back to billing</a>`;
+
+    const info = await transporter.sendMail({
+      from: `"Keyvia Billing" <${EMAIL_USER}>`,
+      to: email,
+      subject: `Refund issued — ${planName || "Keyvia"} (${reference || ""})`,
+      html: emailWrapper("Refund issued", content),
+    });
+
+    console.log(`Keyvia subscription refund email sent: ${info.messageId}`);
+    return true;
+  } catch (error) {
+    console.error("Subscription refund email failed:", error.message);
+    return false;
+  }
+};

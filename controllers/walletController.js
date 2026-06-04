@@ -1,7 +1,8 @@
 import axios from "axios";
 import { pool } from "../db.js";
 import crypto from "crypto";
-import { convertFromUSD, convertToUSD } from "../utils/exchangeRates.js"; 
+import { convertFromUSD, convertToUSD } from "../utils/exchangeRates.js";
+import { txRefBelongsToUser } from "../utils/paymentSecurity.js";
 
 const FLW_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || process.env.FLW_SECRET_KEY;
 const FLW_BASE = "https://api.flutterwave.com/v3";
@@ -81,6 +82,10 @@ export const verifyWalletFunding = async (req, res) => {
     const { transaction_id } = req.body;
     const userId = req.user?.unique_id;
 
+    if (!transaction_id) {
+      return res.status(400).json({ message: "transaction_id is required" });
+    }
+
     // 1. Verify with Flutterwave
     const flwRes = await axios.get(`${FLW_BASE}/transactions/${transaction_id}/verify`, {
       headers: { Authorization: `Bearer ${FLW_SECRET_KEY}` },
@@ -88,7 +93,15 @@ export const verifyWalletFunding = async (req, res) => {
 
     const { status, amount, currency, tx_ref } = flwRes.data.data;
 
-    // 2. Idempotency Check
+    // 2. CRITICAL: the funded ref must be one WE issued to THIS user
+    //    (format FUND-<userId>-<rand>). Without this, a user could submit
+    //    another user's transaction_id and credit that payment to their own
+    //    wallet (theft + double-spend).
+    if (!tx_ref || !String(tx_ref).startsWith("FUND-") || !txRefBelongsToUser(tx_ref, userId)) {
+      return res.status(403).json({ success: false, message: "This payment does not belong to you." });
+    }
+
+    // 3. Idempotency Check
     const checkRef = await pool.query("SELECT id FROM payments WHERE tx_ref = $1", [tx_ref]);
     if (checkRef.rows.length > 0) {
         return res.json({ success: true, message: "Already credited" });

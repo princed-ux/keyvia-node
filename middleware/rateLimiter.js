@@ -29,6 +29,16 @@ export const authLimiter = rateLimit({
   skipSuccessfulRequests: true, // Don't count successful requests
 });
 
+// OTP RATE LIMITER - Caps BOTH OTP sends and verify attempts (5 per 15 min).
+// Unlike authLimiter, this counts successful requests too, so it actually
+// limits OTP sends (SMS bombing) and brute-forcing the 6-digit code.
+export const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,
+  keyGenerator: (req) => req.user?.unique_id || req.ip,
+  message: "Too many OTP requests. Please wait a few minutes and try again.",
+});
+
 // PAYMENT RATE LIMITER - Very strict (2 requests per minute per user)
 export const paymentLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -96,6 +106,7 @@ export const dynamicLimiter = rateLimit({
 export const rateLimiters = {
   api: apiLimiter,
   auth: authLimiter,
+  otp: otpLimiter,
   payment: paymentLimiter,
   messaging: messagingLimiter,
   upload: uploadLimiter,

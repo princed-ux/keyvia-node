@@ -1,6 +1,13 @@
 import axios from "axios";
 import crypto from "crypto";
 import { pool } from "../db.js";
+import { verifyAmountAndCurrency } from "../utils/paymentSecurity.js";
+import { refundPayment } from "../utils/paymentRefund.js";
+import {
+  sendSubscriptionReceiptEmail,
+  sendSubscriptionRefundEmail,
+} from "../utils/emailService.js";
+import { PLAN_CATALOG } from "../config/planCatalog.js";
 
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
@@ -12,202 +19,7 @@ const SUPPORTED_PROVIDERS = new Set(["paystack", "flutterwave", "korapay"]);
 // International users are charged in USD.
 // =====================================================
 
-const PLAN_CATALOG = {
-  agent: {
-    free: {
-      name: "Free Agent",
-      durationDays: null,
-      prices: {
-        NGN: 0,
-        USD: 0,
-      },
-      limits: {
-        activeListings: 1,
-        photoLimit: 25,
-        analytics: false,
-        advancedAnalytics: false,
-        aiChecks: false,
-        badge: "identity_only",
-        priorityReview: false,
-        prioritySupport: false,
-        featuredAgent: false,
-        teamSeats: 0,
-      },
-    },
-
-    pro_agent: {
-      name: "Pro Agent",
-      durationDays: 30,
-      prices: {
-        NGN: 12000,
-        USD: 9,
-      },
-      limits: {
-        activeListings: 25,
-        photoLimit: 65,
-        analytics: true,
-        advancedAnalytics: false,
-        aiChecks: true,
-        badge: "standard_verified",
-        priorityReview: true,
-        prioritySupport: false,
-        featuredAgent: false,
-        teamSeats: 0,
-      },
-    },
-
-    elite_agent: {
-      name: "Elite Agent",
-      durationDays: 30,
-      prices: {
-        NGN: 25000,
-        USD: 19,
-      },
-      limits: {
-        activeListings: 100,
-        photoLimit: 100,
-        analytics: true,
-        advancedAnalytics: true,
-        aiChecks: true,
-        badge: "elite_verified",
-        priorityReview: true,
-        prioritySupport: true,
-        featuredAgent: true,
-        teamSeats: 0,
-      },
-    },
-  },
-
-  owner: {
-    free: {
-      name: "Free Owner",
-      durationDays: null,
-      prices: {
-        NGN: 0,
-        USD: 0,
-      },
-      limits: {
-        activeListings: 1,
-        photoLimit: 25,
-        analytics: false,
-        advancedAnalytics: false,
-        aiChecks: false,
-        badge: "identity_only",
-        priorityReview: false,
-        prioritySupport: false,
-        featuredOwner: false,
-        teamSeats: 0,
-      },
-    },
-
-    pro_owner: {
-      name: "Pro Owner",
-      durationDays: 30,
-      prices: {
-        NGN: 12000,
-        USD: 9,
-      },
-      limits: {
-        activeListings: 25,
-        photoLimit: 65,
-        analytics: true,
-        advancedAnalytics: false,
-        aiChecks: true,
-        badge: "standard_verified",
-        priorityReview: true,
-        prioritySupport: false,
-        featuredOwner: false,
-        teamSeats: 0,
-      },
-    },
-
-    elite_owner: {
-      name: "Elite Owner",
-      durationDays: 30,
-      prices: {
-        NGN: 25000,
-        USD: 19,
-      },
-      limits: {
-        activeListings: 100,
-        photoLimit: 100,
-        analytics: true,
-        advancedAnalytics: true,
-        aiChecks: true,
-        badge: "elite_verified",
-        priorityReview: true,
-        prioritySupport: true,
-        featuredOwner: true,
-        teamSeats: 0,
-      },
-    },
-  },
-
-  brokerage: {
-    free: {
-      name: "Free Brokerage",
-      durationDays: null,
-      prices: {
-        NGN: 0,
-        USD: 0,
-      },
-      limits: {
-        activeListings: 3,
-        photoLimit: 25,
-        analytics: false,
-        advancedAnalytics: false,
-        aiChecks: false,
-        badge: "identity_only",
-        priorityReview: false,
-        prioritySupport: false,
-        featuredBrokerage: false,
-        teamSeats: 2,
-      },
-    },
-
-    pro_brokerage: {
-      name: "Pro Brokerage",
-      durationDays: 30,
-      prices: {
-        NGN: 35000,
-        USD: 29,
-      },
-      limits: {
-        activeListings: 150,
-        photoLimit: 100,
-        analytics: true,
-        advancedAnalytics: false,
-        aiChecks: true,
-        badge: "brokerage_verified",
-        priorityReview: true,
-        prioritySupport: false,
-        featuredBrokerage: false,
-        teamSeats: 15,
-      },
-    },
-
-    elite_brokerage: {
-      name: "Elite Brokerage",
-      durationDays: 30,
-      prices: {
-        NGN: 65000,
-        USD: 49,
-      },
-      limits: {
-        activeListings: 300,
-        photoLimit: 120,
-        analytics: true,
-        advancedAnalytics: true,
-        aiChecks: true,
-        badge: "elite_brokerage",
-        priorityReview: true,
-        prioritySupport: true,
-        featuredBrokerage: true,
-        teamSeats: 50,
-      },
-    },
-  },
-};
+// PLAN_CATALOG is imported from ../config/planCatalog.js (single source of truth).
 
 // =====================================================
 // HELPERS
@@ -299,6 +111,39 @@ const getSubscriptionPath = (role) => {
   if (normalizedRole === "owner") return "/owner/subscription";
 
   return "/dashboard/subscription";
+};
+
+const getPlanName = (role, planId) =>
+  PLAN_CATALOG[normalizeRole(role)]?.[planId]?.name || null;
+
+// Lightweight user lookup for billing emails.
+const getBillingUser = async (userId) => {
+  const r = await pool.query(
+    `SELECT email, name, role, country FROM users WHERE unique_id::text = $1::text LIMIT 1`,
+    [userId],
+  );
+  return r.rows[0] || null;
+};
+
+// Record a refund outcome on the payment row. status becomes 'refunded' when the
+// gateway confirmed the refund, otherwise 'refund_failed' (so admins can follow up).
+const markPaymentRefunded = async (reference, info = {}) => {
+  try {
+    await pool.query(
+      `UPDATE subscription_payments
+       SET status = $2,
+           provider_response = COALESCE(provider_response, '{}'::jsonb) || $3::jsonb,
+           updated_at = NOW()
+       WHERE reference = $1`,
+      [
+        reference,
+        info.refunded ? "refunded" : "refund_failed",
+        JSON.stringify({ refund: info }),
+      ],
+    );
+  } catch (e) {
+    console.warn("markPaymentRefunded failed:", e.message);
+  }
 };
 
 const getUserForSubscription = async (userId) => {
@@ -1010,10 +855,147 @@ export const verifySubscriptionPayment = async (req, res) => {
       });
     }
 
-    const subscription = await activateSubscription({
-      reference,
-      providerData,
-    });
+    // ----------------------------------------------------------------
+    // Bind the gateway result to OUR pending record before activating.
+    // Confirms: (a) the reference is a real pending payment, (b) it belongs
+    // to the requesting user, and (c) the amount actually paid matches the
+    // plan price — so a "successful" status on an underpaid/foreign-currency
+    // charge can't unlock a paid plan.
+    // ----------------------------------------------------------------
+    const pendingRes = await pool.query(
+      `SELECT user_id, amount, currency, status, plan, role
+       FROM subscription_payments
+       WHERE reference = $1
+       LIMIT 1`,
+      [reference],
+    );
+    const pending = pendingRes.rows[0];
+
+    if (!pending) {
+      return res.status(404).json({
+        success: false,
+        message: "Payment record not found.",
+      });
+    }
+
+    if (String(pending.user_id) !== String(req.user?.unique_id)) {
+      return res.status(403).json({
+        success: false,
+        message: "This payment does not belong to you.",
+      });
+    }
+
+    const billingUser = await getBillingUser(pending.user_id);
+    const planName = getPlanName(pending.role, pending.plan);
+    const billingPath = getSubscriptionPath(pending.role);
+    const txId = req.query.transaction_id || providerData?.data?.id || null;
+    const node = providerData?.data || {};
+    // Paystack reports minor units (kobo/cents); FLW & Korapay report major units.
+    const paidAmount =
+      provider === "paystack" ? Number(node.amount) / 100 : Number(node.amount);
+    const paidCurrency =
+      node.currency || node.transaction_currency || pending.currency;
+
+    // Skip amount re-validation if already activated (idempotent replays).
+    if (pending.status !== "paid") {
+      const amountCheck = verifyAmountAndCurrency({
+        paidAmount,
+        paidCurrency,
+        expectedAmount: pending.amount,
+        expectedCurrency: pending.currency,
+      });
+
+      if (!amountCheck.ok) {
+        // A successful charge that doesn't match the plan price — auto-refund.
+        const refund = await refundPayment({
+          provider,
+          reference,
+          transactionId: txId,
+          amount: paidAmount,
+        });
+        await markPaymentRefunded(reference, {
+          reason: amountCheck.reason,
+          refunded: refund.ok,
+          response: refund.response || refund.error || null,
+        });
+        if (billingUser?.email) {
+          await sendSubscriptionRefundEmail({
+            email: billingUser.email,
+            name: billingUser.name,
+            planName,
+            amount: paidAmount,
+            currency: paidCurrency,
+            reference,
+            reason: amountCheck.reason,
+            billingPath,
+          }).catch(() => {});
+        }
+        return res.status(400).json({
+          success: false,
+          refunded: refund.ok,
+          message: refund.ok
+            ? "We couldn't confirm the correct payment amount, so you were automatically refunded."
+            : `Payment validation failed: ${amountCheck.reason}. A refund has been initiated.`,
+        });
+      }
+    }
+
+    let subscription;
+    try {
+      subscription = await activateSubscription({
+        reference,
+        providerData,
+      });
+    } catch (activationErr) {
+      console.error(
+        "Subscription activation failed after a successful charge — refunding:",
+        activationErr.message,
+      );
+      const refund = await refundPayment({
+        provider,
+        reference,
+        transactionId: txId,
+        amount: paidAmount,
+      });
+      await markPaymentRefunded(reference, {
+        reason: "activation_failed",
+        refunded: refund.ok,
+        response: refund.response || refund.error || null,
+      });
+      if (billingUser?.email) {
+        await sendSubscriptionRefundEmail({
+          email: billingUser.email,
+          name: billingUser.name,
+          planName,
+          amount: paidAmount,
+          currency: paidCurrency,
+          reference,
+          reason: "We hit a problem activating your plan.",
+          billingPath,
+        }).catch(() => {});
+      }
+      return res.status(500).json({
+        success: false,
+        refunded: refund.ok,
+        message: refund.ok
+          ? "We couldn't activate your plan, so you were automatically refunded."
+          : "We couldn't activate your plan. A refund has been initiated.",
+      });
+    }
+
+    // Success — send the receipt email (best effort; never blocks the response).
+    if (billingUser?.email) {
+      await sendSubscriptionReceiptEmail({
+        email: billingUser.email,
+        name: billingUser.name,
+        planName: planName || subscription.plan,
+        amount: subscription.amount,
+        currency: subscription.currency,
+        reference: subscription.reference || reference,
+        periodEnd: subscription.current_period_end,
+        billingPath,
+      }).catch(() => {});
+    }
 
     return res.json({
       success: true,

@@ -35,7 +35,9 @@ const signAccessToken = (user) => {
       email: user.email,
     },
     ACCESS_TOKEN_SECRET,
-    { expiresIn: "7d" }
+    // SEC-1: short-lived access token (held in memory on the client). Longevity
+    // comes from the httpOnly refresh-token cookie (45d) via /api/auth/refresh.
+    { expiresIn: process.env.ACCESS_TOKEN_EXPIRES || "30m" }
   );
 };
 
@@ -1205,6 +1207,8 @@ export const finishOnboarding = async (req, res) => {
         : true;
     let finalAgencyName = agency_name || null;
     let finalTeamCode = currentUser.team_code || null;
+    let pendingBrokerageId = null;
+    let pendingBrokerageName = null;
 
     if (normalizedRole === "brokerage" && !finalTeamCode) {
       finalTeamCode = await createUniqueBrokerageTeamCode(client);
@@ -1245,10 +1249,13 @@ export const finishOnboarding = async (req, res) => {
         });
       }
 
-      linkedAgencyId = agencyCheck.rows[0].unique_id;
-      isSoloAgent = false;
-      finalAgencyName =
+      // Phase B: entering a team code creates a PENDING join request — the
+      // agent is NOT linked until the brokerage approves. Stay solo for now.
+      pendingBrokerageId = agencyCheck.rows[0].unique_id;
+      pendingBrokerageName =
         agencyCheck.rows[0].brokerage_name || agencyCheck.rows[0].name || null;
+      linkedAgencyId = null;
+      isSoloAgent = true;
     }
 
     if (normalizedRole === "agent" && !team_code) {
@@ -1428,6 +1435,33 @@ const docColumn =
         `,
         [userId, finalTeamCode],
       );
+    }
+
+    // Phase B: record the pending brokerage join request (agent not linked yet).
+    if (normalizedRole === "agent" && pendingBrokerageId) {
+      await client.query(
+        `INSERT INTO brokerage_memberships (brokerage_id, agent_id, status, requested_at, updated_at)
+         VALUES ($1::uuid, $2::uuid, 'pending', NOW(), NOW())
+         ON CONFLICT (brokerage_id, agent_id)
+         DO UPDATE SET status = 'pending', requested_at = NOW(),
+                       decided_at = NULL, decided_by = NULL, updated_at = NOW()`,
+        [pendingBrokerageId, userId],
+      ).catch((e) =>
+        console.warn("[Onboarding] membership insert skipped:", e?.message),
+      );
+
+      try {
+        await client.query(
+          `INSERT INTO notifications (recipient_id, title, message, type, resource_type, resource_id, created_at)
+           VALUES ($1::uuid, $2, $3, 'system', 'brokerage', $4::uuid, NOW())`,
+          [
+            pendingBrokerageId,
+            "New Agent Join Request",
+            `${currentUser.name || "An agent"} has requested to join ${pendingBrokerageName || "your brokerage"}.`,
+            userId,
+          ],
+        );
+      } catch {}
     }
 
     await client.query(
@@ -1712,6 +1746,13 @@ const docColumn =
 // 13. DELETE TEST USER
 // ===================================================
 export const deleteTestUser = async (req, res) => {
+  // SAFETY: this is a dev-only helper for reusing test emails. It must NEVER be
+  // callable in production (it deletes a user with no auth). Auto-disabled when
+  // NODE_ENV === "production"; remove the route entirely before launch.
+  if (process.env.NODE_ENV === "production") {
+    return res.status(404).json({ message: "Not found." });
+  }
+
   const { email } = req.body;
 
   if (!email) {
@@ -1778,11 +1819,17 @@ export const deleteTestUser = async (req, res) => {
     } catch {}
 
     try {
+      // If this user is a brokerage owner, unlink their agents and remove the
+      // brokerage profile (canonical model: linked_agency_id = owner unique_id).
       await client.query(
-        "UPDATE users SET brokerage_id=NULL WHERE brokerage_id=(SELECT id FROM brokerages WHERE owner_id=$1)",
+        "UPDATE users SET linked_agency_id=NULL, is_solo_agent=TRUE WHERE linked_agency_id=$1",
         [userId]
       );
-      await client.query("DELETE FROM brokerages WHERE owner_id=$1", [userId]);
+      await client.query(
+        "UPDATE agent_profiles SET linked_agency_id=NULL, is_solo_agent=TRUE WHERE linked_agency_id=$1",
+        [userId]
+      ).catch(() => {});
+      await client.query("DELETE FROM brokerage_profiles WHERE unique_id=$1", [userId]);
     } catch {}
 
     try {

@@ -1,9 +1,105 @@
+import jwt from "jsonwebtoken";
 import { onlineUsers } from "./onlineUsers.js";
 import { emitToUser } from "./socketUtils.js";
 import { pool } from "../db.js";
 import { createNotification } from "../controllers/notificationsController.js";
 import { maybeSendAutoReply } from "../services/messageSettingsService.js";
 import { publishMessageToSQS } from "../services/sqsMessagingService.js";
+
+const normalizeRole = (role) => String(role || "").trim().toLowerCase();
+
+const isAdminRole = (role) => {
+  const r = normalizeRole(role);
+  return r === "admin" || r === "super_admin" || r === "superadmin";
+};
+
+/**
+ * Extract and clean a bearer token from the socket handshake.
+ * The frontend sends it as `auth.token`; we also accept an Authorization header.
+ * localStorage values are sometimes JSON-stringified, so strip wrapping quotes.
+ */
+const getHandshakeToken = (socket) => {
+  let token =
+    socket.handshake?.auth?.token ||
+    socket.handshake?.headers?.authorization ||
+    "";
+
+  if (!token) return null;
+
+  token = String(token).trim();
+  if (token.startsWith("Bearer ")) token = token.slice(7).trim();
+  token = token.replace(/^"|"$/g, "");
+
+  if (!token || token === "null" || token === "undefined") return null;
+
+  return token;
+};
+
+/**
+ * Socket authentication middleware.
+ * Verifies the JWT on the handshake and binds the VERIFIED identity to the
+ * socket. Every handler reads identity from socket.userId (never from the
+ * client payload), so a client can no longer impersonate another user.
+ */
+const socketAuth = (socket, next) => {
+  try {
+    const token = getHandshakeToken(socket);
+    if (!token) {
+      return next(new Error("UNAUTHORIZED: missing token"));
+    }
+
+    const secret = process.env.ACCESS_TOKEN_SECRET;
+    if (!secret) {
+      console.error("[SocketAuth] ACCESS_TOKEN_SECRET is missing.");
+      return next(new Error("SERVER_CONFIG_ERROR"));
+    }
+
+    const decoded = jwt.verify(token, secret);
+
+    if (!decoded?.unique_id) {
+      return next(new Error("UNAUTHORIZED: invalid token payload"));
+    }
+
+    // Bind verified identity. Store on socket.data too so it survives
+    // connection-state-recovery and is available in every handler.
+    socket.userId = String(decoded.unique_id);
+    socket.userRole = normalizeRole(decoded.role);
+    socket.data.userId = socket.userId;
+    socket.data.userRole = socket.userRole;
+
+    return next();
+  } catch (err) {
+    console.error(`[SocketAuth] Rejected: ${err.name} - ${err.message}`);
+    return next(new Error("UNAUTHORIZED"));
+  }
+};
+
+const registerPresence = (io, socket) => {
+  const userId = socket.userId;
+  if (!userId) return;
+
+  if (!onlineUsers[userId]) {
+    onlineUsers[userId] = new Set();
+  }
+  onlineUsers[userId].add(socket.id);
+
+  // Personal room is keyed strictly by the authenticated id.
+  socket.join(userId);
+
+  io.emit("online_users", Object.keys(onlineUsers));
+};
+
+const removePresence = (io, socket) => {
+  const userId = socket.userId;
+  if (!userId || !onlineUsers[userId]) return;
+
+  onlineUsers[userId].delete(socket.id);
+  if (onlineUsers[userId].size === 0) {
+    delete onlineUsers[userId];
+  }
+
+  io.emit("online_users", Object.keys(onlineUsers));
+};
 
 const getUnreadCountForUser = async (conversationId, userId) => {
   const result = await pool.query(
@@ -20,76 +116,118 @@ const getUnreadCountForUser = async (conversationId, userId) => {
   return result.rows[0]?.count || 0;
 };
 
+/**
+ * Authorization helper: is the authenticated user a participant of this
+ * conversation? Joining a conversation room means receiving its message
+ * broadcasts, so this must be gated.
+ */
+const isConversationParticipant = async (conversationId, userId) => {
+  try {
+    const result = await pool.query(
+      `SELECT 1
+       FROM conversations
+       WHERE conversation_id = $1
+         AND (user1_id::text = $2::text OR user2_id::text = $2::text)
+       LIMIT 1`,
+      [conversationId, userId],
+    );
+    return result.rows.length > 0;
+  } catch (err) {
+    console.error("[Socket] participant check failed:", err.message);
+    return false;
+  }
+};
+
+const isTeamGroupMember = async (groupId, userId) => {
+  try {
+    const result = await pool.query(
+      `SELECT 1
+       FROM brokerage_message_group_members
+       WHERE group_id = $1 AND user_id::text = $2::text
+       LIMIT 1`,
+      [groupId, userId],
+    );
+    return result.rows.length > 0;
+  } catch (err) {
+    console.error("[Socket] team-group membership check failed:", err.message);
+    return false;
+  }
+};
+
 export const registerSocketHandlers = (io) => {
+  // Gate every connection behind JWT verification.
+  io.use(socketAuth);
+
   io.on("connection", (socket) => {
-    console.log("⚡ Client connected:", socket.id);
+    console.log(`⚡ Client connected: ${socket.id} (user ${socket.userId})`);
+
+    // Presence is established from the verified identity automatically —
+    // it no longer depends on the client emitting an honest userId.
+    registerPresence(io, socket);
+
+    // Update last_active without trusting any client payload.
+    pool
+      .query("UPDATE users SET last_active = NOW() WHERE unique_id = $1", [
+        socket.userId,
+      ])
+      .catch(() => {});
 
     // ==========================
-    // USER ONLINE
+    // USER ONLINE / OFFLINE
+    // (kept for backward-compat; identity comes from the socket, not the payload)
     // ==========================
-    socket.on("user_online", async ({ userId }) => {
-      if (!userId) return;
+    socket.on("user_online", () => {
+      registerPresence(io, socket);
+    });
 
-      if (!onlineUsers[userId]) {
-        onlineUsers[userId] = new Set();
-      }
+    socket.on("user_offline", () => {
+      removePresence(io, socket);
+    });
 
-      onlineUsers[userId].add(socket.id);
-      socket.userId = userId;
-
-      // Join personal room
-      socket.join(userId);
-
-      try {
-        await pool.query(
-          "UPDATE users SET last_active = NOW() WHERE unique_id = $1",
-          [userId]
+    // ==========================
+    // JOIN ROOMS (all authorized against the verified identity)
+    // ==========================
+    socket.on("join_conversation", async ({ conversationId }) => {
+      if (!conversationId) return;
+      const allowed = await isConversationParticipant(
+        conversationId,
+        socket.userId,
+      );
+      if (!allowed) {
+        console.warn(
+          `[Socket] user ${socket.userId} denied join_conversation ${conversationId}`,
         );
-      } catch {}
-
-      io.emit("online_users", Object.keys(onlineUsers));
-    });
-
-    // ==========================
-    // USER OFFLINE
-    // ==========================
-    socket.on("user_offline", ({ userId }) => {
-      if (!userId) return;
-
-      if (onlineUsers[userId]) {
-        onlineUsers[userId].delete(socket.id);
-
-        if (onlineUsers[userId].size === 0) {
-          delete onlineUsers[userId];
-        }
+        return;
       }
-
-      io.emit("online_users", Object.keys(onlineUsers));
+      socket.join(`conv_${conversationId}`);
     });
 
-    // ==========================
-    // JOIN ROOMS
-    // ==========================
-    socket.on("join_conversation", ({ conversationId }) => {
-      if (conversationId) {
-        socket.join(`conv_${conversationId}`);
+    socket.on("join_team_group", async ({ groupId }) => {
+      if (!groupId) return;
+      const allowed = await isTeamGroupMember(groupId, socket.userId);
+      if (!allowed) {
+        console.warn(
+          `[Socket] user ${socket.userId} denied join_team_group ${groupId}`,
+        );
+        return;
       }
+      socket.join(`team_group_${groupId}`);
     });
 
-    socket.on("join_team_group", ({ groupId }) => {
-      if (groupId) {
-        socket.join(`team_group_${groupId}`);
-      }
+    // A user may only join their OWN agent room.
+    socket.on("join_agent_room", () => {
+      socket.join(`agent_${socket.userId}`);
     });
 
-    socket.on("join_agent_room", ({ agent_id }) => {
-      if (agent_id) {
-        socket.join(`agent_${agent_id}`);
-      }
-    });
-
+    // Only admins/super-admins may join the admin broadcast room.
     socket.on("join_admins", () => {
-      socket.join("admins");
+      if (isAdminRole(socket.userRole)) {
+        socket.join("admins");
+      } else {
+        console.warn(
+          `[Socket] non-admin ${socket.userId} denied join_admins`,
+        );
+      }
     });
 
     // ==========================
@@ -97,7 +235,6 @@ export const registerSocketHandlers = (io) => {
     // ==========================
     socket.on("send_message", async ({
       conversationId,
-      senderId,
       message,
       productId,
       id,
@@ -108,7 +245,8 @@ export const registerSocketHandlers = (io) => {
       attachment_type,
       type,
     }) => {
-      const actualSenderId = socket.userId || senderId;
+      // Sender is ALWAYS the authenticated socket identity.
+      const actualSenderId = socket.userId;
 
       if (!conversationId || !actualSenderId || !message) return;
 
@@ -257,15 +395,22 @@ export const registerSocketHandlers = (io) => {
     // ==========================
     // MESSAGE SEEN
     // ==========================
-    socket.on("message_seen", async ({ conversationId, userId }) => {
-      const actualUserId = socket.userId || userId;
+    socket.on("message_seen", async ({ conversationId }) => {
+      const actualUserId = socket.userId;
 
       if (!conversationId || !actualUserId) return;
 
+      // Only a participant may mark a conversation's messages as seen.
+      const allowed = await isConversationParticipant(
+        conversationId,
+        actualUserId,
+      );
+      if (!allowed) return;
+
       try {
         await pool.query(
-          `UPDATE messages 
-           SET seen = TRUE 
+          `UPDATE messages
+           SET seen = TRUE
            WHERE conversation_id = $1
              AND sender_id::text != $2::text`,
           [conversationId, actualUserId]
@@ -278,8 +423,8 @@ export const registerSocketHandlers = (io) => {
       } catch {}
     });
 
-    socket.on("typing", ({ conversationId, userId }) => {
-      const actualUserId = socket.userId || userId;
+    socket.on("typing", ({ conversationId }) => {
+      const actualUserId = socket.userId;
       if (!conversationId || !actualUserId) return;
 
       socket.to(`conv_${conversationId}`).emit("user_typing", {
@@ -292,8 +437,8 @@ export const registerSocketHandlers = (io) => {
       });
     });
 
-    socket.on("stop_typing", ({ conversationId, userId }) => {
-      const actualUserId = socket.userId || userId;
+    socket.on("stop_typing", ({ conversationId }) => {
+      const actualUserId = socket.userId;
       if (!conversationId || !actualUserId) return;
 
       socket.to(`conv_${conversationId}`).emit("user_stop_typing", {
@@ -346,8 +491,14 @@ export const registerSocketHandlers = (io) => {
       }
     });
 
-    socket.on("delete_message", ({ messageId, conversationId }) => {
+    socket.on("delete_message", async ({ messageId, conversationId }) => {
       if (!messageId || !conversationId) return;
+      // Only a participant of the conversation may broadcast a deletion.
+      const allowed = await isConversationParticipant(
+        conversationId,
+        socket.userId,
+      );
+      if (!allowed) return;
       io.to(`conv_${conversationId}`).emit("message_deleted", { messageId });
     });
 
@@ -355,19 +506,8 @@ export const registerSocketHandlers = (io) => {
     // DISCONNECT
     // ==========================
     socket.on("disconnect", () => {
-      console.log("❌ Disconnected:", socket.id);
-
-      const userId = socket.userId;
-
-      if (userId && onlineUsers[userId]) {
-        onlineUsers[userId].delete(socket.id);
-
-        if (onlineUsers[userId].size === 0) {
-          delete onlineUsers[userId];
-        }
-      }
-
-      io.emit("online_users", Object.keys(onlineUsers));
+      console.log(`❌ Disconnected: ${socket.id} (user ${socket.userId})`);
+      removePresence(io, socket);
     });
   });
 };

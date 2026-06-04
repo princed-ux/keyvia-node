@@ -539,7 +539,7 @@ export const getLiveNowTours = async (req, res) => {
       FROM live_tours lt
       JOIN listings l ON lt.property_id = l.id
       LEFT JOIN users u ON lt.host_id = u.unique_id
-      LEFT JOIN brokerages b ON lt.agency_id = b.id
+      LEFT JOIN brokerage_profiles b ON b.unique_id = lt.agency_id
       WHERE lt.is_live = TRUE
       ORDER BY lt.started_at DESC
       LIMIT 48

@@ -941,74 +941,54 @@ router.post("/join-team", async (req, res) => {
 
     const companyName = brokerage.company_name || brokerage.name || "Keyvia Brokerage";
 
-    await client.query(
-      `
-      UPDATE users
-      SET linked_agency_id = $1::uuid,
-          is_solo_agent = FALSE,
-          brokerage_name = $2,
-          updated_at = NOW()
-      WHERE unique_id::text = $3::text
-      `,
-      [brokerage.unique_id, companyName, agentId],
+    // An agent must be approved by the brokerage — entering a team code only
+    // creates a PENDING request. The agent is NOT linked until approval.
+    const existingMembership = await client.query(
+      `SELECT status FROM brokerage_memberships
+       WHERE brokerage_id::text = $1::text AND agent_id::text = $2::text
+       LIMIT 1`,
+      [brokerage.unique_id, agentId],
     );
 
-    await client.query(
-      `
-      INSERT INTO agent_profiles (
-        unique_id,
-        linked_agency_id,
-        is_solo_agent,
-        updated_at
-      )
-      VALUES ($1::uuid, $2::uuid, FALSE, NOW())
-      ON CONFLICT (unique_id)
-      DO UPDATE SET
-        linked_agency_id = EXCLUDED.linked_agency_id,
-        is_solo_agent = FALSE,
-        updated_at = NOW()
-      `,
-      [agentId, brokerage.unique_id],
-    );
+    if (existingMembership.rows[0]?.status === "approved") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: `You are already a member of ${companyName}.`,
+      });
+    }
+
+    if (existingMembership.rows[0]?.status === "pending") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: `You already have a pending request to join ${companyName}.`,
+      });
+    }
 
     await client.query(
-      `
-      INSERT INTO profiles (
-        unique_id,
-        email,
-        full_name,
-        linked_agency_id,
-        is_solo_agent,
-        brokerage_name,
-        updated_at
-      )
-      VALUES ($1::uuid, $2, $3, $4::uuid, FALSE, $5, NOW())
-      ON CONFLICT (unique_id)
-      DO UPDATE SET
-        linked_agency_id = EXCLUDED.linked_agency_id,
-        is_solo_agent = FALSE,
-        brokerage_name = EXCLUDED.brokerage_name,
-        updated_at = NOW()
-      `,
-      [agentId, agent.email || null, agent.name || null, brokerage.unique_id, companyName],
+      `INSERT INTO brokerage_memberships (brokerage_id, agent_id, status, requested_at, updated_at)
+       VALUES ($1::uuid, $2::uuid, 'pending', NOW(), NOW())
+       ON CONFLICT (brokerage_id, agent_id)
+       DO UPDATE SET status = 'pending', requested_at = NOW(),
+                     decided_at = NULL, decided_by = NULL, updated_at = NOW()`,
+      [brokerage.unique_id, agentId],
     );
 
-    await notifyAgencyAgentJoined({
+    await safeNotify(
       client,
-      brokerageId: brokerage.unique_id,
+      brokerage.unique_id,
+      "New Agent Join Request",
+      `${agent.name || "An agent"} has requested to join ${companyName}.`,
       agentId,
-      brokerageName: companyName,
-      agentName: agent.name,
-      io: req.io,
-    });
+    );
 
     await client.query("COMMIT");
 
     return res.json({
       success: true,
-      message: `You are now connected to ${companyName}.`,
-      linked_agency_id: brokerage.unique_id,
-      is_solo_agent: false,
+      pending: true,
+      message: `Your request to join ${companyName} has been sent. You'll be notified once it's reviewed.`,
       brokerage: {
         unique_id: brokerage.unique_id,
         company_name: companyName,
@@ -1094,6 +1074,44 @@ router.post("/exit", async (req, res) => {
   }
 });
 
+// Agent: my current brokerage membership status (pending / approved / rejected)
+router.get("/my-membership", async (req, res) => {
+  try {
+    const agentId = requireUser(req, res);
+    if (!agentId) return;
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        m.status,
+        m.requested_at,
+        m.decided_at,
+        m.brokerage_id,
+        COALESCE(bp.company_name, ow.brokerage_name, ow.name) AS brokerage_name,
+        COALESCE(bp.logo_url, ow.avatar_url) AS brokerage_avatar_url
+      FROM brokerage_memberships m
+      JOIN users ow ON ow.unique_id::text = m.brokerage_id::text
+      LEFT JOIN brokerage_profiles bp ON bp.unique_id::text = m.brokerage_id::text
+      WHERE m.agent_id::text = $1::text
+      ORDER BY CASE m.status
+                 WHEN 'pending' THEN 0
+                 WHEN 'approved' THEN 1
+                 ELSE 2
+               END, m.updated_at DESC
+      LIMIT 1
+      `,
+      [agentId],
+    );
+
+    return res.json({ success: true, membership: rows[0] || null });
+  } catch (err) {
+    console.error("Get My Membership Error:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch membership." });
+  }
+});
+
 router.get("/agents", async (req, res) => {
   try {
     const userId = requireUser(req, res);
@@ -1115,6 +1133,9 @@ router.get("/agents", async (req, res) => {
         u.is_verified,
         u.is_verified_agent,
         u.created_at,
+        m.status AS membership_status,
+        m.requested_at AS membership_requested_at,
+        m.decided_at AS membership_decided_at,
         COALESCE(ap.experience_years, u.experience_years) AS experience_years,
         COALESCE(ap.linked_agency_id, u.linked_agency_id) AS linked_agency_id,
         COALESCE(ap.is_solo_agent, u.is_solo_agent) AS is_solo_agent,
@@ -1122,7 +1143,9 @@ router.get("/agents", async (req, res) => {
         COUNT(DISTINCT l.id) FILTER (
           WHERE l.status = 'approved' AND l.is_active = true
         )::int AS active_listings_count
-      FROM users u
+      FROM brokerage_memberships m
+      JOIN users u
+        ON u.unique_id::text = m.agent_id::text
       LEFT JOIN profiles p
         ON p.unique_id::text = u.unique_id::text
       LEFT JOIN agent_profiles ap
@@ -1133,11 +1156,8 @@ router.get("/agents", async (req, res) => {
           OR l.assigned_agent_id::text = u.unique_id::text
           OR l.agent_unique_id::text = u.unique_id::text
         )
-      WHERE (
-          u.linked_agency_id::text = $1::text
-          OR ap.linked_agency_id::text = $1::text
-        )
-        AND LOWER(u.role::TEXT) IN ('agent', 'agency_agent', 'agencyagent', 'brokerage_agent')
+      WHERE m.brokerage_id::text = $1::text
+        AND m.status IN ('pending', 'approved')
       GROUP BY
         u.unique_id,
         u.name,
@@ -1159,8 +1179,11 @@ router.get("/agents", async (req, res) => {
         ap.linked_agency_id,
         u.linked_agency_id,
         ap.is_solo_agent,
-        u.is_solo_agent
-      ORDER BY u.created_at DESC
+        u.is_solo_agent,
+        m.status,
+        m.requested_at,
+        m.decided_at
+      ORDER BY CASE WHEN m.status = 'pending' THEN 0 ELSE 1 END, u.created_at DESC
       `,
       [userId]
     );
@@ -1286,6 +1309,19 @@ router.delete("/agents/:id", async (req, res) => {
         [id],
       );
 
+      await client.query(
+        `
+        UPDATE brokerage_memberships
+        SET status = 'removed',
+            decided_at = NOW(),
+            decided_by = $2::uuid,
+            updated_at = NOW()
+        WHERE agent_id::text = $1::text
+          AND brokerage_id::text = $2::text
+        `,
+        [id, brokerageId],
+      ).catch(() => {});
+
       await safeNotify(
         client,
         id,
@@ -1312,6 +1348,170 @@ router.delete("/agents/:id", async (req, res) => {
       success: false,
       message: err.message || "Failed to remove agent",
     });
+  }
+});
+
+// Approve a pending agency-agent join request
+router.post("/agents/:id/approve", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const brokerageId = requireUser(req, res);
+    if (!brokerageId) return;
+
+    const { id: agentId } = req.params;
+
+    await client.query("BEGIN");
+    const brokerage = await requireBrokerage(client, brokerageId);
+
+    const membershipRes = await client.query(
+      `SELECT id, status FROM brokerage_memberships
+       WHERE brokerage_id::text = $1::text AND agent_id::text = $2::text
+       LIMIT 1`,
+      [brokerageId, agentId],
+    );
+    const membership = membershipRes.rows[0];
+
+    if (!membership || membership.status !== "pending") {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "No pending join request found for this agent.",
+      });
+    }
+
+    const companyName =
+      brokerage.company_name || brokerage.name || "Keyvia Brokerage";
+
+    await client.query(
+      `UPDATE brokerage_memberships
+       SET status = 'approved', decided_at = NOW(), decided_by = $1::uuid, updated_at = NOW()
+       WHERE brokerage_id::text = $1::text AND agent_id::text = $2::text`,
+      [brokerageId, agentId],
+    );
+
+    await client.query(
+      `UPDATE users
+       SET linked_agency_id = $1::uuid, is_solo_agent = FALSE, brokerage_name = $2, updated_at = NOW()
+       WHERE unique_id::text = $3::text`,
+      [brokerageId, companyName, agentId],
+    );
+
+    await client.query(
+      `INSERT INTO agent_profiles (unique_id, linked_agency_id, is_solo_agent, updated_at)
+       VALUES ($1::uuid, $2::uuid, FALSE, NOW())
+       ON CONFLICT (unique_id)
+       DO UPDATE SET linked_agency_id = EXCLUDED.linked_agency_id, is_solo_agent = FALSE, updated_at = NOW()`,
+      [agentId, brokerageId],
+    ).catch(() => {});
+
+    await client.query(
+      `UPDATE profiles
+       SET linked_agency_id = $1::uuid, is_solo_agent = FALSE, brokerage_name = $2, updated_at = NOW()
+       WHERE unique_id::text = $3::text`,
+      [brokerageId, companyName, agentId],
+    ).catch(() => {});
+
+    await safeNotify(
+      client,
+      agentId,
+      "Brokerage Request Approved",
+      `You are now connected to ${companyName}.`,
+      brokerageId,
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "Agent approved.",
+      agent_id: agentId,
+      membership_status: "approved",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Approve Agent Error:", err);
+    return res.status(err.statusCode || 500).json({
+      success: false,
+      message: err.message || "Failed to approve agent.",
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Reject a pending agency-agent join request
+router.post("/agents/:id/reject", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const brokerageId = requireUser(req, res);
+    if (!brokerageId) return;
+
+    const { id: agentId } = req.params;
+
+    await client.query("BEGIN");
+    const brokerage = await requireBrokerage(client, brokerageId);
+
+    const membershipRes = await client.query(
+      `SELECT id, status FROM brokerage_memberships
+       WHERE brokerage_id::text = $1::text AND agent_id::text = $2::text
+       LIMIT 1`,
+      [brokerageId, agentId],
+    );
+    const membership = membershipRes.rows[0];
+
+    if (!membership || membership.status !== "pending") {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "No pending join request found for this agent.",
+      });
+    }
+
+    await client.query(
+      `UPDATE brokerage_memberships
+       SET status = 'rejected', decided_at = NOW(), decided_by = $1::uuid, updated_at = NOW()
+       WHERE brokerage_id::text = $1::text AND agent_id::text = $2::text`,
+      [brokerageId, agentId],
+    );
+
+    // Safety: ensure the agent is not linked to this brokerage.
+    await client.query(
+      `UPDATE users
+       SET linked_agency_id = NULL, is_solo_agent = TRUE, brokerage_name = NULL, updated_at = NOW()
+       WHERE unique_id::text = $1::text AND linked_agency_id::text = $2::text`,
+      [agentId, brokerageId],
+    );
+
+    const companyName =
+      brokerage.company_name || brokerage.name || "the brokerage";
+
+    await safeNotify(
+      client,
+      agentId,
+      "Brokerage Request Declined",
+      `Your request to join ${companyName} was not approved.`,
+      brokerageId,
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "Request rejected.",
+      agent_id: agentId,
+      membership_status: "rejected",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Reject Agent Error:", err);
+    return res.status(err.statusCode || 500).json({
+      success: false,
+      message: err.message || "Failed to reject agent.",
+    });
+  } finally {
+    client.release();
   }
 });
 

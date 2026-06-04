@@ -18,7 +18,7 @@ import {
 
 // ✅ IMPORT THE MIDDLEWARE
 import { protect } from "../middleware/authMiddleware.js";
-import { authLimiter } from "../middleware/rateLimiter.js";
+import { authLimiter, otpLimiter } from "../middleware/rateLimiter.js";
 import { upload } from "../middleware/upload.js"
 
 const router = express.Router();
@@ -74,14 +74,14 @@ router.post("/reset-password/:token", authLimiter, resetPassword);
    5. SESSION MANAGEMENT
 ========================= */
 router.post("/logout", logout);
-router.post("/refresh", refresh);
+router.post("/refresh", authLimiter, refresh);
 
 
 /* =========================
    6. PHONE VERIFICATION (SENDCHAMP) ✅ NEW
 ========================= */
-router.post("/phone/send-otp", protect, sendPhoneOtp);
-router.post("/phone/verify-otp", protect, verifyPhoneOtp);
+router.post("/phone/send-otp", protect, otpLimiter, sendPhoneOtp);
+router.post("/phone/verify-otp", protect, otpLimiter, verifyPhoneOtp);
 
 
 

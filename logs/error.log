@@ -3790,3 +3790,4 @@
 2026-05-31 16:00:11 [ERROR]: UNCAUGHT EXCEPTION — shutting down EPIPE: broken pipe, write
 2026-05-31 16:00:11 [ERROR]: UNCAUGHT EXCEPTION — shutting down EPIPE: broken pipe, write
 2026-05-31 16:00:11 [ERROR]: UNCAUGHT EXCEPTION — shutting down EPIPE: broken pipe, write
+2026-06-03 22:00:18 [ERROR]: UNCAUGHT EXCEPTION — shutting down listen EADDRINUSE: address already in use :::5000
