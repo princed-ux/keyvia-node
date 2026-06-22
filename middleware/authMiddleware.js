@@ -348,6 +348,139 @@ export const verifySuperAdmin = (req, res, next) => {
 };
 
 /**
+ * Step-up re-auth guard (B2). When the platform setting
+ * `require_admin_reauth_for_sensitive_actions` is ON, sensitive admin actions
+ * require a fresh re-auth token (issued by POST /api/admin/reauth after the
+ * admin re-enters their password) supplied in the `x-admin-reauth` header.
+ * When the setting is OFF, this is a no-op so existing flows are unaffected.
+ */
+export const requireAdminReauth = async (req, res, next) => {
+  try {
+    const { getBool } = await import("../services/settingsService.js");
+    const enabled = await getBool("require_admin_reauth_for_sensitive_actions");
+    if (!enabled) return next();
+
+    const token =
+      req.headers["x-admin-reauth"] || req.headers["X-Admin-Reauth"] || "";
+    if (!token) {
+      return res.status(401).json({
+        message: "Re-authentication required for this action.",
+        code: "REAUTH_REQUIRED",
+      });
+    }
+
+    const secret = process.env.ACCESS_TOKEN_SECRET;
+    let decoded;
+    try {
+      decoded = jwt.verify(token, secret);
+    } catch {
+      return res.status(401).json({
+        message: "Re-authentication expired. Please confirm your password again.",
+        code: "REAUTH_EXPIRED",
+      });
+    }
+
+    if (
+      decoded?.purpose !== "admin_reauth" ||
+      String(decoded?.unique_id) !== String(req.user?.unique_id)
+    ) {
+      return res.status(401).json({
+        message: "Invalid re-authentication token.",
+        code: "REAUTH_INVALID",
+      });
+    }
+
+    return next();
+  } catch (err) {
+    console.error("[requireAdminReauth] error:", err);
+    return res.status(500).json({ message: "Re-auth check failed." });
+  }
+};
+
+/**
+ * Role guard middleware factory.
+ * Usage: requireRole('agent', 'brokerage_owner')
+ * Accepts both DB enum values and normalized frontend values.
+ */
+export const requireRole = (...allowedRoles) => (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ message: "Unauthorized", code: "NO_USER" });
+  }
+
+  const normalize = (r) => {
+    const v = String(r || "").toLowerCase();
+    if (v === "brokerage_owner") return "brokerage";
+    if (v === "super_admin") return "superadmin";
+    if (v === "landlord") return "owner";
+    return v;
+  };
+
+  const userRole = normalize(req.user.role);
+  const allowed = allowedRoles.map(normalize);
+
+  // Super admin and admin pass all role gates unless explicitly excluded
+  if (req.user.is_super_admin || req.user.is_admin) return next();
+
+  if (!allowed.includes(userRole)) {
+    return res.status(403).json({
+      message: "Forbidden: insufficient role",
+      code: "ROLE_FORBIDDEN",
+      required: allowedRoles,
+      actual: userRole,
+    });
+  }
+
+  return next();
+};
+
+/**
+ * Brokerage team permission gate for agency agents.
+ * Checks that the agent's brokerage team_code has the given permission key.
+ * Usage: requireTeamPermission('can_list')
+ */
+export const requireTeamPermission = (permissionKey) => async (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const role = normalizeRole(req.user.role);
+
+  // Only applies to agency agents; solo agents and other roles pass through
+  if (role !== "agencyagent" && req.user.is_solo_agent !== false) {
+    return next();
+  }
+
+  if (!req.user.team_code) {
+    return next();
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT permissions FROM team_codes
+       WHERE UPPER(TRIM(code)) = UPPER(TRIM($1))
+         AND is_active = true
+       LIMIT 1`,
+      [req.user.team_code]
+    );
+
+    if (!result.rows.length) return next(); // No explicit restrictions found
+
+    const permissions = result.rows[0].permissions || {};
+    if (permissions[permissionKey] === false) {
+      return res.status(403).json({
+        message: `Your brokerage team has restricted this action (${permissionKey}).`,
+        code: "TEAM_PERMISSION_DENIED",
+      });
+    }
+
+    return next();
+  } catch (err) {
+    console.error("[requireTeamPermission] DB error:", err.message);
+    return next(); // Fail open — don't block on DB errors
+  }
+};
+
+/**
  * Aliases
  */
 export const authenticate = authenticateAndAttachUser;

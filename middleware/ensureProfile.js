@@ -14,6 +14,6 @@ export const ensureProfile = async (req, res, next) => {
     next();
   } catch (err) {
     console.error("ensureProfile error:", err);
-    next(); // don't block request
+    return res.status(500).json({ error: "Internal server error" });
   }
 };

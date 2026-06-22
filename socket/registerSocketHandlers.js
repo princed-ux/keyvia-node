@@ -250,6 +250,17 @@ export const registerSocketHandlers = (io) => {
 
       if (!conversationId || !actualSenderId || !message) return;
 
+      // Per-socket rate limit: max 60 send_message events per minute
+      const now = Date.now();
+      if (!socket.data._msgRateWindow) socket.data._msgRateWindow = { count: 0, start: now };
+      const window = socket.data._msgRateWindow;
+      if (now - window.start > 60_000) { window.count = 0; window.start = now; }
+      window.count += 1;
+      if (window.count > 60) {
+        socket.emit("error", { message: "Message rate limit exceeded. Please slow down." });
+        return;
+      }
+
       try {
         const conversation = await pool.query(
           `SELECT user1_id, user2_id
@@ -289,17 +300,15 @@ export const registerSocketHandlers = (io) => {
           `INSERT INTO messages (
              conversation_id,
              sender_id,
-             recipient_id,
-             content,
              message,
              product_id,
              attachment_url,
              attachment_type,
              is_auto_reply
            )
-           VALUES ($1, $2, $3, $4, $4, $5, $6, $7, FALSE)
+           VALUES ($1, $2, $3, $4, $5, $6, FALSE)
            RETURNING
-             id,
+             message_id AS id,
              conversation_id,
              sender_id,
              message,
@@ -312,7 +321,6 @@ export const registerSocketHandlers = (io) => {
           [
             conversationId,
             actualSenderId,
-            recipientId,
             message,
             productId || null,
             attachmentUrl || attachment_url || null,
@@ -416,6 +424,13 @@ export const registerSocketHandlers = (io) => {
           [conversationId, actualUserId]
         );
 
+        // Reset email threshold log so future unread spikes can notify again
+        pool.query(
+          `UPDATE message_email_log SET reset_at = NOW()
+           WHERE user_id::text = $1::text AND reset_at IS NULL`,
+          [actualUserId]
+        ).catch(() => {});
+
         io.to(`conv_${conversationId}`).emit("messages_seen", {
           conversationId,
           userId: actualUserId,
@@ -502,12 +517,206 @@ export const registerSocketHandlers = (io) => {
       io.to(`conv_${conversationId}`).emit("message_deleted", { messageId });
     });
 
+    // edit_message: authenticated sender edits their own message via socket
+    socket.on("edit_message", async ({ messageId, conversationId, message: newText }) => {
+      if (!messageId || !conversationId || !newText) return;
+      const allowed = await isConversationParticipant(conversationId, socket.userId);
+      if (!allowed) return;
+      try {
+        const result = await pool.query(
+          `UPDATE messages SET message = $1, edited_at = NOW()
+           WHERE message_id = $2 AND sender_id::text = $3::text AND deleted_at IS NULL
+           RETURNING message_id AS id, conversation_id, sender_id, message, edited_at, created_at`,
+          [String(newText).trim(), messageId, socket.userId]
+        );
+        if (result.rows.length) {
+          io.to(`conv_${conversationId}`).emit("message_edited", result.rows[0]);
+        }
+      } catch (err) {
+        console.error("[Socket] edit_message error:", err.message);
+      }
+    });
+
+    // ==========================
+    // LIVE TOUR EVENTS
+    // ==========================
+
+    socket.on("join_live_tour", async ({ tourId }) => {
+      if (!tourId || !socket.userId) return;
+      const room = `live_tour_${tourId}`;
+      socket.join(room);
+      // track which live tours this socket is watching so disconnect can clean up
+      if (!socket.data._liveTourRooms) socket.data._liveTourRooms = new Set();
+      socket.data._liveTourRooms.add(tourId);
+
+      try {
+        const result = await pool.query(
+          `UPDATE live_tours
+           SET current_viewers = GREATEST(0, current_viewers + 1),
+               total_viewers   = total_viewers + 1,
+               peak_viewers    = GREATEST(peak_viewers, current_viewers + 1)
+           WHERE id = $1 AND is_live = TRUE
+           RETURNING current_viewers, total_viewers, peak_viewers`,
+          [tourId],
+        );
+        if (result.rows.length) {
+          io.to(room).emit("viewer_count_update", {
+            tourId,
+            ...result.rows[0],
+          });
+        }
+      } catch (err) {
+        console.warn("[LiveTour] join_live_tour DB error:", err.message);
+      }
+    });
+
+    socket.on("leave_live_tour", async ({ tourId }) => {
+      if (!tourId) return;
+      const room = `live_tour_${tourId}`;
+      socket.leave(room);
+      socket.data._liveTourRooms?.delete(tourId);
+
+      try {
+        const result = await pool.query(
+          `UPDATE live_tours
+           SET current_viewers = GREATEST(0, current_viewers - 1)
+           WHERE id = $1
+           RETURNING current_viewers, total_viewers, peak_viewers`,
+          [tourId],
+        );
+        if (result.rows.length) {
+          io.to(room).emit("viewer_count_update", {
+            tourId,
+            ...result.rows[0],
+          });
+        }
+      } catch (err) {
+        console.warn("[LiveTour] leave_live_tour DB error:", err.message);
+      }
+    });
+
+    socket.on("live_comment", async ({ tourId, message }) => {
+      if (!tourId || !message || !socket.userId) return;
+
+      const trimmed = String(message).trim().slice(0, 500);
+      if (!trimmed) return;
+
+      // Per-socket rate limit: max 30 comments per minute
+      const now = Date.now();
+      if (!socket.data._commentRateWindow) socket.data._commentRateWindow = { count: 0, start: now };
+      const cw = socket.data._commentRateWindow;
+      if (now - cw.start > 60_000) { cw.count = 0; cw.start = now; }
+      cw.count += 1;
+      if (cw.count > 30) {
+        socket.emit("error", { message: "Comment rate limit exceeded. Please slow down." });
+        return;
+      }
+
+      try {
+        const userRes = await pool.query(
+          `SELECT COALESCE(name, email, 'Viewer') AS display_name, avatar_url
+           FROM users WHERE unique_id = $1 LIMIT 1`,
+          [socket.userId],
+        );
+        const userName = userRes.rows[0]?.display_name || "Viewer";
+        const userAvatar = userRes.rows[0]?.avatar_url || null;
+
+        const result = await pool.query(
+          `INSERT INTO live_tour_comments (tour_id, user_id, user_name, user_avatar, message)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, tour_id, user_id, user_name, user_avatar, message, created_at`,
+          [tourId, socket.userId, userName, userAvatar, trimmed],
+        );
+
+        io.to(`live_tour_${tourId}`).emit("new_live_comment", result.rows[0]);
+      } catch (err) {
+        console.error("[LiveTour] live_comment error:", err.message);
+      }
+    });
+
+    socket.on("live_reaction", async ({ tourId, reactionType }) => {
+      if (!tourId || !reactionType || !socket.userId) return;
+
+      const validReactions = new Set(["like", "love", "fire", "clap", "house", "interest"]);
+      if (!validReactions.has(reactionType)) return;
+
+      try {
+        await pool.query(
+          `INSERT INTO live_tour_reactions (tour_id, user_id, reaction_type)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (tour_id, user_id, reaction_type) DO NOTHING`,
+          [tourId, socket.userId, reactionType],
+        );
+      } catch (err) {
+        console.warn("[LiveTour] live_reaction DB:", err.message);
+      }
+
+      // Broadcast ephemeral animation to all viewers regardless of DB result
+      io.to(`live_tour_${tourId}`).emit("live_reaction_burst", {
+        tourId,
+        reactionType,
+        userId: socket.userId,
+      });
+    });
+
+    socket.on("delete_live_comment", async ({ tourId, commentId }) => {
+      if (!tourId || !commentId || !socket.userId) return;
+
+      try {
+        // Only comment owner or host may delete
+        const tourRes = await pool.query(
+          `SELECT host_id FROM live_tours WHERE id = $1 LIMIT 1`,
+          [tourId],
+        );
+        const isHost = tourRes.rows[0]?.host_id === socket.userId;
+
+        const result = await pool.query(
+          `UPDATE live_tour_comments
+           SET is_deleted = TRUE, deleted_by = $1
+           WHERE id = $2
+             AND ($3 = TRUE OR user_id::text = $1::text)
+           RETURNING id`,
+          [socket.userId, commentId, isHost],
+        );
+
+        if (result.rows.length) {
+          io.to(`live_tour_${tourId}`).emit("live_comment_deleted", { commentId });
+        }
+      } catch (err) {
+        console.error("[LiveTour] delete_live_comment error:", err.message);
+      }
+    });
+
     // ==========================
     // DISCONNECT
     // ==========================
-    socket.on("disconnect", () => {
+    socket.on("disconnect", async () => {
       console.log(`❌ Disconnected: ${socket.id} (user ${socket.userId})`);
       removePresence(io, socket);
+
+      // Decrement viewer count for any live tours this socket was watching
+      const rooms = socket.data._liveTourRooms;
+      if (rooms && rooms.size > 0) {
+        for (const tourId of rooms) {
+          try {
+            const result = await pool.query(
+              `UPDATE live_tours
+               SET current_viewers = GREATEST(0, current_viewers - 1)
+               WHERE id = $1
+               RETURNING current_viewers, total_viewers, peak_viewers`,
+              [tourId],
+            );
+            if (result.rows.length) {
+              io.to(`live_tour_${tourId}`).emit("viewer_count_update", {
+                tourId,
+                ...result.rows[0],
+              });
+            }
+          } catch {
+            // best-effort cleanup
+          }
+        }
+      }
     });
   });
 };

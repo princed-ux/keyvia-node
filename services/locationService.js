@@ -248,8 +248,14 @@ const osmPrecision = (item = {}) => {
 const normalizeOsmPlace = (item = {}) => {
   const address = item.address || {};
   const precision = osmPrecision(item);
+  // Nigerian roads often appear under `name` tag or `namedetails.name` rather than `road`
   const street = clean(
-    address.road || address.pedestrian || address.footway || address.path,
+    address.road ||
+    address.pedestrian ||
+    address.footway ||
+    address.path ||
+    item.namedetails?.name ||
+    item.name,
   );
   const title =
     compact(address.house_number, street) ||
@@ -286,6 +292,9 @@ const normalizeOsmPlace = (item = {}) => {
 };
 
 const isUsefulAutocompleteResult = (item = {}) => {
+  // Google already ranks predictions well; keep them all (predictions carry no
+  // address sub-fields, so the heuristics below would drop valid results).
+  if (item.provider === "google") return true;
   const precision = clean(item.precision).toLowerCase();
   if (["exact", "street", "neighborhood"].includes(precision)) return true;
   return Boolean(item.address?.street || item.address?.houseNumber || item.placeType === "PointOfInterest");
@@ -420,6 +429,282 @@ const awsReverse = async ({ lat, lng }) => {
   return (response.ResultItems || []).map(normalizeAwsPlace);
 };
 
+// ───────────────────────────────────────────────────────────────────────────
+// Google provider (Places Autocomplete + Place Details + Geocoding).
+// Uses the server-side key; results are normalized to the SAME shape as AWS/OSM
+// so the dispatchers, routes, and frontend are unchanged.
+// ───────────────────────────────────────────────────────────────────────────
+const GOOGLE_KEY =
+  process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_PLACES_API_KEY || "";
+
+const googleTypeToPrecision = (types = []) => {
+  const t = (types || []).map((x) => String(x).toLowerCase());
+  if (t.includes("street_address") || t.includes("premise") || t.includes("subpremise"))
+    return "exact";
+  if (t.includes("route") || t.includes("intersection")) return "street";
+  if (
+    t.includes("neighborhood") ||
+    t.some((x) => x.startsWith("sublocality")) ||
+    t.includes("point_of_interest") ||
+    t.includes("establishment")
+  )
+    return "neighborhood";
+  if (t.includes("locality") || t.includes("postal_code") || t.includes("postal_town"))
+    return "city";
+  return "approximate";
+};
+
+const googleLocationTypeToPrecision = (locType) => {
+  switch (String(locType || "").toUpperCase()) {
+    case "ROOFTOP":
+      return "exact";
+    case "RANGE_INTERPOLATED":
+      return "street";
+    case "GEOMETRIC_CENTER":
+      return "neighborhood";
+    default:
+      return "approximate";
+  }
+};
+
+const pickComponent = (components = [], type) => {
+  const c = (components || []).find(
+    (x) => Array.isArray(x.types) && x.types.includes(type),
+  );
+  return c ? clean(c.long_name) : "";
+};
+
+const normalizeGoogleGeocode = (result = {}) => {
+  const comps = result.address_components || [];
+  const loc = result.geometry?.location || {};
+  const houseNumber = pickComponent(comps, "street_number");
+  const street = pickComponent(comps, "route");
+  const neighborhood =
+    pickComponent(comps, "neighborhood") ||
+    pickComponent(comps, "sublocality") ||
+    pickComponent(comps, "sublocality_level_1");
+  const city =
+    pickComponent(comps, "locality") ||
+    pickComponent(comps, "postal_town") ||
+    pickComponent(comps, "administrative_area_level_2");
+  const state = pickComponent(comps, "administrative_area_level_1");
+  const country = pickComponent(comps, "country");
+  const postalCode = pickComponent(comps, "postal_code");
+  const precision = result.geometry?.location_type
+    ? googleLocationTypeToPrecision(result.geometry.location_type)
+    : googleTypeToPrecision(result.types);
+  const title =
+    compact(houseNumber, street) ||
+    clean(result.name) ||
+    clean(result.formatted_address);
+  const subtitle = compact(neighborhood, city, state, country);
+
+  return {
+    provider: "google",
+    placeId: clean(result.place_id),
+    label: clean(result.formatted_address) || compact(title, subtitle),
+    title: title || "Suggested location",
+    subtitle,
+    address: { houseNumber, street, neighborhood, city, state, country, postalCode },
+    latitude: Number.isFinite(Number(loc.lat)) ? String(loc.lat) : "",
+    longitude: Number.isFinite(Number(loc.lng)) ? String(loc.lng) : "",
+    precision,
+    confidence: confidenceFromPrecision(precision),
+    placeType: clean((result.types || [])[0]),
+    distanceMeters: null,
+  };
+};
+
+// Places API (New) autocomplete suggestion → normalized shape (no coords;
+// resolved to coords via Place Details on select).
+const normalizeGoogleNewPrediction = (pred = {}) => {
+  const sf = pred.structuredFormat || {};
+  const precision = googleTypeToPrecision(pred.types);
+  return {
+    provider: "google",
+    placeId: clean(pred.placeId),
+    label: clean(pred.text?.text),
+    title: clean(sf.mainText?.text) || clean(pred.text?.text) || "Suggested location",
+    subtitle: clean(sf.secondaryText?.text),
+    address: {
+      houseNumber: "",
+      street: "",
+      neighborhood: "",
+      city: "",
+      state: "",
+      country: "",
+      postalCode: "",
+    },
+    latitude: "",
+    longitude: "",
+    precision,
+    confidence: confidenceFromPrecision(precision),
+    placeType: clean((pred.types || [])[0]),
+    distanceMeters: null,
+  };
+};
+
+const pickNewComponent = (components = [], type) => {
+  const c = (components || []).find(
+    (x) => Array.isArray(x.types) && x.types.includes(type),
+  );
+  return c ? clean(c.longText) : "";
+};
+
+// Places API (New) Place Details → normalized shape (camelCase + longText).
+const normalizeGoogleNewPlace = (place = {}) => {
+  const comps = place.addressComponents || [];
+  const loc = place.location || {};
+  const houseNumber = pickNewComponent(comps, "street_number");
+  const street = pickNewComponent(comps, "route");
+  const neighborhood =
+    pickNewComponent(comps, "neighborhood") ||
+    pickNewComponent(comps, "sublocality") ||
+    pickNewComponent(comps, "sublocality_level_1");
+  const city =
+    pickNewComponent(comps, "locality") ||
+    pickNewComponent(comps, "postal_town") ||
+    pickNewComponent(comps, "administrative_area_level_2");
+  const state = pickNewComponent(comps, "administrative_area_level_1");
+  const country = pickNewComponent(comps, "country");
+  const postalCode = pickNewComponent(comps, "postal_code");
+  const precision = googleTypeToPrecision(place.types);
+  const title =
+    compact(houseNumber, street) ||
+    clean(place.displayName?.text) ||
+    clean(place.formattedAddress);
+  const subtitle = compact(neighborhood, city, state, country);
+
+  return {
+    provider: "google",
+    placeId: clean(place.id),
+    label: clean(place.formattedAddress) || compact(title, subtitle),
+    title: title || "Suggested location",
+    subtitle,
+    address: { houseNumber, street, neighborhood, city, state, country, postalCode },
+    latitude: Number.isFinite(Number(loc.latitude)) ? String(loc.latitude) : "",
+    longitude: Number.isFinite(Number(loc.longitude)) ? String(loc.longitude) : "",
+    precision,
+    confidence: confidenceFromPrecision(precision),
+    placeType: clean((place.types || [])[0]),
+    distanceMeters: null,
+  };
+};
+
+// Classic Geocoding API GET (returns HTTP 200 with a `status` field on errors).
+const googleGet = async (url, label) =>
+  withTimeout(async (signal) => {
+    const response = await fetch(url, { signal });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      console.warn(`[LocationService] ${label} HTTP ${response.status}`);
+      return null;
+    }
+    if (data?.status && !["OK", "ZERO_RESULTS"].includes(data.status)) {
+      console.warn(
+        `[LocationService] ${label}: ${data.status} ${data.error_message || ""}`.trim(),
+      );
+    }
+    return data;
+  }, label);
+
+// Places API (New) — REST endpoints under places.googleapis.com (error returns
+// an HTTP 4xx with an `error.message`). Used for autocomplete + place details.
+const googlePlacesNew = async ({ url, method = "GET", body = null, fieldMask }, label) =>
+  withTimeout(async (signal) => {
+    const headers = { "X-Goog-Api-Key": GOOGLE_KEY };
+    if (fieldMask) headers["X-Goog-FieldMask"] = fieldMask;
+    if (body) headers["Content-Type"] = "application/json";
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      console.warn(
+        `[LocationService] ${label}: ${data?.error?.message || `HTTP ${response.status}`}`,
+      );
+      return null;
+    }
+    return data;
+  }, label);
+
+const googleAutocomplete = async (params) => {
+  if (!GOOGLE_KEY) return [];
+  const countryIso = requireCountryIso(params.country).toLowerCase();
+  const lat = toNumber(params.lat);
+  const lng = toNumber(params.lng);
+  const radius = Number(params.radius || DEFAULT_RADIUS_METERS);
+
+  const body = {
+    input: compact(params.q, params.city, params.state, params.country),
+    includedRegionCodes: [countryIso],
+  };
+  if (lat !== null && lng !== null) {
+    body.locationBias = {
+      circle: {
+        center: { latitude: lat, longitude: lng },
+        radius: Number.isFinite(radius) ? radius : DEFAULT_RADIUS_METERS,
+      },
+    };
+  }
+
+  const data = await googlePlacesNew(
+    {
+      url: "https://places.googleapis.com/v1/places:autocomplete",
+      method: "POST",
+      body,
+    },
+    "Google Places (New) autocomplete",
+  );
+  const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+  return suggestions
+    .map((s) => s.placePrediction)
+    .filter(Boolean)
+    .map(normalizeGoogleNewPrediction);
+};
+
+const googleGeocode = async (params) => {
+  if (!GOOGLE_KEY) return [];
+
+  // Selected suggestion → resolve coords via Places API (New) Place Details.
+  if (params.placeId) {
+    const data = await googlePlacesNew(
+      {
+        url: `https://places.googleapis.com/v1/places/${encodeURIComponent(params.placeId)}`,
+        fieldMask: "id,location,formattedAddress,addressComponents,displayName,types",
+      },
+      "Google place details (New)",
+    );
+    return data?.id ? [normalizeGoogleNewPlace(data)] : [];
+  }
+
+  // Free-text address → classic Geocoding API.
+  const countryIso = requireCountryIso(params.country);
+  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+  url.searchParams.set(
+    "address",
+    compact(params.address || params.q, params.city, params.state, params.country),
+  );
+  url.searchParams.set("key", GOOGLE_KEY);
+  url.searchParams.set("components", `country:${countryIso}`);
+  const data = await googleGet(url, "Google geocode");
+  const results = Array.isArray(data?.results) ? data.results : [];
+  return results.map(normalizeGoogleGeocode);
+};
+
+const googleReverse = async ({ lat, lng }) => {
+  if (!GOOGLE_KEY) return [];
+  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+  url.searchParams.set("latlng", `${lat},${lng}`);
+  url.searchParams.set("key", GOOGLE_KEY);
+  const data = await googleGet(url, "Google reverse geocode");
+  const results = Array.isArray(data?.results) ? data.results : [];
+  return results.map(normalizeGoogleGeocode);
+};
+
 export const autocompleteLocation = async (params = {}) => {
   const q = clean(params.q);
   if (q.length < 2) return { results: [], cached: false };
@@ -435,7 +720,13 @@ export const autocompleteLocation = async (params = {}) => {
 
   let results = [];
 
-  if (LOCATION_PROVIDER === "aws") {
+  if (LOCATION_PROVIDER === "google") {
+    try {
+      results = await googleAutocomplete(params);
+    } catch (error) {
+      console.warn("[LocationService] Google autocomplete failed:", error?.message || error);
+    }
+  } else if (LOCATION_PROVIDER === "aws") {
     try {
       results = await awsAutocomplete(params);
     } catch (error) {
@@ -472,7 +763,13 @@ export const geocodeLocation = async (params = {}) => {
 
   let results = [];
 
-  if (LOCATION_PROVIDER === "aws") {
+  if (LOCATION_PROVIDER === "google") {
+    try {
+      results = await googleGeocode(params);
+    } catch (error) {
+      console.warn("[LocationService] Google geocode failed:", error?.message || error);
+    }
+  } else if (LOCATION_PROVIDER === "aws") {
     try {
       const awsResult = await awsGeocode(params);
       results = Array.isArray(awsResult) ? awsResult : [awsResult].filter(Boolean);
@@ -503,7 +800,13 @@ export const reverseLocation = async (params = {}) => {
 
   let results = [];
 
-  if (LOCATION_PROVIDER === "aws") {
+  if (LOCATION_PROVIDER === "google") {
+    try {
+      results = await googleReverse({ lat, lng });
+    } catch (error) {
+      console.warn("[LocationService] Google reverse failed:", error?.message || error);
+    }
+  } else if (LOCATION_PROVIDER === "aws") {
     try {
       results = await awsReverse({ lat, lng });
     } catch (error) {

@@ -128,11 +128,11 @@ router.post("/conversations/:convId/send", authenticate, async (req, res) => {
       : conv.rows[0].user1_id;
 
     const result = await pool.query(
-      `INSERT INTO messages (conversation_id, sender_id, recipient_id, content, message, product_id)
-       VALUES ($1, $2, $3, $4, $4, $5)
-       RETURNING id, conversation_id, sender_id, message,
+      `INSERT INTO messages (conversation_id, sender_id, message, product_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING message_id AS id, conversation_id, sender_id, message,
                  seen, product_id, TO_JSON(created_at) AS created_at`,
-      [convId, userId, recipientId, message.trim(), product_id || null],
+      [convId, userId, message.trim(), product_id || null],
     );
 
     await pool.query(

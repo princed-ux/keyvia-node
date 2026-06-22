@@ -158,6 +158,111 @@ router.put("/password", authenticateToken, async (req, res) => {
   }
 });
 
+// Update core account info (name, phone, bio) — writes directly to users table
+router.put("/profile-info", authenticateToken, async (req, res) => {
+  try {
+    const { name, phone, bio } = req.body;
+    const uid = req.user.unique_id;
+    const updates = [];
+    const values = [];
+
+    if (name !== undefined) {
+      values.push(String(name || "").trim());
+      updates.push(`name = $${values.length}`);
+    }
+    if (phone !== undefined) {
+      values.push(String(phone || "").trim() || null);
+      updates.push(`phone = $${values.length}`);
+    }
+    if (bio !== undefined) {
+      values.push(String(bio || "").trim() || null);
+      updates.push(`bio = $${values.length}`);
+    }
+
+    if (!updates.length) {
+      return res.status(400).json({ success: false, message: "No fields to update." });
+    }
+
+    values.push(uid);
+    await pool.query(
+      `UPDATE users SET ${updates.join(", ")}, updated_at = NOW() WHERE unique_id::text = $${values.length}::text`,
+      values,
+    );
+
+    const result = await pool.query(
+      "SELECT name, phone, bio FROM users WHERE unique_id::text = $1::text LIMIT 1",
+      [uid],
+    );
+
+    return res.json({ success: true, message: "Profile info updated.", user: result.rows[0] });
+  } catch (err) {
+    console.error("[Settings] profile-info update error:", err);
+    return res.status(500).json({ success: false, message: "Could not update profile info." });
+  }
+});
+
+// List active sessions for this user
+router.get("/sessions", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, created_at, last_used_at, device_info, ip_address
+       FROM refresh_tokens
+       WHERE user_id::text = $1::text
+       ORDER BY COALESCE(last_used_at, created_at) DESC`,
+      [req.user.unique_id],
+    );
+
+    return res.json({ success: true, sessions: result.rows });
+  } catch (err) {
+    // If last_used_at / device_info columns don't exist, return minimal data
+    try {
+      const fallback = await pool.query(
+        "SELECT id, created_at FROM refresh_tokens WHERE user_id::text = $1::text ORDER BY created_at DESC",
+        [req.user.unique_id],
+      );
+      return res.json({ success: true, sessions: fallback.rows });
+    } catch {
+      return res.status(500).json({ success: false, message: "Could not fetch sessions." });
+    }
+  }
+});
+
+// Revoke a specific session
+router.delete("/sessions/:id", authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      "DELETE FROM refresh_tokens WHERE id = $1 AND user_id::text = $2::text",
+      [req.params.id, req.user.unique_id],
+    );
+    return res.json({ success: true, message: "Session revoked." });
+  } catch (err) {
+    console.error("[Settings] revoke session error:", err);
+    return res.status(500).json({ success: false, message: "Could not revoke session." });
+  }
+});
+
+// Revoke all OTHER sessions (keep current)
+router.delete("/sessions", authenticateToken, async (req, res) => {
+  try {
+    const currentToken = req.cookies?.refreshToken;
+    if (currentToken) {
+      await pool.query(
+        "DELETE FROM refresh_tokens WHERE user_id::text = $1::text AND token != $2",
+        [req.user.unique_id, currentToken],
+      );
+    } else {
+      await pool.query(
+        "DELETE FROM refresh_tokens WHERE user_id::text = $1::text",
+        [req.user.unique_id],
+      );
+    }
+    return res.json({ success: true, message: "All other sessions revoked." });
+  } catch (err) {
+    console.error("[Settings] revoke all sessions error:", err);
+    return res.status(500).json({ success: false, message: "Could not revoke sessions." });
+  }
+});
+
 router.get("/:section", authenticateToken, async (req, res) => {
   try {
     const column = SECTION_COLUMNS[req.params.section];

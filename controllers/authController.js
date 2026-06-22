@@ -1,9 +1,11 @@
 import bcrypt from "bcrypt";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { pool } from "../db.js";
 import { generateSpecialId } from "../utils/generateId.js";
 import {
   sendSignupOtpEmail,
+  sendLoginOtpEmail,
   sendPasswordResetEmail,
 } from "../utils/sendEmail.js";
 import {
@@ -19,6 +21,7 @@ import {
 } from "@aws-sdk/client-rekognition";
 import { getAiSettings } from "../services/aiSettingsService.js";
 import { analyzeVerification } from "../services/aiVerificationService.js";
+import settingsService from "../services/settingsService.js";
 
 // ================= ENV =================
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
@@ -41,6 +44,39 @@ const signAccessToken = (user) => {
   );
 };
 
+
+// ── Trusted-device helpers ────────────────────────────────────────────────
+const hashDeviceToken = (raw) =>
+  crypto.createHash("sha256").update(String(raw)).digest("hex");
+
+const parseDeviceLabel = (ua = "") => {
+  if (/iPhone|iPad/i.test(ua)) return "Safari on iOS";
+  if (/Android/i.test(ua))     return "Chrome on Android";
+  if (/Chrome/i.test(ua))      return "Chrome on Desktop";
+  if (/Firefox/i.test(ua))     return "Firefox";
+  if (/Safari/i.test(ua))      return "Safari";
+  return "Unknown Browser";
+};
+
+// Shared user payload shape — used by both OTP path and trusted-device path
+const buildUserPayload = (user) => ({
+  id: user.id,
+  name: user.name,
+  email: user.email,
+  role: mapEnumToRole(user.role),
+  unique_id: user.unique_id,
+  avatar_url: user.avatar_url,
+  is_super_admin: user.is_super_admin,
+  is_admin: user.is_admin,
+  phone_verified: user.phone_verified,
+  special_id: user.special_id,
+  verification_status: user.verification_status || "new",
+  linked_agency_id: user.linked_agency_id || null,
+  is_solo_agent: user.is_solo_agent,
+  country: user.country || null,
+  verification_country: user.verification_country || null,
+});
+// ─────────────────────────────────────────────────────────────────────────
 
 const buildPublicMediaUrl = (value) => {
   if (!value) return null;
@@ -180,6 +216,19 @@ export const register = async (req, res) => {
 
   if (!name || !email || !password) {
     return res.status(400).json({ message: "All fields are required." });
+  }
+
+  // B2: enforce the allow_new_registrations platform setting.
+  try {
+    const registrationsOpen = await settingsService.getBool("allow_new_registrations");
+    if (!registrationsOpen) {
+      return res.status(403).json({
+        message: "New registrations are currently closed. Please check back later.",
+        code: "REGISTRATIONS_CLOSED",
+      });
+    }
+  } catch {
+    // If the setting can't be read, fail open (don't block signups on a settings glitch).
   }
 
   try {
@@ -403,6 +452,60 @@ export const resendSignupOtp = async (req, res) => {
       return res.status(500).json({
         message: "Could not send verification email. Please try again later.",
       });
+    }
+
+    return res.status(500).json({ message: "Server error." });
+  }
+};
+
+// ===================================================
+// 3b. RESEND LOGIN OTP
+// ===================================================
+export const resendLoginOtp = async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    if (!email) {
+      return res.status(400).json({ message: "Email required." });
+    }
+
+    const cleanEmail = normalizeEmail(email);
+
+    // Confirm account exists before generating a code (don't leak existence via timing)
+    const userCheck = await pool.query(
+      "SELECT unique_id FROM users WHERE email = $1 LIMIT 1",
+      [cleanEmail],
+    );
+    if (!userCheck.rows.length) {
+      return res.status(400).json({ message: "Invalid request." });
+    }
+
+    const code     = Math.floor(100000 + Math.random() * 900000).toString();
+    const codeHash = await bcrypt.hash(code, 10);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await pool.query(
+      "UPDATE email_otps SET used=true WHERE email=$1 AND purpose='login'",
+      [cleanEmail],
+    );
+
+    await pool.query(
+      `INSERT INTO email_otps (email, code_hash, expires_at, purpose)
+       VALUES ($1, $2, $3, 'login')`,
+      [cleanEmail, codeHash, expiresAt],
+    );
+
+    await sendLoginOtpEmail(cleanEmail, code);
+
+    return res.json({ success: true, message: "New code sent." });
+  } catch (err) {
+    console.error("[ResendLoginOTP]", err);
+
+    if (isTransientConnectionError(err)) {
+      return sendAuthConnectionError(
+        res,
+        "Could not resend your verification code. Please try again.",
+      );
     }
 
     return res.status(500).json({ message: "Server error." });
@@ -775,10 +878,14 @@ export const setRole = async (req, res) => {
 };
 
 // ===================================================
-// 6. LOGIN
+// 6. LOGIN  (step 1 — verify credentials, send OTP)
 // ===================================================
 export const login = async (req, res) => {
   const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email and password are required." });
+  }
 
   try {
     const cleanEmail = normalizeEmail(email);
@@ -797,6 +904,170 @@ export const login = async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials." });
     }
 
+    // Ban check
+    if (user.is_banned) {
+      if (!user.banned_until || new Date() < new Date(user.banned_until)) {
+        const message = user.banned_until
+          ? `Your account is suspended until ${new Date(user.banned_until).toLocaleDateString()}.`
+          : "Your account has been permanently banned.";
+        return res.status(403).json({ message, code: "ACCOUNT_BANNED" });
+      }
+      // Temporary ban expired — auto-lift
+      await pool.query(
+        "UPDATE users SET is_banned=false, ban_reason=NULL, banned_until=NULL WHERE unique_id=$1",
+        [user.unique_id]
+      );
+    }
+
+    // ── Trusted-device shortcut ──────────────────────────────────────────
+    // If the client sends a valid device token that was issued after a prior
+    // OTP verification, skip OTP entirely and issue tokens directly.
+    const rawDeviceToken = req.headers["x-device-token"];
+    if (rawDeviceToken) {
+      try {
+        const tokenHash = hashDeviceToken(rawDeviceToken);
+        const trusted = await pool.query(
+          `SELECT id FROM trusted_devices
+           WHERE token_hash = $1 AND user_id = $2 AND expires_at > NOW()
+           LIMIT 1`,
+          [tokenHash, user.unique_id],
+        );
+
+        if (trusted.rows.length > 0) {
+          // Extend rolling 30-day window on every active use
+          await pool.query(
+            `UPDATE trusted_devices
+             SET last_used_at = NOW(), expires_at = NOW() + INTERVAL '30 days'
+             WHERE id = $1`,
+            [trusted.rows[0].id],
+          );
+
+          const accessToken  = signAccessToken(user);
+          const refreshToken = jwt.sign(
+            { unique_id: user.unique_id },
+            REFRESH_TOKEN_SECRET,
+            { expiresIn: "45d" },
+          );
+
+          await pool.query("DELETE FROM refresh_tokens WHERE user_id=$1", [user.unique_id]);
+          await pool.query(
+            `INSERT INTO refresh_tokens (user_id, token, ip_address, device_info)
+             VALUES ($1, $2, $3, $4)`,
+            [user.unique_id, refreshToken, req.ip, req.headers["user-agent"] || null],
+          );
+
+          res.cookie("refreshToken", refreshToken, {
+            httpOnly: true,
+            sameSite: "Lax",
+            secure: process.env.NODE_ENV === "production",
+            maxAge: 45 * 24 * 60 * 60 * 1000,
+          });
+
+          return res.json({
+            success: true,
+            requiresOtp: false,
+            accessToken,
+            user: buildUserPayload(user),
+          });
+        }
+      } catch (deviceErr) {
+        // Non-fatal — fall through to normal OTP path
+        console.warn("[Login] Trusted-device check failed:", deviceErr.message);
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────
+
+    // Generate 6-digit OTP, store hashed
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const codeHash = await bcrypt.hash(code, 10);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+
+    await pool.query(
+      "UPDATE email_otps SET used=true WHERE email=$1 AND purpose='login'",
+      [cleanEmail]
+    );
+    await pool.query(
+      `INSERT INTO email_otps (email, code_hash, expires_at, purpose)
+       VALUES ($1, $2, $3, 'login')`,
+      [cleanEmail, codeHash, expiresAt]
+    );
+
+    await sendLoginOtpEmail(cleanEmail, code);
+
+    return res.json({
+      success: true,
+      requiresOtp: true,
+      message: "Verification code sent to your email.",
+    });
+  } catch (err) {
+    console.error("[Login]", err);
+
+    if (isTransientConnectionError(err)) {
+      return sendAuthConnectionError(res, "Login failed due to a connection issue. Please try again.");
+    }
+
+    return res.status(500).json({ message: "Server error." });
+  }
+};
+
+// ===================================================
+// 6b. VERIFY LOGIN OTP  (step 2 — exchange OTP for tokens)
+// ===================================================
+export const verifyLoginOtp = async (req, res) => {
+  const { email, code } = req.body;
+
+  if (!email || !code) {
+    return res.status(400).json({ message: "Email and code are required." });
+  }
+
+  try {
+    const cleanEmail = normalizeEmail(email);
+    const cleanCode = String(code).trim();
+
+    const otpRes = await pool.query(
+      `SELECT * FROM email_otps
+       WHERE email=$1 AND used=false AND purpose='login'
+       ORDER BY created_at DESC LIMIT 1`,
+      [cleanEmail]
+    );
+
+    if (!otpRes.rows.length) {
+      return res.status(400).json({ message: "Invalid or expired code." });
+    }
+
+    const otp = otpRes.rows[0];
+
+    if (new Date() > otp.expires_at) {
+      return res.status(400).json({ message: "Code has expired. Please request a new code." });
+    }
+
+    // Brute-force guard — max 5 wrong attempts per code
+    if ((otp.attempts || 0) >= 5) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many incorrect attempts. Please request a new code.",
+        code: "OTP_MAX_ATTEMPTS",
+      });
+    }
+
+    const valid = await bcrypt.compare(cleanCode, otp.code_hash);
+    if (!valid) {
+      await pool.query(
+        "UPDATE email_otps SET attempts = attempts + 1 WHERE id = $1",
+        [otp.id],
+      );
+      return res.status(400).json({ message: "Invalid code." });
+    }
+
+    await pool.query("UPDATE email_otps SET used=true WHERE id=$1", [otp.id]);
+
+    const userRes = await pool.query("SELECT * FROM users WHERE email=$1 LIMIT 1", [cleanEmail]);
+    if (!userRes.rows.length) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    const user = userRes.rows[0];
+
     const accessToken = signAccessToken(user);
     const refreshToken = jwt.sign(
       { unique_id: user.unique_id },
@@ -804,12 +1075,11 @@ export const login = async (req, res) => {
       { expiresIn: "45d" }
     );
 
-    await pool.query("DELETE FROM refresh_tokens WHERE user_id=$1", [
-      user.unique_id,
-    ]);
+    await pool.query("DELETE FROM refresh_tokens WHERE user_id=$1", [user.unique_id]);
     await pool.query(
-      "INSERT INTO refresh_tokens (user_id, token) VALUES ($1,$2)",
-      [user.unique_id, refreshToken]
+      `INSERT INTO refresh_tokens (user_id, token, ip_address, device_info)
+       VALUES ($1, $2, $3, $4)`,
+      [user.unique_id, refreshToken, req.ip, req.headers["user-agent"] || null],
     );
 
     res.cookie("refreshToken", refreshToken, {
@@ -819,26 +1089,32 @@ export const login = async (req, res) => {
       maxAge: 45 * 24 * 60 * 60 * 1000,
     });
 
+    // Issue a trusted-device token so future logins from this browser skip OTP
+    const rawDeviceToken = crypto.randomBytes(32).toString("hex");
+    await pool.query(
+      `INSERT INTO trusted_devices (user_id, token_hash, device_label, ip_address, last_used_at, expires_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '30 days')`,
+      [
+        user.unique_id,
+        hashDeviceToken(rawDeviceToken),
+        parseDeviceLabel(req.headers["user-agent"]),
+        req.ip,
+      ],
+    );
+
     return res.json({
       success: true,
       accessToken,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: mapEnumToRole(user.role),
-        unique_id: user.unique_id,
-        avatar_url: user.avatar_url,
-        is_super_admin: user.is_super_admin,
-        phone_verified: user.phone_verified,
-        special_id: user.special_id,
-        verification_status: user.verification_status || "new",
-        linked_agency_id: user.linked_agency_id || null,
-        is_solo_agent: user.is_solo_agent,
-      },
+      deviceToken: rawDeviceToken,
+      user: buildUserPayload(user),
     });
   } catch (err) {
-    console.error("[Login]", err);
+    console.error("[VerifyLoginOtp]", err);
+
+    if (isTransientConnectionError(err)) {
+      return sendAuthConnectionError(res, "Could not verify your code. Please try again.");
+    }
+
     return res.status(500).json({ message: "Server error." });
   }
 };
@@ -866,31 +1142,81 @@ export const refresh = async (req, res) => {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
+  const client = await pool.connect();
   try {
-    const foundToken = await pool.query(
-      "SELECT * FROM refresh_tokens WHERE token=$1",
+    await client.query("BEGIN");
+
+    const foundToken = await client.query(
+      "SELECT * FROM refresh_tokens WHERE token=$1 FOR UPDATE",
       [cookies.refreshToken]
     );
 
     if (!foundToken.rows.length) {
+      await client.query("ROLLBACK");
+      // Clear the stale cookie so the client doesn't keep retrying
+      res.clearCookie("refreshToken");
       return res.status(403).json({ message: "Forbidden" });
     }
 
     const payload = jwt.verify(cookies.refreshToken, REFRESH_TOKEN_SECRET);
-    const userRes = await pool.query("SELECT * FROM users WHERE unique_id=$1", [
+    const userRes = await client.query("SELECT * FROM users WHERE unique_id=$1", [
       payload.unique_id,
     ]);
 
     const user = userRes.rows[0];
-
     if (!user) {
+      await client.query("ROLLBACK");
       return res.status(403).json({ message: "Forbidden" });
     }
 
+    // Rotate: delete the used token, issue a fresh one
+    await client.query("DELETE FROM refresh_tokens WHERE token=$1", [cookies.refreshToken]);
+
+    const newRefreshToken = jwt.sign(
+      { unique_id: user.unique_id },
+      REFRESH_TOKEN_SECRET,
+      { expiresIn: "45d" }
+    );
+    await client.query(
+      "INSERT INTO refresh_tokens (user_id, token, ip_address, device_info) VALUES ($1, $2, $3, $4)",
+      [user.unique_id, newRefreshToken, req.ip, req.headers["user-agent"] || null]
+    );
+
+    await client.query("COMMIT");
+
+    res.cookie("refreshToken", newRefreshToken, {
+      httpOnly: true,
+      sameSite: "Lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 45 * 24 * 60 * 60 * 1000,
+    });
+
     const accessToken = signAccessToken(user);
-    return res.json({ accessToken });
+    return res.json({
+      accessToken,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: mapEnumToRole(user.role),
+        unique_id: user.unique_id,
+        avatar_url: user.avatar_url,
+        is_super_admin: user.is_super_admin,
+        is_admin: user.is_admin,
+        phone_verified: user.phone_verified,
+        special_id: user.special_id,
+        verification_status: user.verification_status || "new",
+        linked_agency_id: user.linked_agency_id || null,
+        is_solo_agent: user.is_solo_agent,
+        country: user.country || null,
+        verification_country: user.verification_country || null,
+      },
+    });
   } catch {
+    await client.query("ROLLBACK").catch(() => {});
     return res.status(403).json({ message: "Forbidden" });
+  } finally {
+    client.release();
   }
 };
 
@@ -954,7 +1280,7 @@ export const resetPassword = async (req, res) => {
     const hashed = await bcrypt.hash(newPassword, 10);
 
     const updated = await pool.query(
-      "UPDATE users SET password=$1 WHERE email=$2",
+      "UPDATE users SET password=$1 WHERE email=$2 RETURNING unique_id",
       [hashed, payload.email]
     );
 
@@ -962,9 +1288,16 @@ export const resetPassword = async (req, res) => {
       return res.status(400).json({ message: "User not found." });
     }
 
+    // Revoke all active sessions and trusted devices — forces full re-auth
+    const uid = updated.rows[0]?.unique_id;
+    if (uid) {
+      await pool.query("DELETE FROM refresh_tokens  WHERE user_id = $1", [uid]);
+      await pool.query("DELETE FROM trusted_devices WHERE user_id = $1", [uid]);
+    }
+
     return res.json({
       success: true,
-      message: "Password reset successful.",
+      message: "Password reset successful. Please log in again.",
     });
   } catch {
     return res.status(400).json({ message: "Invalid token." });
@@ -1682,18 +2015,56 @@ const docColumn =
     setImmediate(async () => {
       try {
         const aiSettings = await getAiSettings();
-        if (aiSettings.ai_auto_scan_verifications) {
-          const userProfile = await pool.query(
-            `SELECT u.unique_id, u.name AS full_name, u.email, u.role, p.avatar_url, p.legal_document_url AS document_url
-             FROM users u LEFT JOIN profiles p ON p.unique_id = u.unique_id WHERE u.unique_id = $1`,
-            [userId],
-          );
-          if (userProfile.rows[0]) {
-            await analyzeVerification(userProfile.rows[0]);
-          }
+        if (!aiSettings.ai_auto_scan_verifications) return;
+
+        const { rows: [profile] } = await pool.query(
+          `SELECT u.unique_id, COALESCE(p.full_name, u.name) AS full_name, u.email, u.role,
+                  COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
+                  COALESCE(u.license_document_url, u.identity_document_url) AS document_url,
+                  COALESCE(bp.company_name, u.brokerage_name) AS company_name
+           FROM users u
+           LEFT JOIN profiles p ON p.unique_id::text = u.unique_id::text
+           LEFT JOIN brokerage_profiles bp ON bp.unique_id::text = u.unique_id::text
+           WHERE u.unique_id = $1`,
+          [userId],
+        );
+        if (!profile) return;
+
+        const report = await analyzeVerification(profile);
+        const score = Number(report?.score || 0);
+        const flags = Array.isArray(report?.flags) ? report.flags : [];
+        const shouldAutoApprove = aiSettings.ai_auto_approve_low_risk !== false;
+        const shouldAutoReject = aiSettings.ai_auto_reject_high_risk !== false;
+
+        let newStatus = null;
+        let isVerified = null;
+        let rejectionReason = null;
+
+        if (score >= 80 && shouldAutoApprove) {
+          newStatus = "verified";
+          isVerified = true;
+        } else if (score <= 35 && shouldAutoReject) {
+          newStatus = "rejected";
+          isVerified = false;
+          rejectionReason = flags.length ? flags.join(" | ") : "Rejected by AI moderation";
         }
-      } catch {
-        // AI verification scan must never block submission
+
+        if (newStatus) {
+          await pool.query(
+            `UPDATE users SET verification_status = $1, is_verified = $2,
+             rejection_reason = COALESCE($3, rejection_reason),
+             risk_score = $4, ai_risk_notes = $5, updated_at = NOW()
+             WHERE unique_id = $6`,
+            [newStatus, isVerified, rejectionReason, score, JSON.stringify(flags), userId],
+          );
+        } else {
+          await pool.query(
+            `UPDATE users SET risk_score = $1, ai_risk_notes = $2, updated_at = NOW() WHERE unique_id = $3`,
+            [score, JSON.stringify(flags), userId],
+          );
+        }
+      } catch (err) {
+        console.warn("[AI verification auto-scan]", err?.message);
       }
     });
 
@@ -1745,6 +2116,38 @@ const docColumn =
 // ===================================================
 // 13. DELETE TEST USER
 // ===================================================
+// Step-up re-authentication (B2). An admin re-enters their password to obtain a
+// short-lived token used for sensitive actions when the security setting is on.
+export const adminReauth = async (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (!password) {
+      return res.status(400).json({ message: "Password is required." });
+    }
+    const r = await pool.query(
+      "SELECT password FROM users WHERE unique_id = $1 LIMIT 1",
+      [req.user?.unique_id],
+    );
+    const hash = r.rows[0]?.password;
+    if (!hash) {
+      return res.status(400).json({ message: "Unable to verify your password." });
+    }
+    const ok = await bcrypt.compare(password, hash);
+    if (!ok) {
+      return res.status(401).json({ message: "Incorrect password." });
+    }
+    const reauthToken = jwt.sign(
+      { unique_id: req.user.unique_id, purpose: "admin_reauth" },
+      ACCESS_TOKEN_SECRET,
+      { expiresIn: "5m" },
+    );
+    return res.json({ success: true, reauth_token: reauthToken, expires_in: 300 });
+  } catch (err) {
+    console.error("[adminReauth]", err);
+    return res.status(500).json({ message: "Re-authentication failed." });
+  }
+};
+
 export const deleteTestUser = async (req, res) => {
   // SAFETY: this is a dev-only helper for reusing test emails. It must NEVER be
   // callable in production (it deletes a user with no auth). Auto-disabled when

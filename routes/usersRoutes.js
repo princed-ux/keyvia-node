@@ -9,15 +9,24 @@ router.get("/search", authenticateToken, async (req, res) => {
   const q = `%${query}%`;
 
   try {
+    const requesterRole = String(req.user?.role || "").toLowerCase();
+    const isAdmin = requesterRole === "admin" || requesterRole === "super_admin" || requesterRole === "superadmin" || req.user?.is_admin || req.user?.is_super_admin;
+
+    // Non-admin users must never see admin/super_admin accounts in search results
+    const adminFilter = isAdmin ? "" : `AND u.role NOT IN ('admin', 'super_admin', 'superadmin')`;
+
     const { rows } = await pool.query(
       `SELECT u.id, u.name AS full_name, u.unique_id, u.special_id, u.email,
               p.username, p.avatar_url
        FROM users u
        LEFT JOIN profiles p ON p.unique_id = u.unique_id
-       WHERE u.name ILIKE $1
+       WHERE (
+         u.name ILIKE $1
           OR p.username ILIKE $1
-          OR u.unique_id ILIKE $1
-          OR u.special_id ILIKE $1
+          OR u.unique_id::text ILIKE $1
+          OR u.special_id::text ILIKE $1
+       )
+       ${adminFilter}
        ORDER BY u.name ASC
        LIMIT 20`,
       [q]
@@ -66,7 +75,25 @@ router.get("/last-seen/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// 4. Block User
+// 4. Register / update FCM device token
+router.post("/device-token", authenticateToken, async (req, res) => {
+  const { token } = req.body;
+  if (!token || typeof token !== "string" || token.trim().length < 10) {
+    return res.status(400).json({ error: "Valid FCM token required" });
+  }
+  try {
+    await pool.query(
+      `UPDATE users SET fcm_token = $1 WHERE unique_id = $2`,
+      [token.trim(), req.user.unique_id],
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Device token error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 5. Block User
 router.post("/block", authenticateToken, async (req, res) => {
   const blocker_id = req.user.unique_id;
   const { blocked_id } = req.body;

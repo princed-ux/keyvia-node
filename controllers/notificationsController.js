@@ -1,5 +1,9 @@
 import crypto from "crypto";
 import { pool } from "../db.js";
+import {
+  sendListingSubmittedEmail,
+  sendListingStatusEmail,
+} from "../utils/emailService.js";
 
 let notificationColumnsCache = null;
 
@@ -10,6 +14,21 @@ const isUuid = (value) => UUID_RE.test(String(value || ""));
 
 const getUserId = (req) =>
   req.user?.unique_id || req.user?.id || req.headers["x-user-id"] || null;
+
+// Resolve a recipient's email + name for transactional emails. Returns null on
+// any failure so callers can treat email as best-effort (never blocks in-app).
+const lookupUserContact = async (userId) => {
+  if (!userId) return null;
+  try {
+    const r = await pool.query(
+      `SELECT email, name FROM users WHERE unique_id::text = $1::text LIMIT 1`,
+      [String(userId)],
+    );
+    return r.rows[0] || null;
+  } catch {
+    return null;
+  }
+};
 
 const getNotificationColumns = async () => {
   if (notificationColumnsCache) return notificationColumnsCache;
@@ -242,6 +261,21 @@ export const notifyListingSubmitted = async (listing = {}, options = {}) => {
   const recipientId =
     listing.uploaded_by_id || listing.agent_unique_id || listing.created_by;
 
+  // Best-effort confirmation email (decoupled from the in-app notification).
+  lookupUserContact(recipientId)
+    .then((contact) => {
+      if (!contact?.email) return null;
+      return sendListingSubmittedEmail({
+        email: contact.email,
+        name: contact.name,
+        listingTitle: listing.title,
+        productId: listing.product_id,
+      });
+    })
+    .catch((err) =>
+      console.warn("[Notifications] listing submitted email skipped:", err?.message),
+    );
+
   return createNotification({
     io: options.io,
     recipientId,
@@ -287,6 +321,23 @@ export const notifyListingStatusUpdate = async ({
       : normalizedStatus === "rejected"
         ? `Your listing "${listing.title || listing.product_id}" was rejected${reason ? `: ${reason}` : "."}`
         : `Your listing "${listing.title || listing.product_id}" status changed to ${normalizedStatus || "pending"}.`;
+
+  // Best-effort status email (decoupled from the in-app notification).
+  lookupUserContact(recipientId)
+    .then((contact) => {
+      if (!contact?.email) return null;
+      return sendListingStatusEmail({
+        email: contact.email,
+        name: contact.name,
+        listingTitle: listing.title || listing.product_id,
+        productId: listing.product_id,
+        status: normalizedStatus,
+        reason,
+      });
+    })
+    .catch((err) =>
+      console.warn("[Notifications] listing status email skipped:", err?.message),
+    );
 
   return createNotification({
     io,

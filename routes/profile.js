@@ -7,6 +7,7 @@ import {
   getProfile,
   updateProfile,
   updateProfileAvatar,
+  updateProfileCover,
   getPublicProfile,
   getPublicAgentProfile,
   getSocialOwnerProfile,
@@ -40,6 +41,14 @@ router.put(
   ensureProfile,
   upload.single("avatar"),
   updateProfileAvatar,
+);
+
+router.put(
+  "/cover",
+  authenticateAndAttachUser,
+  ensureProfile,
+  upload.single("cover"),
+  updateProfileCover,
 );
 
 // =====================================================

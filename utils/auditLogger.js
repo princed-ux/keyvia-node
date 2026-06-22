@@ -40,6 +40,23 @@ export const logAdminAction = async (
 };
 
 /**
+ * Request-aware audit helper — captures admin id, admin name and IP from the
+ * request so callers don't have to thread them through manually.
+ * @param {object} req - Express request (must have req.user)
+ */
+export const auditLog = async (req, action, targetType, targetId, changes = {}) => {
+  const adminId = req?.user?.unique_id || null;
+  const adminName = req?.user?.name || req?.user?.email || null;
+  const ip =
+    (req?.headers?.["x-forwarded-for"] || "").split(",")[0].trim() ||
+    req?.ip ||
+    req?.socket?.remoteAddress ||
+    null;
+
+  return logAdminAction(adminId, action, targetType, targetId, changes, adminName, ip);
+};
+
+/**
  * Log rate limit violation
  * @param {string} userId - The ID of the user being rate limited
  * @param {string} endpoint - The endpoint that was rate limited

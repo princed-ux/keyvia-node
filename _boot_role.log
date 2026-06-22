@@ -1,0 +1,69 @@
+✅ Connected to AWS PostgreSQL
+✅ Connected to PostgreSQL
+🚀 Server + Socket.IO running on http://localhost:5055
+⚠️ Rate limiting is disabled in development mode.
+🔁 Subscription renewal job started
+🔔 System alert checks started (every 30 min)
+🔁 Checking due subscriptions...
+✅ Subscription renewal check done: 0
+2026-06-04 21:32:08 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:08 +0000] "GET /health HTTP/1.1" 503 105 "-" "curl/8.18.0"[39m
+2026-06-04 21:32:14 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:14 +0000] "GET /health HTTP/1.1" 503 105 "-" "curl/8.18.0"[39m
+2026-06-04 21:32:20 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:20 +0000] "GET /health HTTP/1.1" 503 105 "-" "curl/8.18.0"[39m
+2026-06-04 21:32:26 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:26 +0000] "GET /health HTTP/1.1" 503 105 "-" "curl/8.18.0"[39m
+2026-06-04 21:32:31 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:31 +0000] "GET /health HTTP/1.1" 503 105 "-" "curl/8.18.0"[39m
+2026-06-04 21:32:37 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:37 +0000] "GET /api/admin/settings HTTP/1.1" 503 105 "-" "node"[39m
+2026-06-04 21:32:37 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:37 +0000] "GET /api/admin/settings HTTP/1.1" 503 105 "-" "node"[39m
+2026-06-04 21:32:37 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:37 +0000] "PUT /api/admin/settings HTTP/1.1" 503 105 "-" "node"[39m
+2026-06-04 21:32:38 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:38 +0000] "PUT /api/admin/settings HTTP/1.1" 503 105 "-" "node"[39m
+2026-06-04 21:32:38 [[32minfo[39m]: [32m::1 - - [04/Jun/2026:20:32:38 +0000] "PUT /api/admin/settings HTTP/1.1" 503 105 "-" "node"[39m
+checkUserMilestones error: Error: Connection terminated due to connection timeout
+    at C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg-pool\index.js:45:11
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async checkUserMilestones (file:///C:/Users/HP/Documents/keyvia-project/keyvia-node/services/systemAlertService.js:44:20)
+    at async Promise.allSettled (index 0)
+    at async Timeout.runSystemChecks [as _onTimeout] (file:///C:/Users/HP/Documents/keyvia-project/keyvia-node/services/systemAlertService.js:139:3) {
+  [cause]: Error: Connection terminated unexpectedly
+      at Connection.<anonymous> (C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg\lib\client.js:180:73)
+      at Object.onceWrapper (node:events:622:28)
+      at Connection.emit (node:events:508:28)
+      at Socket.<anonymous> (C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg\lib\connection.js:61:12)
+      at Socket.emit (node:events:508:28)
+      at TCP.<anonymous> (node:net:346:12)
+}
+🔁 Checking due subscriptions...
+[Renewal] run failed: Connection terminated due to connection timeout
+✅ Subscription renewal check done: 0
+checkUserMilestones error: Error: Connection terminated due to connection timeout
+    at C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg-pool\index.js:45:11
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async checkUserMilestones (file:///C:/Users/HP/Documents/keyvia-project/keyvia-node/services/systemAlertService.js:44:20)
+    at async Promise.allSettled (index 0)
+    at async Timeout.runSystemChecks [as _onTimeout] (file:///C:/Users/HP/Documents/keyvia-project/keyvia-node/services/systemAlertService.js:139:3) {
+  [cause]: Error: Connection terminated unexpectedly
+      at Connection.<anonymous> (C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg\lib\client.js:180:73)
+      at Object.onceWrapper (node:events:622:28)
+      at Connection.emit (node:events:508:28)
+      at Socket.<anonymous> (C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg\lib\connection.js:61:12)
+      at Socket.emit (node:events:508:28)
+      at TCP.<anonymous> (node:net:346:12)
+}
+🔁 Checking due subscriptions...
+[Renewal] run failed: Connection terminated due to connection timeout
+✅ Subscription renewal check done: 0
+checkUserMilestones error: Error: Connection terminated due to connection timeout
+    at C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg-pool\index.js:45:11
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async checkUserMilestones (file:///C:/Users/HP/Documents/keyvia-project/keyvia-node/services/systemAlertService.js:44:20)
+    at async Promise.allSettled (index 0)
+    at async Timeout.runSystemChecks [as _onTimeout] (file:///C:/Users/HP/Documents/keyvia-project/keyvia-node/services/systemAlertService.js:139:3) {
+  [cause]: Error: Connection terminated unexpectedly
+      at Connection.<anonymous> (C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg\lib\client.js:180:73)
+      at Object.onceWrapper (node:events:622:28)
+      at Connection.emit (node:events:508:28)
+      at Socket.<anonymous> (C:\Users\HP\Documents\keyvia-project\keyvia-node\node_modules\pg\lib\connection.js:61:12)
+      at Socket.emit (node:events:508:28)
+      at TCP.<anonymous> (node:net:346:12)
+}
+🔁 Checking due subscriptions...
+[Renewal] run failed: Connection terminated due to connection timeout
+✅ Subscription renewal check done: 0

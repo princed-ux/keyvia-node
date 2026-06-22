@@ -9,6 +9,8 @@ import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 import { pool } from "../db.js";
 import { v4 as uuidv4 } from "uuid";
 import { notifyNewTour } from "../services/buyerAlertService.js";
+import { PLAN_CATALOG, normalizeRole } from "../config/planCatalog.js";
+import { sendPushToUsers } from "../services/fcmService.js";
 
 const ivsClient = new IvsClient({
   region: process.env.AWS_IVS_REGION || process.env.AWS_REGION || "eu-west-1",
@@ -61,11 +63,17 @@ const buildTourPayload = (
     property_id: tour.property_id,
     host_id: tour.host_id,
     agency_id: tour.agency_id,
+    title: tour.title || null,
+    description: tour.description || null,
+    thumbnail_url: tour.thumbnail_url || null,
+    scheduled_at: tour.scheduled_at || null,
     playback_url: includePlayback
       ? tour.ivs_playback_url || tour.playback_url || ""
       : "",
     price_in_coins: Number(tour.price_in_coins || 0),
     is_live: tour.is_live,
+    is_recorded: tour.is_recorded || false,
+    recording_url: tour.recording_url || null,
     started_at: tour.started_at,
     ended_at: tour.ended_at,
     ...getViewerCounts(tour),
@@ -234,6 +242,45 @@ export const goLive = async (req, res) => {
     }
 
     // ------------------------------------------------------------------------
+    // Subscription tier limit check
+    // ------------------------------------------------------------------------
+    try {
+      const userPlanRow = await pool.query(
+        `SELECT subscription_plan, role FROM users WHERE unique_id = $1 LIMIT 1`,
+        [hostId],
+      );
+      const userRow = userPlanRow.rows[0];
+      if (userRow) {
+        const normalizedRole = normalizeRole(userRow.role);
+        const planId = userRow.subscription_plan || "free";
+        const planLimits = PLAN_CATALOG[normalizedRole]?.[planId]?.limits;
+        const monthlyLimit = planLimits?.liveTourMonthly ?? 1;
+
+        if (monthlyLimit !== -1) {
+          const countRow = await pool.query(
+            `SELECT COUNT(*) AS cnt
+             FROM live_tours
+             WHERE host_id = $1
+               AND started_at >= date_trunc('month', NOW())`,
+            [hostId],
+          );
+          const usedThisMonth = Number(countRow.rows[0]?.cnt || 0);
+          if (usedThisMonth >= monthlyLimit) {
+            return res.status(403).json({
+              success: false,
+              message: `Your ${planId === "free" ? "free" : planId} plan allows ${monthlyLimit} live tour${monthlyLimit === 1 ? "" : "s"} per month. Upgrade to go live more often.`,
+              code: "LIVE_TOUR_LIMIT_REACHED",
+              used: usedThisMonth,
+              limit: monthlyLimit,
+            });
+          }
+        }
+      }
+    } catch (tierErr) {
+      console.warn("⚠️ Tier limit check failed (non-blocking):", tierErr.message);
+    }
+
+    // ------------------------------------------------------------------------
     // Resume existing active tour instead of creating another channel.
     // IMPORTANT: This must stay INSIDE goLive.
     // ------------------------------------------------------------------------
@@ -323,6 +370,8 @@ export const goLive = async (req, res) => {
     // ------------------------------------------------------------------------
     const tourId = uuidv4();
 
+    const { title, description, thumbnail_url, scheduled_at } = req.body || {};
+
     const createTourQuery = `
       INSERT INTO live_tours (
         id,
@@ -334,10 +383,14 @@ export const goLive = async (req, res) => {
         ivs_playback_url,
         ivs_ingest_endpoint,
         price_in_coins,
+        title,
+        description,
+        thumbnail_url,
+        scheduled_at,
         is_live,
         started_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, TRUE, NOW())
       RETURNING *
     `;
 
@@ -351,6 +404,10 @@ export const goLive = async (req, res) => {
       playbackUrl,
       ingestEndpoint,
       priceInCoins,
+      title ? String(title).trim().slice(0, 255) : null,
+      description ? String(description).trim().slice(0, 2000) : null,
+      thumbnail_url ? String(thumbnail_url).trim() : null,
+      scheduled_at || null,
     ]);
 
     const tour = tourResult.rows[0];
@@ -381,6 +438,26 @@ export const goLive = async (req, res) => {
     } catch (notifyError) {
       console.error("❌ Live tour notification failed:", notifyError);
     }
+
+    // Push notification to users who follow this host
+    setImmediate(async () => {
+      try {
+        const followersResult = await pool.query(
+          `SELECT follower_id FROM user_follows WHERE following_id = $1`,
+          [hostId],
+        );
+        const followerIds = followersResult.rows.map((r) => r.follower_id);
+        if (followerIds.length > 0) {
+          await sendPushToUsers(followerIds, {
+            title: `${agentName} is LIVE`,
+            body: `${agentName} just started a live tour for ${propertyTitle}. Join now!`,
+            data: { tourId, type: "live_tour_started" },
+          });
+        }
+      } catch (pushErr) {
+        console.warn("⚠️ FCM push to host followers failed:", pushErr.message);
+      }
+    });
 
     setImmediate(() => {
       if (listing?.product_id) {
@@ -1187,6 +1264,284 @@ export const purchaseAccess = async (req, res) => {
 };
 
 // ============================================================================
+// 8. GET LIVE TOUR COMMENTS
+// ============================================================================
+export const getLiveTourComments = async (req, res) => {
+  try {
+    const { tour_id } = req.params;
+    const limit = Math.min(Number(req.query.limit) || 50, 100);
+    const before = req.query.before || null;
+
+    const result = await pool.query(
+      `SELECT id, tour_id, user_id, user_name, user_avatar, message, created_at
+       FROM live_tour_comments
+       WHERE tour_id = $1
+         AND is_deleted = FALSE
+         ${before ? "AND created_at < $3" : ""}
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      before ? [tour_id, limit, before] : [tour_id, limit],
+    );
+
+    return res.json({
+      success: true,
+      comments: result.rows.reverse(),
+      has_more: result.rows.length === limit,
+    });
+  } catch (error) {
+    console.error("getLiveTourComments error:", error);
+    return res.status(500).json({ success: false, message: "Could not load comments." });
+  }
+};
+
+// ============================================================================
+// 9. GET REPLAYS
+// ============================================================================
+export const getReplays = async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 20, 48);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+    const result = await pool.query(
+      `SELECT
+         lt.id,
+         lt.title,
+         lt.description,
+         lt.thumbnail_url,
+         lt.recording_url,
+         lt.is_recorded,
+         lt.total_viewers,
+         lt.peak_viewers,
+         lt.started_at,
+         lt.ended_at,
+         lt.property_id,
+         l.title AS property_title,
+         l.product_id,
+         l.city,
+         l.state,
+         l.country,
+         l.photos,
+         COALESCE(u.name, u.email, 'Keyvia host') AS host_name,
+         u.avatar_url AS host_avatar,
+         u.unique_id AS host_id
+       FROM live_tours lt
+       JOIN listings l ON lt.property_id = l.id
+       JOIN users u ON lt.host_id = u.unique_id
+       WHERE lt.is_live = FALSE
+         AND lt.ended_at IS NOT NULL
+       ORDER BY lt.ended_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset],
+    );
+
+    return res.json({
+      success: true,
+      replays: result.rows,
+      has_more: result.rows.length === limit,
+    });
+  } catch (error) {
+    console.error("getReplays error:", error);
+    return res.status(500).json({ success: false, message: "Could not load replays." });
+  }
+};
+
+// ============================================================================
+// 10. GET UPCOMING TOURS
+// ============================================================================
+export const getUpcomingTours = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         lt.id,
+         lt.title,
+         lt.description,
+         lt.thumbnail_url,
+         lt.scheduled_at,
+         lt.property_id,
+         l.title AS property_title,
+         l.product_id,
+         l.city,
+         l.state,
+         l.country,
+         l.photos,
+         COALESCE(u.name, u.email, 'Keyvia host') AS host_name,
+         u.avatar_url AS host_avatar,
+         u.unique_id AS host_id
+       FROM live_tours lt
+       JOIN listings l ON lt.property_id = l.id
+       JOIN users u ON lt.host_id = u.unique_id
+       WHERE lt.is_live = FALSE
+         AND lt.scheduled_at IS NOT NULL
+         AND lt.scheduled_at > NOW()
+         AND lt.ended_at IS NULL
+       ORDER BY lt.scheduled_at ASC
+       LIMIT 48`,
+    );
+
+    return res.json({ success: true, upcoming: result.rows });
+  } catch (error) {
+    console.error("getUpcomingTours error:", error);
+    return res.status(500).json({ success: false, message: "Could not load upcoming tours." });
+  }
+};
+
+// ============================================================================
+// 11. GET RECENTLY ENDED TOURS
+// ============================================================================
+export const getRecentlyEndedTours = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         lt.id,
+         lt.title,
+         lt.description,
+         lt.thumbnail_url,
+         lt.recording_url,
+         lt.is_recorded,
+         lt.total_viewers,
+         lt.peak_viewers,
+         lt.ended_at,
+         lt.property_id,
+         l.title AS property_title,
+         l.product_id,
+         l.city,
+         l.state,
+         l.country,
+         l.photos,
+         COALESCE(u.name, u.email, 'Keyvia host') AS host_name,
+         u.avatar_url AS host_avatar,
+         u.unique_id AS host_id
+       FROM live_tours lt
+       JOIN listings l ON lt.property_id = l.id
+       JOIN users u ON lt.host_id = u.unique_id
+       WHERE lt.is_live = FALSE
+         AND lt.ended_at > NOW() - INTERVAL '24 hours'
+       ORDER BY lt.ended_at DESC
+       LIMIT 48`,
+    );
+
+    return res.json({ success: true, tours: result.rows });
+  } catch (error) {
+    console.error("getRecentlyEndedTours error:", error);
+    return res.status(500).json({ success: false, message: "Could not load recent tours." });
+  }
+};
+
+// ============================================================================
+// 12. FOLLOW / UNFOLLOW HOST
+// ============================================================================
+export const followHost = async (req, res) => {
+  try {
+    const followerId = getHostId(req);
+    const { host_id } = req.params;
+
+    if (!followerId) return res.status(401).json({ success: false, message: "Please log in." });
+    if (!host_id) return res.status(400).json({ success: false, message: "Host id required." });
+    if (normalizeId(followerId) === normalizeId(host_id)) {
+      return res.status(400).json({ success: false, message: "You cannot follow yourself." });
+    }
+
+    await pool.query(
+      `INSERT INTO user_follows (follower_id, following_id)
+       VALUES ($1, $2)
+       ON CONFLICT (follower_id, following_id) DO NOTHING`,
+      [followerId, host_id],
+    );
+
+    return res.json({ success: true, following: true });
+  } catch (error) {
+    console.error("followHost error:", error);
+    return res.status(500).json({ success: false, message: "Could not follow host." });
+  }
+};
+
+export const unfollowHost = async (req, res) => {
+  try {
+    const followerId = getHostId(req);
+    const { host_id } = req.params;
+
+    if (!followerId) return res.status(401).json({ success: false, message: "Please log in." });
+
+    await pool.query(
+      `DELETE FROM user_follows WHERE follower_id = $1 AND following_id = $2`,
+      [followerId, host_id],
+    );
+
+    return res.json({ success: true, following: false });
+  } catch (error) {
+    console.error("unfollowHost error:", error);
+    return res.status(500).json({ success: false, message: "Could not unfollow host." });
+  }
+};
+
+export const getFollowStatus = async (req, res) => {
+  try {
+    const followerId = getHostId(req);
+    const { host_id } = req.params;
+
+    if (!followerId || !host_id) return res.json({ success: true, following: false, follower_count: 0 });
+
+    const [statusRes, countRes] = await Promise.all([
+      pool.query(
+        `SELECT 1 FROM user_follows WHERE follower_id = $1 AND following_id = $2 LIMIT 1`,
+        [followerId, host_id],
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS cnt FROM user_follows WHERE following_id = $1`,
+        [host_id],
+      ),
+    ]);
+
+    return res.json({
+      success: true,
+      following: statusRes.rows.length > 0,
+      follower_count: countRes.rows[0]?.cnt || 0,
+    });
+  } catch (error) {
+    console.error("getFollowStatus error:", error);
+    return res.status(500).json({ success: false, following: false, follower_count: 0 });
+  }
+};
+
+// ============================================================================
+// 13. GET REACTION SUMMARY
+// ============================================================================
+export const getReactionSummary = async (req, res) => {
+  try {
+    const { tour_id } = req.params;
+    const viewerId = getHostId(req);
+
+    const result = await pool.query(
+      `SELECT reaction_type, COUNT(*)::int AS count
+       FROM live_tour_reactions
+       WHERE tour_id = $1
+       GROUP BY reaction_type`,
+      [tour_id],
+    );
+
+    const summary = {};
+    for (const row of result.rows) {
+      summary[row.reaction_type] = row.count;
+    }
+
+    let userReactions = [];
+    if (viewerId) {
+      const userRes = await pool.query(
+        `SELECT reaction_type FROM live_tour_reactions
+         WHERE tour_id = $1 AND user_id = $2`,
+        [tour_id, viewerId],
+      );
+      userReactions = userRes.rows.map((r) => r.reaction_type);
+    }
+
+    return res.json({ success: true, summary, user_reactions: userReactions });
+  } catch (error) {
+    console.error("getReactionSummary error:", error);
+    return res.status(500).json({ success: false, summary: {}, user_reactions: [] });
+  }
+};
+
+// ============================================================================
 // HELPER: Notify users who saved the property
 // ============================================================================
 async function notifyPropertyFollowers(propertyId, propertyTitle, tourId) {
@@ -1313,4 +1668,12 @@ export default {
   getLiveTour,
   reportLiveTour,
   purchaseAccess,
+  getLiveTourComments,
+  getReplays,
+  getUpcomingTours,
+  getRecentlyEndedTours,
+  followHost,
+  unfollowHost,
+  getFollowStatus,
+  getReactionSummary,
 };

@@ -7,6 +7,7 @@ import {
   maybeSendAutoReply,
   saveMessageSettings,
 } from "../services/messageSettingsService.js";
+import { sendNewMessageEmail } from "../utils/emailService.js";
 
 const router = express.Router();
 
@@ -82,6 +83,67 @@ const getUnreadCountForUser = async (conversationId, userId) => {
 };
 
 const normalizeRole = (role) => String(role || "").toLowerCase().trim();
+
+// Threshold-based email notification. Fires once per threshold until recipient reads.
+// Thresholds checked: 10 unread, 50 unread, 100 unread.
+const EMAIL_THRESHOLDS = [
+  { key: "10_unread", count: 10, subject: "You have 10 unread messages on Keyvia" },
+  { key: "50_unread", count: 50, subject: "Your Keyvia inbox is filling up" },
+  { key: "100_unread", count: 100, subject: "Urgent: 100+ unread messages on Keyvia" },
+];
+
+const maybeSendThresholdEmail = async ({ pool: db, recipientId, senderName, messagePreview, sendNewMessageEmail: sendEmail }) => {
+  try {
+    // Count ALL unread messages for this recipient (across all conversations)
+    const unreadRes = await db.query(
+      `SELECT COUNT(*)::int AS total FROM messages
+       WHERE recipient_id::text = $1::text AND COALESCE(seen, false) = FALSE`,
+      [recipientId]
+    );
+    const totalUnread = unreadRes.rows[0]?.total || 0;
+
+    const userRes = await db.query(
+      "SELECT name, email FROM users WHERE unique_id::text = $1::text LIMIT 1",
+      [recipientId]
+    );
+    const recipient = userRes.rows[0];
+    if (!recipient?.email) return;
+
+    for (const threshold of EMAIL_THRESHOLDS) {
+      if (totalUnread < threshold.count) break;
+
+      const logRes = await db.query(
+        `SELECT sent_at, reset_at FROM message_email_log
+         WHERE user_id::text = $1::text AND threshold_key = $2 LIMIT 1`,
+        [recipientId, threshold.key]
+      );
+      const logRow = logRes.rows[0];
+
+      // Skip if already sent and not yet reset (recipient hasn't read messages)
+      if (logRow && !logRow.reset_at) continue;
+
+      await sendEmail({
+        email: recipient.email,
+        name: recipient.name,
+        senderName,
+        messagePreview,
+        subject: threshold.subject,
+        actionUrl: null,
+      }).catch(() => null);
+
+      await db.query(
+        `INSERT INTO message_email_log (user_id, threshold_key, sent_at)
+         VALUES ($1::uuid, $2, NOW())
+         ON CONFLICT (user_id, threshold_key) DO UPDATE
+           SET sent_at = NOW(), reset_at = NULL`,
+        [recipientId, threshold.key]
+      );
+      break; // Only send one threshold email per message event
+    }
+  } catch (_) {
+    // Never let email gating crash message delivery
+  }
+};
 
 const isBrokerageRole = (role) =>
   ["brokerage", "brokerage_owner"].includes(normalizeRole(role));
@@ -522,6 +584,15 @@ const createOrGetDirectConversation = async (req, res) => {
       });
     }
 
+    // Admin/super-admin accounts are not reachable via public messaging
+    const requesterRole = String(req.user?.role || "").toLowerCase();
+    const isAdmin = requesterRole === "admin" || requesterRole === "super_admin" || requesterRole === "superadmin" || req.user?.is_admin || req.user?.is_super_admin;
+    const recipientRole = String(recipient.role || "").toLowerCase();
+    const recipientIsAdmin = recipientRole === "admin" || recipientRole === "super_admin" || recipientRole === "superadmin";
+    if (recipientIsAdmin && !isAdmin) {
+      return res.status(404).json({ success: false, message: "Recipient could not be found." });
+    }
+
     const existing = await pool.query(
       `
       SELECT *
@@ -555,13 +626,14 @@ const createOrGetDirectConversation = async (req, res) => {
       return res.json({ ...conversation, success: true, conversation });
     }
 
+    const convType = productId ? "listing_inquiry" : "direct";
     const created = await pool.query(
       `
-      INSERT INTO conversations (user1_id, user2_id, product_id)
-      VALUES ($1, $2, $3)
+      INSERT INTO conversations (user1_id, user2_id, product_id, conversation_type)
+      VALUES ($1, $2, $3, $4)
       RETURNING *
       `,
-      [currentUserId, String(recipientId), productId],
+      [currentUserId, String(recipientId), productId, convType],
     );
 
     const conversation = created.rows[0];
@@ -652,12 +724,19 @@ router.get("/user/:id", authenticate, async (req, res) => {
       LEFT JOIN listings l
         ON l.product_id::text = COALESCE(c.product_id, lm.product_id)::text
 
-      WHERE (c.user1_id::text = $1::text AND COALESCE(c.deleted_by_user1, false) = FALSE)
-         OR (c.user2_id::text = $1::text AND COALESCE(c.deleted_by_user2, false) = FALSE)
+      WHERE (
+        (c.user1_id::text = $1::text AND COALESCE(c.deleted_by_user1, false) = FALSE
+          AND ($2 = TRUE  AND COALESCE(c.archived_by_user1, false) = TRUE
+            OR $2 = FALSE AND COALESCE(c.archived_by_user1, false) = FALSE))
+        OR
+        (c.user2_id::text = $1::text AND COALESCE(c.deleted_by_user2, false) = FALSE
+          AND ($2 = TRUE  AND COALESCE(c.archived_by_user2, false) = TRUE
+            OR $2 = FALSE AND COALESCE(c.archived_by_user2, false) = FALSE))
+      )
 
       ORDER BY lm.created_at DESC NULLS LAST, c.updated_at DESC NULLS LAST
       `,
-      [currentUserId],
+      [currentUserId, req.query.archived === "true"],
     );
 
     return res.json(result.rows);
@@ -1425,10 +1504,15 @@ router.get("/:conversationId", authenticate, async (req, res) => {
       });
     }
 
+    const paginated = req.query.page !== undefined;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const offset = (page - 1) * limit;
+
     const result = await pool.query(
       `
       SELECT
-        m.id,
+        m.message_id AS id,
         m.conversation_id,
         m.sender_id,
         m.message,
@@ -1437,13 +1521,18 @@ router.get("/:conversationId", authenticate, async (req, res) => {
         m.attachment_url,
         m.attachment_type,
         m.is_auto_reply,
+        m.edited_at,
         TO_JSON(m.created_at) AS created_at,
         NULL::jsonb AS reactions
       FROM messages m
       WHERE m.conversation_id = $1
+        AND m.deleted_at IS NULL
       ORDER BY m.created_at ASC
+      ${paginated ? `LIMIT $2 OFFSET $3` : ""}
       `,
-      [req.params.conversationId],
+      paginated
+        ? [req.params.conversationId, limit, offset]
+        : [req.params.conversationId],
     );
 
     await pool.query(
@@ -1452,9 +1541,33 @@ router.get("/:conversationId", authenticate, async (req, res) => {
       SET seen = TRUE
       WHERE conversation_id = $1
         AND sender_id::text != $2::text
+        AND deleted_at IS NULL
       `,
       [req.params.conversationId, currentUserId],
     );
+
+    // Reset email thresholds so the user can receive notification emails again
+    pool.query(
+      `UPDATE message_email_log SET reset_at = NOW()
+       WHERE user_id::text = $1::text AND reset_at IS NULL`,
+      [currentUserId]
+    ).catch(() => null);
+
+    if (paginated) {
+      const totalRes = await pool.query(
+        `SELECT COUNT(*)::int AS total FROM messages
+         WHERE conversation_id = $1 AND deleted_at IS NULL`,
+        [req.params.conversationId]
+      );
+      const total = totalRes.rows[0]?.total || 0;
+      return res.json({
+        messages: result.rows,
+        page,
+        limit,
+        total,
+        hasMore: offset + result.rows.length < total,
+      });
+    }
 
     return res.json(result.rows);
   } catch (err) {
@@ -1565,6 +1678,16 @@ router.post("/:conversationId/send", authenticate, async (req, res) => {
       productId,
       io: req.io,
     });
+
+    // Threshold-based email notification — never send on every message.
+    // Thresholds: 10, 50, 100 unread. Each fires once until recipient reads.
+    maybeSendThresholdEmail({
+      pool,
+      recipientId,
+      senderName: req.user?.name || "A Keyvia member",
+      messagePreview: message,
+      sendNewMessageEmail,
+    }).catch(() => null);
 
     if (productId) {
       await pool
@@ -1700,6 +1823,146 @@ router.delete("/:id", authenticate, async (req, res) => {
       success: false,
       message: "Could not delete message.",
     });
+  }
+});
+
+// ==========================
+// MESSAGE SEARCH
+// ==========================
+router.get("/search/messages", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+  const q = String(req.query.q || "").trim();
+  if (!q) return res.json([]);
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         m.message_id AS id,
+         m.conversation_id,
+         m.sender_id,
+         m.message,
+         m.seen,
+         m.product_id,
+         m.attachment_url,
+         m.attachment_type,
+         m.edited_at,
+         TO_JSON(m.created_at) AS created_at
+       FROM messages m
+       JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE (c.user1_id::text = $1::text OR c.user2_id::text = $1::text)
+         AND m.deleted_at IS NULL
+         AND to_tsvector('english', COALESCE(m.message, '')) @@ plainto_tsquery('english', $2)
+       ORDER BY m.created_at DESC
+       LIMIT 50`,
+      [currentUserId, q]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error("[Messages] Search error:", err.message);
+    return res.status(500).json({ success: false, message: "Search failed." });
+  }
+});
+
+// ==========================
+// MESSAGE EDIT
+// ==========================
+router.patch("/:messageId/edit", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+  const { messageId } = req.params;
+  const newText = String(req.body?.message || "").trim();
+  if (!newText) return res.status(400).json({ success: false, message: "Message cannot be empty." });
+
+  try {
+    const msgRes = await pool.query(
+      `SELECT message_id, conversation_id, sender_id FROM messages
+       WHERE message_id = $1 AND sender_id::text = $2::text AND deleted_at IS NULL LIMIT 1`,
+      [messageId, currentUserId]
+    );
+    if (!msgRes.rows.length)
+      return res.status(404).json({ success: false, message: "Message not found or not yours." });
+
+    const { conversation_id } = msgRes.rows[0];
+
+    const updated = await pool.query(
+      `UPDATE messages SET message = $1, edited_at = NOW()
+       WHERE message_id = $2
+       RETURNING message_id AS id, conversation_id, sender_id, message, edited_at, TO_JSON(created_at) AS created_at`,
+      [newText, messageId]
+    );
+
+    const payload = updated.rows[0];
+    req.io?.to(`conv_${conversation_id}`).emit("message_edited", payload);
+
+    return res.json({ success: true, message: payload });
+  } catch (err) {
+    console.error("[Messages] Edit error:", err.message);
+    return res.status(500).json({ success: false, message: "Could not edit message." });
+  }
+});
+
+// ==========================
+// MESSAGE SOFT DELETE
+// ==========================
+router.delete("/:messageId", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+  const { messageId } = req.params;
+
+  try {
+    const msgRes = await pool.query(
+      `SELECT message_id, conversation_id FROM messages
+       WHERE message_id = $1 AND sender_id::text = $2::text AND deleted_at IS NULL LIMIT 1`,
+      [messageId, currentUserId]
+    );
+    if (!msgRes.rows.length)
+      return res.status(404).json({ success: false, message: "Message not found or not yours." });
+
+    const { conversation_id } = msgRes.rows[0];
+
+    await pool.query(
+      `UPDATE messages SET deleted_at = NOW() WHERE message_id = $1`,
+      [messageId]
+    );
+
+    req.io?.to(`conv_${conversation_id}`).emit("message_deleted", { messageId });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("[Messages] Delete error:", err.message);
+    return res.status(500).json({ success: false, message: "Could not delete message." });
+  }
+});
+
+// ==========================
+// ARCHIVE CONVERSATION
+// ==========================
+router.post("/conversations/:conversationId/archive", authenticate, async (req, res) => {
+  const currentUserId = getUserId(req);
+  const { conversationId } = req.params;
+
+  try {
+    const convRes = await pool.query(
+      `SELECT conversation_id, user1_id, user2_id FROM conversations
+       WHERE conversation_id = $1
+         AND (user1_id::text = $2::text OR user2_id::text = $2::text)
+       LIMIT 1`,
+      [conversationId, currentUserId]
+    );
+    if (!convRes.rows.length)
+      return res.status(404).json({ success: false, message: "Conversation not found." });
+
+    const conv = convRes.rows[0];
+    const isUser1 = String(conv.user1_id) === String(currentUserId);
+    const archiveCol = isUser1 ? "archived_by_user1" : "archived_by_user2";
+    const archive = req.body?.archive !== false; // default true
+
+    await pool.query(
+      `UPDATE conversations SET ${archiveCol} = $1 WHERE conversation_id = $2`,
+      [archive, conversationId]
+    );
+
+    return res.json({ success: true, archived: archive });
+  } catch (err) {
+    console.error("[Messages] Archive error:", err.message);
+    return res.status(500).json({ success: false, message: "Could not archive conversation." });
   }
 });
 

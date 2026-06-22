@@ -1,5 +1,7 @@
 import pkg from "pg";
 const { Pool } = pkg;
+import { createNotification } from "./notificationsController.js";
+import { sendNewOfferEmail, sendOfferResponseEmail } from "../utils/emailService.js";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -66,12 +68,51 @@ export const createOffer = async (req, res) => {
 
     const offer = result.rows[0];
 
+    // In-app notification + email to recipient
     try {
-      await pool.query(
-        `INSERT INTO notifications (user_id, type, title, message, reference_id, reference_type)
-         VALUES ($1, 'offer', 'New Offer Received', $2, $3, 'offer')`,
-        [recipient_id, `A new offer of ${currency || "USD"} ${parseFloat(offer_amount).toLocaleString()} has been submitted`, offer.id]
+      // Fetch recipient details for email
+      const recipientRes = await pool.query(
+        "SELECT name, email FROM users WHERE unique_id::text = $1::text LIMIT 1",
+        [String(recipient_id)],
       );
+      const recipient = recipientRes.rows[0];
+
+      // Fetch listing title for context
+      const listingRes = await pool.query(
+        "SELECT title, address FROM listings WHERE id::text = $1::text OR product_id::text = $1::text LIMIT 1",
+        [String(listing_id)],
+      );
+      const listing = listingRes.rows[0];
+      const propertyTitle = listing?.title || listing?.address || "your listing";
+
+      // In-app notification using the shared system
+      await createNotification({
+        io: req.io,
+        recipientId: String(recipient_id),
+        senderId: userId,
+        type: "new_offer",
+        title: "New Offer Received",
+        message: `${req.user?.name || "A buyer"} submitted a ${offer_type || "purchase"} offer on "${propertyTitle}".`,
+        entityType: "offer",
+        entityId: String(offer.id),
+        actionUrl: "/dashboard/applications",
+        actionLabel: "Review Offer",
+        data: { offer_id: offer.id, offer_amount, currency },
+      }).catch(() => null);
+
+      // Email notification
+      if (recipient?.email) {
+        await sendNewOfferEmail({
+          email: recipient.email,
+          name: recipient.name,
+          propertyTitle,
+          offerAmount: offer_amount,
+          currency: currency || "NGN",
+          buyerName: req.user?.name,
+          offerType: offer_type || "purchase",
+          actionUrl: null,
+        }).catch(() => null);
+      }
     } catch (_) {}
 
     res.status(201).json(offer);
@@ -242,12 +283,48 @@ export const respondToOffer = async (req, res) => {
     const notifyUserId = response_type === "withdrawn" ? offer.recipient_id : offer.buyer_id;
     const actionLabel = { accepted: "accepted", rejected: "rejected", countered: "countered", withdrawn: "withdrawn" }[response_type];
 
+    // In-app notification + email
     try {
-      await pool.query(
-        `INSERT INTO notifications (user_id, type, title, message, reference_id, reference_type)
-         VALUES ($1, 'offer', 'Offer ${actionLabel}', $2, $3, 'offer')`,
-        [notifyUserId, `Your offer has been ${actionLabel}`, id]
+      const notifyUserRes = await pool.query(
+        "SELECT name, email FROM users WHERE unique_id::text = $1::text LIMIT 1",
+        [String(notifyUserId)],
       );
+      const notifyUser = notifyUserRes.rows[0];
+
+      // Fetch listing info for context
+      const listingRes = await pool.query(
+        "SELECT title, address FROM listings WHERE id::text = $1::text LIMIT 1",
+        [String(offer.listing_id)],
+      );
+      const listing = listingRes.rows[0];
+      const propertyTitle = listing?.title || listing?.address || "the property";
+
+      await createNotification({
+        io: req.io,
+        recipientId: String(notifyUserId),
+        senderId: userId,
+        type: "offer_response",
+        title: `Offer ${actionLabel}`,
+        message: `Your offer on "${propertyTitle}" has been ${actionLabel}.`,
+        entityType: "offer",
+        entityId: String(id),
+        actionUrl: "/buyer/offers",
+        actionLabel: "View Offer",
+        data: { offer_id: id, response_type },
+      }).catch(() => null);
+
+      if (notifyUser?.email) {
+        await sendOfferResponseEmail({
+          email: notifyUser.email,
+          name: notifyUser.name,
+          propertyTitle,
+          offerAmount: offer.offer_amount,
+          currency: offer.currency || "NGN",
+          responseType: response_type,
+          counterAmount: counter_amount || null,
+          actionUrl: null,
+        }).catch(() => null);
+      }
     } catch (_) {}
 
     res.json({

@@ -6,6 +6,8 @@ import {
 import { emitUserNotification } from "../services/socketEmitter.js";
 import { sendVerificationStatusEmail } from "../utils/emailService.js";
 import { getAiSettings } from "../services/aiSettingsService.js";
+import { performFullAnalysis } from "../services/analysisService.js";
+import { notifyMatchingSavedSearches } from "../services/savedSearchService.js";
 
 const tableExists = async (tableName) => {
   const result = await pool.query(
@@ -51,6 +53,7 @@ export const getPendingProfiles = async (req, res) => {
         u.verification_status,
         u.is_verified,
         u.rejection_reason,
+        u.risk_score,
         COALESCE(u.license_document_url, u.identity_document_url) AS document_url
       FROM users u
       LEFT JOIN profiles p
@@ -138,7 +141,13 @@ export const analyzeAgentProfile = async (req, res) => {
 // =========================================================
 export const analyzeAllPendingProfiles = async (req, res) => {
   try {
-    const pendingRes = await pool.query(`
+    // Optional: restrict to specific selected users ("Analyze selected").
+    const requestedIds = Array.isArray(req.body?.ids)
+      ? req.body.ids.filter(Boolean).map(String)
+      : [];
+
+    const pendingRes = await pool.query(
+      `
       SELECT
         u.unique_id,
         COALESCE(p.full_name, u.name) AS full_name,
@@ -170,7 +179,10 @@ export const analyzeAllPendingProfiles = async (req, res) => {
       LEFT JOIN agent_profiles ap
         ON ap.unique_id::text = u.unique_id::text
       WHERE u.verification_status = 'pending'
-    `);
+        ${requestedIds.length ? "AND u.unique_id::text = ANY($1)" : ""}
+    `,
+      requestedIds.length ? [requestedIds] : [],
+    );
 
     const profiles = pendingRes.rows;
     const reports = await analyzeVerificationBulk(profiles);
@@ -179,6 +191,8 @@ export const analyzeAllPendingProfiles = async (req, res) => {
     const shouldAutoApprove = aiSettings.ai_auto_approve_low_risk !== false;
     const shouldAutoReject = aiSettings.ai_auto_reject_high_risk !== false;
     const requireManualReview = aiSettings.ai_require_manual_review_medium_risk !== false;
+    const approveThreshold = Number(aiSettings.ai_auto_approve_threshold) || 80;
+    const rejectThreshold = Number(aiSettings.ai_auto_reject_threshold) || 35;
 
     let verified = 0;
     let rejected = 0;
@@ -196,16 +210,16 @@ export const analyzeAllPendingProfiles = async (req, res) => {
       const safeVerdicts = ["safe to approve", "verified", "auto-approve"];
       const rejectVerdicts = ["rejected", "auto-reject", "auto rejected", "reject"];
 
-      if ((safeVerdicts.includes(verdict?.toLowerCase()) || score >= 80) && shouldAutoApprove) {
+      if ((safeVerdicts.includes(verdict?.toLowerCase()) || score >= approveThreshold) && shouldAutoApprove) {
         newStatus = "verified";
         verified++;
-      } else if ((rejectVerdicts.includes(verdict?.toLowerCase()) || score <= 35) && shouldAutoReject) {
+      } else if ((rejectVerdicts.includes(verdict?.toLowerCase()) || score <= rejectThreshold) && shouldAutoReject) {
         newStatus = "rejected";
         reason = `AI Auto-Reject: ${flags.join(", ") || "Low Confidence"}`;
         rejected++;
       } else if (requireManualReview) {
         remaining++;
-      } else if (safeVerdicts.includes(verdict?.toLowerCase()) || score >= 80) {
+      } else if (safeVerdicts.includes(verdict?.toLowerCase()) || score >= approveThreshold) {
         newStatus = "verified";
         verified++;
       } else {
@@ -947,5 +961,166 @@ export const updateSecuritySetting = async (req, res) => {
   } catch (err) {
     console.error("[UpdateSecuritySetting] Error:", err);
     return res.status(500).json({ success: false, message: "Failed to update security setting" });
+  }
+};
+
+// =========================================================
+// BULK LISTING AI ANALYSIS
+// =========================================================
+export const analyzeListingAdmin = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: "Missing listing id" });
+    const report = await performFullAnalysis(id);
+    return res.json(report);
+  } catch (err) {
+    console.error("[AI Analyze Listing] Error:", err);
+    return res.status(500).json({ error: "Analysis failed" });
+  }
+};
+
+export const analyzeAllPendingListings = async (req, res) => {
+  try {
+    const aiSettings = await getAiSettings();
+    const shouldAutoApprove = aiSettings.ai_auto_approve_low_risk !== false;
+    const shouldAutoReject = aiSettings.ai_auto_reject_high_risk !== false;
+    const approveThreshold = Number(aiSettings.ai_auto_approve_threshold) || 80;
+    const rejectThreshold = Number(aiSettings.ai_auto_reject_threshold) || 35;
+
+    const { rows: listings } = await pool.query(
+      `SELECT product_id FROM listings
+       WHERE is_active = false
+         AND LOWER(status::text) IN ('pending', 'under_review')
+         AND (moderation_status IS NULL OR LOWER(moderation_status) = 'pending')
+       ORDER BY created_at DESC
+       LIMIT 100`
+    );
+
+    let total = listings.length;
+    let analyzed = 0;
+    let approved = 0;
+    let rejected = 0;
+    let escalated = 0;
+
+    const CONCURRENCY = 3;
+    for (let i = 0; i < listings.length; i += CONCURRENCY) {
+      const chunk = listings.slice(i, i + CONCURRENCY);
+      await Promise.all(chunk.map(async ({ product_id }) => {
+        try {
+          const report = await performFullAnalysis(product_id);
+          analyzed++;
+          const score = Number(report?.score || 0);
+          const verdict = String(report?.verdict || "").toLowerCase();
+          const flags = Array.isArray(report?.flags) ? report.flags : [];
+          const reason = flags.length ? flags.join(" | ") : verdict;
+
+          const safeVerdicts = ["safe to approve", "approved", "auto-approve", "approved", "pass", "passed"];
+          const rejectVerdicts = ["rejected", "auto-reject", "auto rejected", "failed", "unsafe"];
+
+          let newStatus = null;
+          let moderationStatus = null;
+          let isActive = false;
+
+          if ((safeVerdicts.includes(verdict) || score >= approveThreshold) && shouldAutoApprove) {
+            newStatus = "approved"; moderationStatus = "approved"; isActive = true; approved++;
+          } else if ((rejectVerdicts.includes(verdict) || score <= rejectThreshold) && shouldAutoReject) {
+            newStatus = "rejected"; moderationStatus = "rejected"; isActive = false; rejected++;
+          } else {
+            moderationStatus = "pending"; escalated++;
+          }
+
+          if (newStatus) {
+            await pool.query(
+              `UPDATE listings SET status = $1, moderation_status = $2, is_active = $3,
+               moderation_reason = $4, risk_score = $5, reviewed_at = NOW(), updated_at = NOW()
+               WHERE product_id = $6`,
+              [newStatus, moderationStatus, isActive, reason, score, product_id]
+            );
+
+            // Alert buyers whose saved searches match a newly auto-approved listing.
+            if (newStatus === "approved" && isActive) {
+              notifyMatchingSavedSearches({ product_id }, req.io).catch(() => {});
+            }
+          } else {
+            await pool.query(
+              `UPDATE listings SET moderation_status = $1, moderation_reason = $2, risk_score = $3, updated_at = NOW()
+               WHERE product_id = $4`,
+              [moderationStatus, reason, score, product_id]
+            );
+          }
+        } catch (err) {
+          console.error(`[analyzeAllPendingListings] ${product_id}:`, err?.message);
+        }
+      }));
+    }
+
+    return res.json({ success: true, total, analyzed, approved, rejected, escalated });
+  } catch (err) {
+    console.error("[analyzeAllPendingListings] Error:", err);
+    return res.status(500).json({ error: "Bulk analysis failed" });
+  }
+};
+
+// =========================================================
+// AUTOMATION STATS
+// =========================================================
+export const getAutomationStats = async (req, res) => {
+  try {
+    const aiSettings = await getAiSettings();
+
+    const [listingStats, verificationStats, recentActivity] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total_scanned,
+          COUNT(*) FILTER (WHERE moderation_status = 'approved')::int AS auto_approved,
+          COUNT(*) FILTER (WHERE moderation_status = 'rejected')::int AS auto_rejected,
+          COUNT(*) FILTER (WHERE moderation_status = 'pending')::int AS escalated,
+          COUNT(*) FILTER (WHERE risk_score IS NOT NULL)::int AS scored
+        FROM listings
+        WHERE reviewed_at >= NOW() - INTERVAL '7 days'
+      `),
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total_scanned,
+          COUNT(*) FILTER (WHERE verification_status = 'verified' AND risk_score IS NOT NULL)::int AS auto_approved,
+          COUNT(*) FILTER (WHERE verification_status = 'rejected' AND risk_score IS NOT NULL)::int AS auto_rejected,
+          COUNT(*) FILTER (WHERE verification_status = 'pending' AND risk_score IS NOT NULL)::int AS escalated
+        FROM users
+        WHERE updated_at >= NOW() - INTERVAL '7 days'
+          AND risk_score IS NOT NULL
+      `),
+      pool.query(`
+        SELECT 'listing' AS item_type, product_id AS item_id, title AS label,
+               risk_score, moderation_status AS verdict, reviewed_at AS processed_at
+        FROM listings
+        WHERE risk_score IS NOT NULL AND reviewed_at IS NOT NULL
+        UNION ALL
+        SELECT 'verification' AS item_type, unique_id::text AS item_id,
+               COALESCE(name, email) AS label,
+               risk_score, verification_status AS verdict, updated_at AS processed_at
+        FROM users
+        WHERE risk_score IS NOT NULL AND risk_score > 0
+          AND role NOT IN ('admin', 'super_admin')
+        ORDER BY processed_at DESC NULLS LAST
+        LIMIT 20
+      `),
+    ]);
+
+    const pendingListings = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM listings WHERE LOWER(status::text) = 'pending' AND is_active = false`
+    );
+    const pendingVerifications = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM users WHERE verification_status = 'pending' AND role NOT IN ('admin', 'super_admin')`
+    );
+
+    return res.json({
+      settings: aiSettings,
+      listing_stats: { ...listingStats.rows[0], pending_count: pendingListings.rows[0].count },
+      verification_stats: { ...verificationStats.rows[0], pending_count: pendingVerifications.rows[0].count },
+      recent_activity: recentActivity.rows,
+    });
+  } catch (err) {
+    console.error("[getAutomationStats] Error:", err);
+    return res.status(500).json({ error: "Failed to load automation stats" });
   }
 };

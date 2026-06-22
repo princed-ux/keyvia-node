@@ -1,6 +1,6 @@
 // keyvia-node/routes/ivsRoutes.js
 // ============================================================================
-// AWS IVS LIVE TOURS - Broadcasting & Viewing
+// AWS IVS LIVE TOURS — Broadcasting, Viewing, Comments, Reactions, Follow
 // ============================================================================
 
 import express from "express";
@@ -16,50 +16,45 @@ import {
   getMyActiveTours,
   reportLiveTour,
   purchaseAccess,
+  getLiveTourComments,
+  getReplays,
+  getUpcomingTours,
+  getRecentlyEndedTours,
+  followHost,
+  unfollowHost,
+  getFollowStatus,
+  getReactionSummary,
 } from "../controllers/ivsController.js";
 
 const router = express.Router();
 
-/**
- * POST /api/ivs/go-live
- * Host starts a live tour (creates IVS channel)
- */
-router.post("/go-live", authenticateToken, goLive);
+// ── Host controls ──────────────────────────────────────────────────────────
+router.post("/go-live",            authenticateToken, goLive);
+router.post("/end-live/:tour_id",  authenticateToken, endLive);
+router.get( "/my-active",          authenticateToken, getMyActiveTours);
 
-/**
- * POST /api/ivs/end-live/:tour_id
- * Host ends the live tour
- */
-router.post("/end-live/:tour_id", authenticateToken, endLive);
+// ── Discovery ──────────────────────────────────────────────────────────────
+router.get("/live-now",        optionalAuth, getLiveNowTours);
+router.get("/upcoming",        optionalAuth, getUpcomingTours);
+router.get("/recently-ended",  optionalAuth, getRecentlyEndedTours);
+router.get("/replays",         optionalAuth, getReplays);
 
-/**
- * GET /api/ivs/my-active
- * Host restores active live rooms in studio
- */
-router.get("/my-active", authenticateToken, getMyActiveTours);
+// ── Single tour ────────────────────────────────────────────────────────────
+router.get( "/tour/:tour_id",           optionalAuth, getLiveTour);
+router.post("/tour/:tour_id/report",    optionalAuth, reportLiveTour);
 
-/**
- * GET /api/ivs/live-now
- * Safe discovery list for buyers and other roles
- */
-router.get("/live-now", optionalAuth, getLiveNowTours);
+// ── Comments ───────────────────────────────────────────────────────────────
+router.get("/tour/:tour_id/comments", optionalAuth, getLiveTourComments);
 
-/**
- * GET /api/ivs/tour/:tour_id
- * Get tour details and check viewer access
- */
-router.get("/tour/:tour_id", optionalAuth, getLiveTour);
+// ── Reactions ──────────────────────────────────────────────────────────────
+router.get("/tour/:tour_id/reactions", optionalAuth, getReactionSummary);
 
-/**
- * POST /api/ivs/tour/:tour_id/report
- * User/public safety report for suspicious live tours
- */
-router.post("/tour/:tour_id/report", optionalAuth, reportLiveTour);
+// ── Follow system ──────────────────────────────────────────────────────────
+router.get(   "/follow/:host_id", authenticateToken, getFollowStatus);
+router.post(  "/follow/:host_id", authenticateToken, followHost);
+router.delete("/follow/:host_id", authenticateToken, unfollowHost);
 
-/**
- * POST /api/ivs/purchase-access/:tour_id
- * Disabled until live-tour payments pass compliance review
- */
+// ── Disabled: live-tour payments ───────────────────────────────────────────
 router.post("/purchase-access/:tour_id", authenticateToken, purchaseAccess);
 
 export default router;

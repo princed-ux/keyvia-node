@@ -1,10 +1,12 @@
 import express from "express";
 import { pool } from "../db.js";
-import { authenticateToken } from "../middleware/authMiddleware.js";
+import { authenticateToken, requireRole } from "../middleware/authMiddleware.js";
+import { requireAnalytics } from "../middleware/planMiddleware.js";
 
 const router = express.Router();
 
 router.use(authenticateToken);
+router.use(requireRole("agent", "brokerage_owner"));
 
 const getUserKey = (req) => String(req.user?.unique_id || req.user?.id || "");
 
@@ -109,7 +111,7 @@ const getPaymentWhere = async (userKey) => {
   };
 };
 
-router.get("/stats", async (req, res) => {
+router.get("/stats", requireAnalytics("basic"), async (req, res) => {
   const userKey = getUserKey(req);
 
   if (!userKey) {
@@ -168,7 +170,7 @@ router.get("/stats", async (req, res) => {
   }
 });
 
-router.get("/charts/funding", async (req, res) => {
+router.get("/charts/funding", requireAnalytics("basic"), async (req, res) => {
   const userKey = getUserKey(req);
 
   try {
@@ -217,7 +219,7 @@ router.get("/charts/funding", async (req, res) => {
   }
 });
 
-router.get("/charts/types", async (req, res) => {
+router.get("/charts/types", requireAnalytics("basic"), async (req, res) => {
   const userKey = getUserKey(req);
 
   try {
@@ -243,7 +245,7 @@ router.get("/charts/types", async (req, res) => {
   }
 });
 
-router.get("/charts/status", async (req, res) => {
+router.get("/charts/status", requireAnalytics("basic"), async (req, res) => {
   const userKey = getUserKey(req);
 
   try {
@@ -316,7 +318,7 @@ router.get("/listings", async (req, res) => {
   }
 });
 
-router.get("/transactions", async (req, res) => {
+router.get("/transactions", requireAnalytics("basic"), async (req, res) => {
   const userKey = getUserKey(req);
   const limit = Math.min(Number(req.query.limit || 5), 25);
 
@@ -369,12 +371,12 @@ router.get("/transactions", async (req, res) => {
   }
 });
 
-router.get("/analytics", async (req, res) => {
+router.get("/analytics", requireAnalytics("advanced"), async (req, res) => {
   const userKey = getUserKey(req);
   if (!userKey) return res.status(401).json({ error: "Unauthorized" });
 
   try {
-    const [totalRes, monthlyRes, listingsRes, typesRes, statusRes] = await Promise.all([
+    const [totalRes, monthlyRes, listingsRes, typesRes, statusRes, funnelRes, dowRes, priceBandRes] = await Promise.all([
       pool.query(
         `SELECT
           COUNT(*)::int AS listings,
@@ -436,9 +438,63 @@ router.get("/analytics", async (req, res) => {
         GROUP BY label ORDER BY count DESC`,
         [userKey],
       ),
+      // Engagement funnel conversion rates (Elite)
+      pool.query(
+        `SELECT
+          COALESCE(SUM(COALESCE(views_count,0)),0)::int AS total_views,
+          COALESCE(SUM(COALESCE(saves_count,0)),0)::int AS total_saves,
+          COALESCE(SUM(COALESCE(contact_count,0)),0)::int AS total_contacts,
+          COALESCE(SUM(COALESCE(tour_request_count,0)),0)::int AS total_tours,
+          AVG(COALESCE(views_count,0))::float AS avg_views,
+          AVG(COALESCE(saves_count,0))::float AS avg_saves,
+          AVG(COALESCE(contact_count,0))::float AS avg_contacts
+        FROM listings l WHERE ${listingOwnerWhere}`,
+        [userKey],
+      ),
+      // Day-of-week engagement (Elite)
+      pool.query(
+        `SELECT
+          TO_CHAR(l.created_at, 'Dy') AS day,
+          EXTRACT(DOW FROM l.created_at)::int AS day_num,
+          COUNT(*)::int AS listings,
+          COALESCE(SUM(COALESCE(l.views_count,0)),0)::int AS views,
+          COALESCE(SUM(COALESCE(l.contact_count,0)),0)::int AS contacts
+        FROM listings l
+        WHERE ${listingOwnerWhere}
+        GROUP BY day, day_num
+        ORDER BY day_num`,
+        [userKey],
+      ),
+      // Price band performance (Elite) — group listings by price range
+      pool.query(
+        `SELECT
+          CASE
+            WHEN l.price < 1000000 THEN 'Under ₦1M'
+            WHEN l.price < 5000000 THEN '₦1M–5M'
+            WHEN l.price < 20000000 THEN '₦5M–20M'
+            WHEN l.price < 50000000 THEN '₦20M–50M'
+            ELSE 'Over ₦50M'
+          END AS price_band,
+          COUNT(*)::int AS count,
+          COALESCE(AVG(COALESCE(views_count,0)),0)::float AS avg_views,
+          COALESCE(AVG(COALESCE(contact_count,0)),0)::float AS avg_contacts,
+          COALESCE(AVG(COALESCE(saves_count,0)),0)::float AS avg_saves
+        FROM listings l
+        WHERE ${listingOwnerWhere}
+          AND l.price IS NOT NULL AND l.price > 0
+        GROUP BY price_band
+        ORDER BY MIN(l.price)`,
+        [userKey],
+      ),
     ]);
 
     const total = totalRes.rows[0] || {};
+    const funnelRow = funnelRes.rows[0] || {};
+    const views = Number(total.views || 0);
+    const saves = Number(total.saves || 0);
+    const contacts = Number(total.contacts || 0);
+    const tours = Number(total.tour_requests || 0);
+
     const monthly = monthlyRes.rows.map((r) => ({
       month: r.month,
       listings_added: Number(r.listings_added || 0),
@@ -463,21 +519,174 @@ router.get("/analytics", async (req, res) => {
         total: {
           listings: total.listings || 0,
           active: total.active || 0,
-          views: total.views || 0,
-          saves: total.saves || 0,
-          contacts: total.contacts || 0,
-          tour_requests: total.tour_requests || 0,
+          views,
+          saves,
+          contacts,
+          tour_requests: tours,
           shares: total.shares || 0,
         },
         monthly,
         byListing,
         byType,
         byStatus,
+        // Elite-tier: engagement funnel conversion rates
+        funnel: {
+          views,
+          saves,
+          contacts,
+          tours,
+          save_rate: views > 0 ? ((saves / views) * 100).toFixed(1) : "0.0",
+          contact_rate: views > 0 ? ((contacts / views) * 100).toFixed(1) : "0.0",
+          tour_rate: views > 0 ? ((tours / views) * 100).toFixed(1) : "0.0",
+          avg_views: Number(funnelRow.avg_views || 0).toFixed(1),
+          avg_saves: Number(funnelRow.avg_saves || 0).toFixed(1),
+          avg_contacts: Number(funnelRow.avg_contacts || 0).toFixed(1),
+        },
+        // Elite-tier: day-of-week performance
+        dayOfWeek: dowRes.rows.map((r) => ({
+          day: r.day,
+          listings: Number(r.listings || 0),
+          views: Number(r.views || 0),
+          contacts: Number(r.contacts || 0),
+        })),
+        // Elite-tier: price band performance
+        priceBands: priceBandRes.rows.map((r) => ({
+          band: r.price_band,
+          count: Number(r.count || 0),
+          avg_views: Number(r.avg_views || 0).toFixed(1),
+          avg_contacts: Number(r.avg_contacts || 0).toFixed(1),
+          avg_saves: Number(r.avg_saves || 0).toFixed(1),
+        })),
       },
     });
   } catch (err) {
     console.error("Agent Analytics Error:", err.message);
     return res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ─── COMMISSION TRACKING ───────────────────────────────────────────────────
+
+const ensureCommissionsTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agent_commissions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      agent_id TEXT NOT NULL,
+      listing_id TEXT,
+      product_id TEXT,
+      client_name TEXT,
+      transaction_type VARCHAR(30) DEFAULT 'sale',
+      gross_amount NUMERIC(15,2) NOT NULL DEFAULT 0,
+      commission_rate NUMERIC(5,2) NOT NULL DEFAULT 0,
+      commission_amount NUMERIC(15,2) GENERATED ALWAYS AS (ROUND(gross_amount * commission_rate / 100, 2)) STORED,
+      currency VARCHAR(10) DEFAULT 'NGN',
+      status VARCHAR(20) DEFAULT 'pending',
+      notes TEXT,
+      transaction_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_commissions_agent ON agent_commissions(agent_id);
+  `);
+};
+
+// GET /agents/commissions
+router.get("/commissions", async (req, res) => {
+  const agentId = getUserKey(req);
+  if (!agentId) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    await ensureCommissionsTable();
+    const result = await pool.query(
+      `SELECT ac.*,
+              l.title AS listing_title,
+              l.address AS listing_address
+       FROM agent_commissions ac
+       LEFT JOIN listings l ON l.product_id::text = ac.product_id::text
+       WHERE ac.agent_id = $1
+       ORDER BY ac.transaction_date DESC, ac.created_at DESC`,
+      [agentId],
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Commissions GET error:", err.message);
+    return res.status(500).json({ error: "Could not fetch commissions" });
+  }
+});
+
+// POST /agents/commissions — log a new commission entry
+router.post("/commissions", async (req, res) => {
+  const agentId = getUserKey(req);
+  if (!agentId) return res.status(401).json({ error: "Unauthorized" });
+
+  const {
+    listing_id, product_id, client_name, transaction_type,
+    gross_amount, commission_rate, currency, notes, transaction_date,
+  } = req.body;
+
+  if (!gross_amount || commission_rate === undefined) {
+    return res.status(400).json({ error: "gross_amount and commission_rate are required." });
+  }
+
+  try {
+    await ensureCommissionsTable();
+    const result = await pool.query(
+      `INSERT INTO agent_commissions
+         (agent_id, listing_id, product_id, client_name, transaction_type,
+          gross_amount, commission_rate, currency, notes, transaction_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [
+        agentId, listing_id || null, product_id || null, client_name || null,
+        transaction_type || "sale", gross_amount, commission_rate,
+        currency || "NGN", notes || null, transaction_date || new Date(),
+      ],
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Commissions POST error:", err.message);
+    return res.status(500).json({ error: "Could not save commission" });
+  }
+});
+
+// PATCH /agents/commissions/:id — update status or notes
+router.patch("/commissions/:id", async (req, res) => {
+  const agentId = getUserKey(req);
+  if (!agentId) return res.status(401).json({ error: "Unauthorized" });
+
+  const { status, notes } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE agent_commissions
+       SET status = COALESCE($1, status),
+           notes = COALESCE($2, notes),
+           updated_at = NOW()
+       WHERE id = $3 AND agent_id = $4
+       RETURNING *`,
+      [status || null, notes || null, req.params.id, agentId],
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Commission not found." });
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Commissions PATCH error:", err.message);
+    return res.status(500).json({ error: "Could not update commission" });
+  }
+});
+
+// DELETE /agents/commissions/:id
+router.delete("/commissions/:id", async (req, res) => {
+  const agentId = getUserKey(req);
+  if (!agentId) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    await pool.query(
+      "DELETE FROM agent_commissions WHERE id = $1 AND agent_id = $2",
+      [req.params.id, agentId],
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Commissions DELETE error:", err.message);
+    return res.status(500).json({ error: "Could not delete commission" });
   }
 });
 

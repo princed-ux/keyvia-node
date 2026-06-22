@@ -11,6 +11,9 @@ const PLACE_GROUPS = {
   restaurants_cafes: ["restaurant", "cafe"],
   parks_recreation: ["park", "gym", "stadium"],
   malls_shopping: ["shopping_mall", "store"],
+  pharmacies: ["pharmacy", "drugstore"],
+  banks: ["bank", "atm"],
+  hotels: ["lodging", "hotel"],
 };
 
 const toNumber = (value) => {
@@ -78,6 +81,8 @@ const computeWalkScore = (snapshot = {}) => {
   const transit500 = countNearby(snapshot.transit, 500);
   const shopping1k = countNearby(snapshot.malls_shopping, 1000);
   const schools1k = countNearby(snapshot.schools, 1000);
+  const pharmacy500 = countNearby(snapshot.pharmacies, 500);
+  const bank1k = countNearby(snapshot.banks, 1000);
 
   if (within200 > 0) score += 15;
   else if (within500 > 0) score += 10;
@@ -87,6 +92,8 @@ const computeWalkScore = (snapshot = {}) => {
   if (transit500 > 0) score += 15;
   if (shopping1k > 0) score += 10;
   if (schools1k > 0) score += 10;
+  if (pharmacy500 > 0) score += 8;
+  if (bank1k > 0) score += 5;
   score += Math.min(within500 * 3, 10);
   score += Math.min(transit500 * 3, 5);
 
@@ -129,7 +136,8 @@ const buildLifestyleSummary = (snapshot = {}) => {
   const transitCount = Array.isArray(snapshot.transit) ? snapshot.transit.length : 0;
   const nearbyDailyErrands =
     (Array.isArray(snapshot.groceries_markets) ? snapshot.groceries_markets.length : 0) +
-    (Array.isArray(snapshot.restaurants_cafes) ? snapshot.restaurants_cafes.length : 0);
+    (Array.isArray(snapshot.restaurants_cafes) ? snapshot.restaurants_cafes.length : 0) +
+    (Array.isArray(snapshot.pharmacies) ? snapshot.pharmacies.length : 0);
 
   const walkabilityLabel =
     transitCount >= 3 || nearbyDailyErrands >= 4
@@ -181,6 +189,9 @@ const OVERPASS_CATEGORIES = {
   restaurants_cafes: ['"amenity"="restaurant"', '"amenity"="cafe"'],
   parks_recreation: ['"leisure"="park"', '"leisure"="garden"', '"leisure"="playground"'],
   malls_shopping: ['"shop"="mall"', '"shop"="department_store"'],
+  pharmacies: ['"amenity"="pharmacy"'],
+  banks: ['"amenity"="bank"', '"amenity"="atm"'],
+  hotels: ['"tourism"="hotel"', '"tourism"="guest_house"'],
 };
 
 const buildOverpassQuery = (lat, lng, radius = 3500) => {
@@ -226,7 +237,14 @@ const scanOverpassPlaces = async ({ latitude, longitude, radiusMeters = 3500 }) 
   let response;
   try {
     response = await axios.post(OVERPASS_URL, `data=${encodeURIComponent(query)}`, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        // overpass-api.de's anti-abuse proxy returns 406 for requests with a
+        // generic/empty User-Agent. A descriptive UA (per Overpass usage policy)
+        // plus an explicit Accept fixes the rejection.
+        Accept: "application/json",
+        "User-Agent": "Keyvia/1.0 (+https://getkeyvia.com; location-intelligence)",
+      },
       timeout: 25000,
     });
   } catch (err) {
@@ -343,6 +361,22 @@ const scanGooglePlaces = async ({ latitude, longitude, radiusMeters = 3500 }) =>
     console.warn("[LocationIntelligence] Street view metadata skipped:", err?.message);
   }
 
+  // If Google returned nothing (e.g. Places API not enabled, or no coverage)
+  // and there's no Street View, report "unavailable" so scanLocationIntelligence
+  // (provider "auto") falls back to OpenStreetMap instead of saving an empty
+  // Google snapshot. When Google IS enabled and returns places, it keeps using it.
+  const totalGooglePlaces = Object.values(output).reduce(
+    (sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0),
+    0,
+  );
+  if (totalGooglePlaces === 0 && !streetView.available) {
+    return {
+      provider: "none",
+      status: "unavailable",
+      street_view: { available: false, provider: "none" },
+    };
+  }
+
   return {
     provider: "google",
     status: "ready",
@@ -369,6 +403,9 @@ export const ensureLocationIntelligenceTables = async (client = pool) => {
       restaurants_cafes JSONB DEFAULT '[]',
       parks_recreation JSONB DEFAULT '[]',
       malls_shopping JSONB DEFAULT '[]',
+      pharmacies JSONB DEFAULT '[]',
+      banks JSONB DEFAULT '[]',
+      hotels JSONB DEFAULT '[]',
       lifestyle_summary JSONB DEFAULT '{}',
       street_view JSONB DEFAULT '{}',
       error_message TEXT NULL,
@@ -379,6 +416,14 @@ export const ensureLocationIntelligenceTables = async (client = pool) => {
 
     CREATE INDEX IF NOT EXISTS idx_location_intelligence_product
       ON location_intelligence_snapshots (product_id, created_at DESC);
+  `);
+
+  // Add new POI columns to existing tables (idempotent)
+  await client.query(`
+    ALTER TABLE location_intelligence_snapshots
+      ADD COLUMN IF NOT EXISTS pharmacies JSONB DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS banks      JSONB DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS hotels     JSONB DEFAULT '[]';
   `);
 };
 
@@ -452,6 +497,9 @@ export const scanLocationIntelligence = async ({
     restaurants_cafes: result.restaurants_cafes || EMPTY_ARRAY,
     parks_recreation: result.parks_recreation || EMPTY_ARRAY,
     malls_shopping: result.malls_shopping || EMPTY_ARRAY,
+    pharmacies: result.pharmacies || EMPTY_ARRAY,
+    banks: result.banks || EMPTY_ARRAY,
+    hotels: result.hotels || EMPTY_ARRAY,
     lifestyle_summary: result.lifestyle_summary || buildLifestyleSummary(result),
     street_view: result.street_view || { available: false, provider: result.provider || provider },
   };
@@ -472,6 +520,9 @@ export const scanLocationIntelligence = async ({
       restaurants_cafes,
       parks_recreation,
       malls_shopping,
+      pharmacies,
+      banks,
+      hotels,
       lifestyle_summary,
       street_view,
       error_message,
@@ -481,7 +532,8 @@ export const scanLocationIntelligence = async ({
     VALUES (
       $1, $2, $3, $4, $5, $6,
       $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb,
-      $14::jsonb, $15::jsonb, $16, NOW(), NOW()
+      $14::jsonb, $15::jsonb, $16::jsonb,
+      $17::jsonb, $18::jsonb, $19, NOW(), NOW()
     )
     RETURNING *
     `,
@@ -499,6 +551,9 @@ export const scanLocationIntelligence = async ({
       JSON.stringify(snapshot.restaurants_cafes),
       JSON.stringify(snapshot.parks_recreation),
       JSON.stringify(snapshot.malls_shopping),
+      JSON.stringify(snapshot.pharmacies),
+      JSON.stringify(snapshot.banks),
+      JSON.stringify(snapshot.hotels),
       JSON.stringify(snapshot.lifestyle_summary),
       JSON.stringify(snapshot.street_view),
       result.error_message || null,

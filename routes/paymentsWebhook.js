@@ -1,5 +1,6 @@
 import express from "express";
 import crypto from "crypto";
+import { pool } from "../db.js";
 
 const router = express.Router();
 
@@ -68,13 +69,33 @@ router.post("/:provider", async (req, res) => {
       }
     }
 
-    // Signature verified. Direct/coin payments are retired (DB-1) — subscription
-    // is the billing model and is activated through the authenticated
-    // /api/subscriptions/verify flow. We just acknowledge the event so the
-    // provider doesn't retry. (A dedicated subscription webhook is a Phase-2 item.)
+    // Signature verified. Extract a stable event ID for idempotency tracking.
     const event = req.body;
     const eventType = event?.event || event?.data?.status || "unknown";
-    console.log(`[PaymentsWebhook] ${provider} event acknowledged: ${eventType}`);
+
+    let eventId = null;
+    if (provider === "paystack")    eventId = event?.data?.reference;
+    if (provider === "flutterwave") eventId = String(event?.data?.id || event?.data?.tx_ref || "");
+    if (provider === "korapay")     eventId = event?.data?.reference;
+
+    if (eventId) {
+      const insert = await pool.query(
+        `INSERT INTO webhook_events (provider, event_id, event_type, received_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (provider, event_id) DO NOTHING`,
+        [provider, eventId, eventType],
+      );
+      if (insert.rowCount === 0) {
+        // Already processed — acknowledge without re-processing
+        console.log(`[PaymentsWebhook] duplicate event skipped: ${provider}/${eventId}`);
+        return res.status(200).json({ status: "already_received" });
+      }
+    }
+
+    // Subscription activation is handled through the authenticated
+    // /api/subscriptions/verify flow. The webhook is acknowledged so the
+    // provider does not retry. Full webhook processing is a Phase-2 item.
+    console.log(`[PaymentsWebhook] ${provider} event acknowledged: ${eventType} (${eventId || "no-id"})`);
 
     return res.status(200).json({ status: "received" });
   } catch (err) {

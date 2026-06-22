@@ -17,11 +17,17 @@ import { COUNTRY_ISO_MAP } from "../utils/countryMap.js";
 import { evaluateListingRisk } from "../services/listingRiskService.js";
 import { enforceListingLimit } from "../services/subscriptionService.js";
 import { getEffectivePlanForUser } from "../utils/effectivePlan.js";
+import { notifyMatchingSavedSearches } from "../services/savedSearchService.js";
+import settingsService from "../services/settingsService.js";
 import {
   getLatestLocationIntelligence,
   scanLocationIntelligence,
 } from "../services/locationIntelligenceService.js";
 import { resolvePublicProfilePayload } from "./profileController.js";
+import {
+  sendTourRequestEmail,
+  sendBrokerageReviewReadyEmail,
+} from "../utils/emailService.js";
 import {
   createNotification,
   notifyListingAssigned,
@@ -1269,7 +1275,12 @@ export const createListing = async (req, res) => {
       verificationStatus === "approved" ||
       verificationStatus === "verified";
 
-    if (!isVerifiedUser) {
+    // B2: require_kyc platform setting gates this. ON (default) => verification
+    // required to publish (preserves existing behavior); OFF => admins permit
+    // unverified users to publish.
+    const requireKyc = await settingsService.getBool("require_kyc");
+
+    if (requireKyc && !isVerifiedUser) {
       return res.status(403).json({
         message: "You must complete verification before creating listings.",
 
@@ -1332,9 +1343,22 @@ export const createListing = async (req, res) => {
 
     const product_id = await generateUniqueProductId();
 
-    const safePhotos = Array.isArray(b.photos)
-      ? b.photos.slice(0, photoLimit)
+    // Enforce the plan photo limit server-side. The frontend already caps
+    // uploads, so this only rejects direct-API attempts to exceed the limit —
+    // returning a clear error rather than silently dropping photos.
+    const submittedPhotos = Array.isArray(b.photos)
+      ? b.photos.filter(Boolean)
       : [];
+
+    if (submittedPhotos.length > photoLimit) {
+      return res.status(400).json({
+        message: `Your plan allows up to ${photoLimit} photos per listing. You attached ${submittedPhotos.length}. Remove ${submittedPhotos.length - photoLimit}, or upgrade your plan for more.`,
+
+        code: "PHOTO_LIMIT_EXCEEDED",
+      });
+    }
+
+    const safePhotos = submittedPhotos.slice(0, photoLimit);
 
     const featuresArr = normalizeFeatures(b.features || b.amenities);
 
@@ -2795,6 +2819,12 @@ export const deleteListing = async (req, res) => {
 
     // Do not delete notifications by product_id unless the notifications table has that column.
 
+    // Clean orphaned records that have no FK cascade to listings
+    await pool.query("DELETE FROM listing_price_history WHERE product_id = $1", [product_id]);
+    await pool.query("DELETE FROM listing_status_history WHERE product_id = $1", [product_id]);
+    await pool.query("DELETE FROM location_intelligence_snapshots WHERE listing_id::text = $1::text", [product_id]);
+    await pool.query("DELETE FROM listing_engagement_snapshots WHERE listing_id::text = $1::text", [product_id]);
+
     await pool.query("DELETE FROM listings WHERE product_id=$1", [product_id]);
 
     // ✅ respond immediately (DO NOT WAIT FOR S3)
@@ -3847,44 +3877,47 @@ export const reportListing = async (req, res) => {
       );
     }
 
-    pool
-      .query(
-        `
+    // B2: gated by the notify_admin_flagged_listing setting.
+    if (await settingsService.getBool("notify_admin_flagged_listing")) {
+      pool
+        .query(
+          `
         SELECT unique_id
         FROM users
         WHERE LOWER(role::text) IN ('admin', 'super_admin')
            OR is_admin = true
            OR is_super_admin = true
         `,
-      )
-      .then(async ({ rows }) => {
-        await Promise.allSettled(
-          rows.map((admin) =>
-            createNotification({
-              recipientId: admin.unique_id,
-              type: "listing_reported",
-              title: "Listing Report Submitted",
-              message: `A public report was submitted for "${listing.title || product_id}".`,
-              entityType: "listing",
-              entityId: product_id,
-              productId: product_id,
-              actionUrl: "/admin/listings",
-              actionLabel: "Review Listing",
-              data: {
-                product_id,
-                reporter_id: reporterId,
-                reason: reportSummary,
-              },
-            }),
-          ),
-        );
-      })
-      .catch((notifyErr) => {
-        console.warn(
-          "[ReportListing] Admin notification failed:",
-          notifyErr?.message,
-        );
-      });
+        )
+        .then(async ({ rows }) => {
+          await Promise.allSettled(
+            rows.map((admin) =>
+              createNotification({
+                recipientId: admin.unique_id,
+                type: "listing_reported",
+                title: "Listing Report Submitted",
+                message: `A public report was submitted for "${listing.title || product_id}".`,
+                entityType: "listing",
+                entityId: product_id,
+                productId: product_id,
+                actionUrl: "/admin/listings",
+                actionLabel: "Review Listing",
+                data: {
+                  product_id,
+                  reporter_id: reporterId,
+                  reason: reportSummary,
+                },
+              }),
+            ),
+          );
+        })
+        .catch((notifyErr) => {
+          console.warn(
+            "[ReportListing] Admin notification failed:",
+            notifyErr?.message,
+          );
+        });
+    }
 
     return res.status(201).json({
       success: true,
@@ -4129,6 +4162,27 @@ export const requestListingTour = async (req, res) => {
         source,
       },
     });
+
+    // Email the agent / owner about the tour request
+    try {
+      const recipientRes = await pool.query(
+        "SELECT name, email FROM users WHERE unique_id::text = $1::text LIMIT 1",
+        [String(recipientId)],
+      );
+      const recipientContact = recipientRes.rows[0];
+      if (recipientContact?.email) {
+        await sendTourRequestEmail({
+          email: recipientContact.email,
+          name: recipientContact.name,
+          propertyTitle: listing.title || listing.address || product_id,
+          buyerName: req.user?.name || "A buyer",
+          tourType: getTourTypeLabel(normalizedTourType),
+          preferredDate: preferred_date || requested_date || null,
+          preferredTime: preferred_time || requested_time || null,
+          actionUrl: null,
+        }).catch(() => null);
+      }
+    } catch (_) {}
 
     return res.status(201).json({
       success: true,
@@ -4681,6 +4735,19 @@ export const getListingAnalytics = async (req, res) => {
       });
     }
 
+    const effectivePlan = await getEffectivePlanForUser(
+      String(req.user?.unique_id || req.user?.id || ""),
+    );
+    if (!effectivePlan?.limits?.analytics) {
+      return res.status(403).json({
+        success: false,
+        upgrade_required: true,
+        current_plan: effectivePlan?.planId || "free",
+        required_level: "basic",
+        message: "Listing analytics require a Pro or Elite plan.",
+      });
+    }
+
     const hasViewEvents = await tableExists("listing_view_events");
     const hasInquiries = await tableExists("listing_inquiries");
     const hasReports = await tableExists("safety_reports");
@@ -4854,6 +4921,9 @@ export const getListingLocationIntelligence = async (req, res) => {
           restaurants_cafes: [],
           parks_recreation: [],
           malls_shopping: [],
+          pharmacies: [],
+          banks: [],
+          hotels: [],
           lifestyle_summary: {},
           street_view: { available: false },
         },
@@ -6576,8 +6646,14 @@ export const updateListingStatus = async (req, res) => {
 
     let isActiveValue = listing.is_active;
 
+    // When Keyvia admin approves a listing that still requires brokerage review,
+    // do NOT publish it yet — route it to the brokerage queue instead.
+    const needsBrokerageHandoff =
+      status === "approved" &&
+      listing.brokerage_review_status === "awaiting_keyvia";
+
     if (status === "approved") {
-      isActiveValue = true;
+      isActiveValue = needsBrokerageHandoff ? false : true;
     } else if (status === "rejected" || status === "pending") {
       isActiveValue = false;
     }
@@ -6604,6 +6680,57 @@ export const updateListingStatus = async (req, res) => {
       product_id,
     ]);
     const updatedListing = result.rows[0];
+
+    // Hand off to brokerage review now that Keyvia has approved
+    if (needsBrokerageHandoff) {
+      await pool.query(
+        `UPDATE listings SET brokerage_review_status = 'pending' WHERE product_id = $1`,
+        [product_id],
+      );
+      updatedListing.brokerage_review_status = "pending";
+
+      // Notify the brokerage owner via socket
+      const brokerageOwnerId = listing.agency_id || listing.brokerage_id;
+      if (req.io && brokerageOwnerId) {
+        req.io.to(String(brokerageOwnerId)).emit("brokerageListingReadyForReview", {
+          product_id,
+          title: listing.title,
+          message: "A listing has passed Keyvia review and is ready for your approval.",
+        });
+      }
+
+      // Create an in-app notification for the brokerage owner
+      if (brokerageOwnerId) {
+        createNotification({
+          userId: brokerageOwnerId,
+          type: "brokerage_listing_review",
+          title: "Listing ready for review",
+          message: `"${listing.title || "A listing"}" has been approved by Keyvia and is awaiting your brokerage approval.`,
+          resourceType: "listing",
+          resourceId: product_id,
+          io: req.io,
+        }).catch(() => {});
+
+        // Best-effort email to the brokerage owner (never blocks the handoff).
+        pool
+          .query(
+            `SELECT email, name FROM users WHERE unique_id::text = $1::text LIMIT 1`,
+            [String(brokerageOwnerId)],
+          )
+          .then((r) => {
+            const owner = r.rows[0];
+            if (owner?.email) {
+              return sendBrokerageReviewReadyEmail({
+                email: owner.email,
+                brokerageName: owner.name,
+                listingTitle: listing.title,
+                productId: product_id,
+              });
+            }
+          })
+          .catch(() => {});
+      }
+    }
 
     await recordListingHistory({
       listing,
@@ -6649,6 +6776,18 @@ export const updateListingStatus = async (req, res) => {
 
       io: req.io,
     });
+
+    // Alert buyers whose saved searches match a newly-live listing (best-effort).
+    if (
+      ["approved", "live", "published"].includes(
+        String(status || "").toLowerCase(),
+      ) &&
+      updatedListing.is_active
+    ) {
+      setImmediate(() => {
+        notifyMatchingSavedSearches(updatedListing, req.io).catch(() => {});
+      });
+    }
 
     if (String(listing.status ?? "") !== String(updatedListing.status ?? "")) {
       setImmediate(() => {
@@ -7789,36 +7928,26 @@ export const batchAnalyzeListings = async (req, res) => {
   try {
     console.log("🚀 Starting listing batch AI analysis...");
 
+    // Optional: restrict to specific selected listings ("Analyze selected").
+    // Falls back to all pending listings when no ids are provided.
+    const requestedIds = Array.isArray(req.body?.product_ids)
+      ? req.body.product_ids.filter(Boolean).map(String)
+      : [];
+
     const pendingQ = await pool.query(
-      `
-
-      SELECT
-
-        product_id,
-
-        uploaded_by_id,
-
-        agent_unique_id,
-
-        created_by,
-
-        title,
-
-        status,
-
-        is_active
-
-      FROM listings
-
-      WHERE status = 'pending'
-
-      OR moderation_status = 'pending'
-
-      ORDER BY created_at ASC
-
-      LIMIT 100;
-
-      `,
+      requestedIds.length
+        ? `SELECT product_id, uploaded_by_id, agent_unique_id, created_by, title, status, is_active
+           FROM listings
+           WHERE product_id = ANY($1)
+             AND (status = 'pending' OR moderation_status = 'pending')
+           ORDER BY created_at ASC
+           LIMIT 100`
+        : `SELECT product_id, uploaded_by_id, agent_unique_id, created_by, title, status, is_active
+           FROM listings
+           WHERE status = 'pending' OR moderation_status = 'pending'
+           ORDER BY created_at ASC
+           LIMIT 100`,
+      requestedIds.length ? [requestedIds] : [],
     );
 
     const pendingListings = pendingQ.rows;
@@ -7852,8 +7981,14 @@ export const batchAnalyzeListings = async (req, res) => {
     const results = [];
 
     const aiSettings = await getAiSettings();
+    const approveThreshold = Number(aiSettings.ai_auto_approve_threshold) || 80;
+    const rejectThreshold = Number(aiSettings.ai_auto_reject_threshold) || 35;
 
-    for (const listing of pendingListings) {
+    // Process in batches of 5 concurrently — prevents serial bottleneck at scale
+    const _CONCURRENCY = 5;
+    for (let _bi = 0; _bi < pendingListings.length; _bi += _CONCURRENCY) {
+      await Promise.allSettled(
+        pendingListings.slice(_bi, _bi + _CONCURRENCY).map(async (listing) => {
       try {
         const report = await performFullAnalysis(listing.product_id);
 
@@ -7915,7 +8050,7 @@ export const batchAnalyzeListings = async (req, res) => {
           aiSettings.ai_require_manual_review_medium_risk !== false;
 
         if (
-          (safeVerdicts.includes(verdict) || score >= 80) &&
+          (safeVerdicts.includes(verdict) || score >= approveThreshold) &&
           shouldAutoApprove
         ) {
           newStatus = "approved";
@@ -7926,7 +8061,7 @@ export const batchAnalyzeListings = async (req, res) => {
 
           approved += 1;
         } else if (
-          (rejectVerdicts.includes(verdict) || score <= 35) &&
+          (rejectVerdicts.includes(verdict) || score <= rejectThreshold) &&
           shouldAutoReject
         ) {
           newStatus = "rejected";
@@ -7944,7 +8079,7 @@ export const batchAnalyzeListings = async (req, res) => {
           isActive = false;
 
           remaining += 1;
-        } else if (safeVerdicts.includes(verdict) || score >= 80) {
+        } else if (safeVerdicts.includes(verdict) || score >= approveThreshold) {
           newStatus = "approved";
 
           moderationStatus = "approved";
@@ -8043,6 +8178,11 @@ export const batchAnalyzeListings = async (req, res) => {
         );
 
         const updatedListing = updateQ.rows[0];
+
+        // Alert buyers whose saved searches match a newly auto-approved listing.
+        if (newStatus === "approved" && isActive && updatedListing) {
+          notifyMatchingSavedSearches(updatedListing, req.io).catch(() => {});
+        }
 
         const receiverId =
           listing.uploaded_by_id ||
@@ -8161,7 +8301,9 @@ export const batchAnalyzeListings = async (req, res) => {
           error: itemErr?.message,
         });
       }
-    }
+        }) // end per-listing async fn
+      ); // end Promise.allSettled for this batch
+    } // end batch for-loop
 
     return res.json({
       success: true,
@@ -9282,8 +9424,10 @@ export const submitListingDraft = async (req, res) => {
 
     const finalIsActive = shouldAutoPublish;
 
+    // "awaiting_keyvia" means the listing must pass Keyvia moderation BEFORE it
+    // enters the brokerage queue. The brokerage is not notified until admin approves.
     const finalBrokerageReviewStatus = requiresBrokerageApproval
-      ? "pending"
+      ? "awaiting_keyvia"
       : "not_required";
 
     const moderationReason = risk.flags?.length
@@ -9967,9 +10111,9 @@ export const submitListingDraft = async (req, res) => {
       });
     }
 
-    // Background AI auto-scan if enabled
+    // Background AI auto-scan if enabled (runs for all listings; publish guards handle visibility)
 
-    if (!shouldAutoPublish && !requiresBrokerageApproval) {
+    if (!shouldAutoPublish) {
       setImmediate(async () => {
         try {
           const aiSettings = await getAiSettings();
@@ -10003,6 +10147,10 @@ export const submitListingDraft = async (req, res) => {
               aiSettings.ai_auto_approve_low_risk !== false;
             const shouldAutoReject =
               aiSettings.ai_auto_reject_high_risk !== false;
+            const approveThreshold =
+              Number(aiSettings.ai_auto_approve_threshold) || 80;
+            const rejectThreshold =
+              Number(aiSettings.ai_auto_reject_threshold) || 35;
 
             let newStatus = "pending";
             let moderationStatus = "pending";
@@ -10013,14 +10161,14 @@ export const submitListingDraft = async (req, res) => {
                 : report?.verdict || "AI analysis completed.";
 
             if (
-              (safeVerdicts.includes(verdict) || score >= 80) &&
+              (safeVerdicts.includes(verdict) || score >= approveThreshold) &&
               shouldAutoApprove
             ) {
               newStatus = "approved";
               moderationStatus = "approved";
               isActive = true;
             } else if (
-              (rejectVerdicts.includes(verdict) || score <= 35) &&
+              (rejectVerdicts.includes(verdict) || score <= rejectThreshold) &&
               shouldAutoReject
             ) {
               newStatus = "rejected";
@@ -10042,6 +10190,11 @@ export const submitListingDraft = async (req, res) => {
                   listing.product_id,
                 ],
               );
+
+              // Alert buyers whose saved searches match a newly auto-approved listing.
+              if (newStatus === "approved" && isActive) {
+                notifyMatchingSavedSearches(listing, req.io).catch(() => {});
+              }
 
               const receiverId =
                 listing.uploaded_by_id ||
@@ -10130,5 +10283,83 @@ export const submitListingDraft = async (req, res) => {
 
       details: err?.message,
     });
+  }
+};
+
+export const getListingComparables = async (req, res) => {
+  const { product_id } = req.params;
+
+  try {
+    const { rows: [subject] } = await pool.query(
+      `SELECT product_id, city, property_type, bedrooms, price, area_sqft, currency
+       FROM listings
+       WHERE product_id = $1 AND is_active = true
+       LIMIT 1`,
+      [product_id],
+    );
+
+    if (!subject) return res.status(404).json({ error: "Listing not found." });
+
+    const { city, property_type, bedrooms, price, currency } = subject;
+    const bedroomsInt = Number(bedrooms) || 0;
+
+    if (!city || !property_type) {
+      return res.json({ comps: [], stats: null, subject_currency: currency });
+    }
+
+    const { rows: comps } = await pool.query(
+      `SELECT
+         l.product_id,
+         l.title,
+         l.price,
+         l.currency,
+         l.area_sqft,
+         l.price_per_sqft,
+         l.bedrooms,
+         l.bathrooms,
+         l.property_type,
+         l.listing_type,
+         l.city,
+         l.status,
+         FLOOR(EXTRACT(EPOCH FROM (NOW() - l.created_at)) / 86400)::INT AS days_on_platform,
+         CASE WHEN jsonb_array_length(l.photos) > 0 THEN l.photos->0->>'url' ELSE NULL END AS cover_photo
+       FROM listings l
+       WHERE
+         l.product_id != $1
+         AND LOWER(TRIM(l.city)) = LOWER(TRIM($2))
+         AND l.property_type = $3
+         AND ABS(COALESCE(l.bedrooms, 0) - $4) <= 1
+         AND l.created_at >= NOW() - INTERVAL '90 days'
+         AND l.is_active = true
+       ORDER BY ABS(COALESCE(l.price, 0) - $5) ASC
+       LIMIT 5`,
+      [product_id, city, property_type, bedroomsInt, price || 0],
+    );
+
+    const { rows: [stats] } = await pool.query(
+      `SELECT
+         COUNT(*)::INT AS total_active,
+         ROUND(AVG(price))::BIGINT AS avg_price,
+         ROUND(AVG(NULLIF(price_per_sqft, 0)))::INT AS avg_price_per_sqft,
+         MIN(price) AS min_price,
+         MAX(price) AS max_price
+       FROM listings
+       WHERE
+         LOWER(TRIM(city)) = LOWER(TRIM($1))
+         AND property_type = $2
+         AND is_active = true
+         AND price > 0
+         AND created_at >= NOW() - INTERVAL '90 days'`,
+      [city, property_type],
+    );
+
+    return res.json({
+      comps,
+      stats: stats?.total_active > 0 ? stats : null,
+      subject_currency: currency,
+    });
+  } catch (err) {
+    console.error("[getListingComparables] Error:", err);
+    return res.status(500).json({ error: "Failed to fetch comparables." });
   }
 };

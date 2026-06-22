@@ -222,6 +222,106 @@ export const sendVerificationStatusEmail = async ({
 };
 
 /* ======================================================
+   🏠 LISTING LIFECYCLE EMAILS
+   (submitted / approved / rejected / brokerage review ready)
+====================================================== */
+const listingActionUrl = (productId) =>
+  `${CLIENT_URL || "https://getkeyvia.com"}/listing/${productId}`;
+
+export const sendListingSubmittedEmail = async ({
+  email,
+  name,
+  listingTitle,
+  productId,
+} = {}) => {
+  if (!email) return false;
+
+  const displayName = name || "there";
+  const title = listingTitle || "Your listing";
+
+  return sendNotificationEmail({
+    to: email,
+    subject: "Your listing was submitted for review",
+    title: "Listing submitted",
+    fromName: "Keyvia",
+    message: `Hi ${displayName}, "${title}" has been submitted and is now in review. We'll let you know as soon as it's approved or if anything needs your attention.`,
+    actionUrl: productId ? listingActionUrl(productId) : null,
+    actionLabel: "View listing",
+  });
+};
+
+export const sendListingStatusEmail = async ({
+  email,
+  name,
+  listingTitle,
+  productId,
+  status,
+  reason = null,
+} = {}) => {
+  if (!email) return false;
+
+  const normalizedStatus = String(status || "").toLowerCase();
+  const approved =
+    normalizedStatus === "approved" ||
+    normalizedStatus === "published" ||
+    normalizedStatus === "live";
+  const rejected = normalizedStatus === "rejected";
+  const displayName = name || "there";
+  const title = listingTitle || "Your listing";
+
+  let subject;
+  let heading;
+  let message;
+
+  if (approved) {
+    subject = "Your listing was approved";
+    heading = "Listing approved";
+    message = `Hi ${displayName}, great news — "${title}" has been approved and is now live on Keyvia.`;
+  } else if (rejected) {
+    subject = "Your listing needs attention";
+    heading = "Listing not approved";
+    message = `Hi ${displayName}, "${title}" was not approved.${reason ? ` Reason: ${reason}` : " Please review the details in your dashboard and resubmit."}`;
+  } else {
+    subject = "Update on your listing";
+    heading = "Listing update";
+    message = `Hi ${displayName}, the status of "${title}" changed to ${normalizedStatus || "pending"}.`;
+  }
+
+  return sendNotificationEmail({
+    to: email,
+    subject,
+    title: heading,
+    fromName: "Keyvia",
+    message,
+    actionUrl: productId ? listingActionUrl(productId) : null,
+    actionLabel: "View listing",
+  });
+};
+
+export const sendBrokerageReviewReadyEmail = async ({
+  email,
+  brokerageName,
+  listingTitle,
+  productId,
+} = {}) => {
+  if (!email) return false;
+
+  const title = listingTitle || "A listing";
+
+  return sendNotificationEmail({
+    to: email,
+    subject: "A listing is ready for your brokerage review",
+    title: "Listing ready for review",
+    fromName: "Keyvia",
+    message: `${brokerageName ? `${brokerageName},` : "Hello,"} "${title}" has passed Keyvia review and is awaiting your brokerage approval.`,
+    actionUrl: productId
+      ? `${CLIENT_URL || "https://getkeyvia.com"}/brokerage/dashboard`
+      : `${CLIENT_URL || "https://getkeyvia.com"}/brokerage/dashboard`,
+    actionLabel: "Review listing",
+  });
+};
+
+/* ======================================================
    💳 SUBSCRIPTION BILLING EMAILS (receipt + refund)
 ====================================================== */
 const formatMoney = (amount, currency) => {
@@ -302,6 +402,163 @@ export const sendSubscriptionReceiptEmail = async ({
     console.error("Subscription receipt email failed:", error.message);
     return false;
   }
+};
+
+/* ======================================================
+   🏠 NEW OFFER RECEIVED (agent / owner)
+====================================================== */
+export const sendNewOfferEmail = async ({
+  email, name, propertyTitle, offerAmount, currency = "NGN",
+  buyerName, offerType = "purchase", actionUrl = null,
+} = {}) => {
+  if (!email) return false;
+  const displayName = name || "there";
+  const sym = currency === "NGN" ? "₦" : currency === "GBP" ? "£" : currency === "EUR" ? "€" : "$";
+  const formatted = `${sym}${Number(offerAmount || 0).toLocaleString()}`;
+  const link = actionUrl || `${CLIENT_URL || "https://getkeyvia.com"}/dashboard/applications`;
+
+  return sendNotificationEmail({
+    to: email,
+    subject: `New ${offerType} offer on "${propertyTitle || "your listing"}"`,
+    title: "You received a new offer",
+    fromName: "Keyvia Marketplace",
+    message: `Hi ${displayName}, ${buyerName || "A buyer"} has submitted a ${offerType} offer of <strong>${formatted}</strong> on <strong>"${propertyTitle || "your listing"}"</strong>. Review the offer and respond in your dashboard.`,
+    actionUrl: link,
+    actionLabel: "Review Offer",
+  });
+};
+
+/* ======================================================
+   💬 OFFER RESPONSE (buyer receives accept/reject/counter)
+====================================================== */
+export const sendOfferResponseEmail = async ({
+  email, name, propertyTitle, offerAmount, currency = "NGN",
+  responseType = "accepted", counterAmount = null, actionUrl = null,
+} = {}) => {
+  if (!email) return false;
+  const displayName = name || "there";
+  const sym = currency === "NGN" ? "₦" : currency === "GBP" ? "£" : currency === "EUR" ? "€" : "$";
+  const formatted = `${sym}${Number(offerAmount || 0).toLocaleString()}`;
+  const link = actionUrl || `${CLIENT_URL || "https://getkeyvia.com"}/buyer/offers`;
+
+  const responseMessages = {
+    accepted: `Great news, ${displayName}! Your offer of <strong>${formatted}</strong> on <strong>"${propertyTitle || "the property"}"</strong> has been <strong>accepted</strong>. Log in to proceed with next steps.`,
+    rejected: `Hi ${displayName}, your offer of <strong>${formatted}</strong> on <strong>"${propertyTitle || "the property"}"</strong> was not accepted this time. You can submit a new offer or continue browsing.`,
+    countered: `Hi ${displayName}, the seller has countered your offer on <strong>"${propertyTitle || "the property"}"</strong>${counterAmount ? ` with a new price of <strong>${sym}${Number(counterAmount).toLocaleString()}</strong>` : ""}. Review and respond in your dashboard.`,
+    withdrawn: `Hi ${displayName}, an offer on <strong>"${propertyTitle || "the property"}"</strong> has been withdrawn.`,
+  };
+
+  const subjectMap = {
+    accepted: `Your offer was accepted — "${propertyTitle || "property"}"`,
+    rejected: `Offer update on "${propertyTitle || "property"}"`,
+    countered: `Counter-offer received on "${propertyTitle || "property"}"`,
+    withdrawn: `Offer withdrawn on "${propertyTitle || "property"}"`,
+  };
+
+  return sendNotificationEmail({
+    to: email,
+    subject: subjectMap[responseType] || `Offer update on "${propertyTitle || "property"}"`,
+    title: responseType === "accepted" ? "Offer accepted!" : responseType === "countered" ? "Counter-offer received" : "Offer update",
+    fromName: "Keyvia Marketplace",
+    message: responseMessages[responseType] || `Your offer status has changed to: ${responseType}.`,
+    actionUrl: link,
+    actionLabel: "View Offer",
+  });
+};
+
+/* ======================================================
+   📅 TOUR REQUEST RECEIVED (agent / owner)
+====================================================== */
+export const sendTourRequestEmail = async ({
+  email, name, propertyTitle, buyerName, tourType = "in-person",
+  preferredDate = null, preferredTime = null, actionUrl = null,
+} = {}) => {
+  if (!email) return false;
+  const displayName = name || "there";
+  const link = actionUrl || `${CLIENT_URL || "https://getkeyvia.com"}/dashboard`;
+  const dateInfo = [preferredDate, preferredTime].filter(Boolean).join(" at ");
+
+  return sendNotificationEmail({
+    to: email,
+    subject: `Tour request for "${propertyTitle || "your listing"}"`,
+    title: "New tour request",
+    fromName: "Keyvia Marketplace",
+    message: `Hi ${displayName}, <strong>${buyerName || "A buyer"}</strong> has requested a <strong>${tourType}</strong> tour of <strong>"${propertyTitle || "your listing"}"</strong>${dateInfo ? ` on <strong>${dateInfo}</strong>` : ""}. Log in to confirm or reschedule.`,
+    actionUrl: link,
+    actionLabel: "View Request",
+  });
+};
+
+/* ======================================================
+   ✉️ NEW MESSAGE RECEIVED
+====================================================== */
+export const sendNewMessageEmail = async ({
+  email, name, senderName, messagePreview = null, actionUrl = null,
+} = {}) => {
+  if (!email) return false;
+  const displayName = name || "there";
+  const link = actionUrl || `${CLIENT_URL || "https://getkeyvia.com"}/dashboard/messages`;
+  const preview = messagePreview
+    ? `<blockquote style="border-left:3px solid #09707d;margin:16px 0;padding:8px 16px;color:#64748b;font-style:italic;">${String(messagePreview).slice(0, 120)}${messagePreview.length > 120 ? "…" : ""}</blockquote>`
+    : "";
+
+  return sendNotificationEmail({
+    to: email,
+    subject: `New message from ${senderName || "a Keyvia member"}`,
+    title: "You have a new message",
+    fromName: "Keyvia",
+    message: `Hi ${displayName}, <strong>${senderName || "Someone"}</strong> sent you a message on Keyvia.${preview ? " Here's a preview:" : ""}${preview}`,
+    actionUrl: link,
+    actionLabel: "Open Message",
+  });
+};
+
+/* ======================================================
+   📋 APPLICATION RECEIVED (rich version — agent / owner)
+====================================================== */
+export const sendApplicationReceivedEmail = async ({
+  email, name, applicantName, propertyTitle, moveInDate = null, actionUrl = null,
+} = {}) => {
+  if (!email) return false;
+  const displayName = name || "there";
+  const link = actionUrl || `${CLIENT_URL || "https://getkeyvia.com"}/dashboard/applications`;
+
+  return sendNotificationEmail({
+    to: email,
+    subject: `New application for "${propertyTitle || "your listing"}"`,
+    title: "New application received",
+    fromName: "Keyvia Marketplace",
+    message: `Hi ${displayName}, <strong>${applicantName || "A prospective tenant"}</strong> has submitted an application for <strong>"${propertyTitle || "your listing"}"</strong>${moveInDate ? ` with a preferred move-in date of <strong>${moveInDate}</strong>` : ""}. Review their details and respond.`,
+    actionUrl: link,
+    actionLabel: "Review Application",
+  });
+};
+
+/* ======================================================
+   📋 APPLICATION STATUS UPDATE (rich version — buyer)
+====================================================== */
+export const sendApplicationStatusEmail = async ({
+  email, name, propertyTitle, status, actionUrl = null,
+} = {}) => {
+  if (!email) return false;
+  const displayName = name || "there";
+  const link = actionUrl || `${CLIENT_URL || "https://getkeyvia.com"}/buyer/applications`;
+  const statusDisplay = String(status || "updated").replaceAll("_", " ");
+
+  const isGood = ["approved", "accepted", "viewing_scheduled"].includes(status);
+  const message = isGood
+    ? `Hi ${displayName}, your application for <strong>"${propertyTitle || "the property"}"</strong> has been <strong>${statusDisplay}</strong>. Log in to see the next steps.`
+    : `Hi ${displayName}, there's an update on your application for <strong>"${propertyTitle || "the property"}"</strong>. Status: <strong>${statusDisplay}</strong>. Log in to review.`;
+
+  return sendNotificationEmail({
+    to: email,
+    subject: `Application update: ${statusDisplay} — "${propertyTitle || "property"}"`,
+    title: isGood ? `Application ${statusDisplay}!` : "Application update",
+    fromName: "Keyvia Marketplace",
+    message,
+    actionUrl: link,
+    actionLabel: "View Application",
+  });
 };
 
 export const sendSubscriptionRefundEmail = async ({

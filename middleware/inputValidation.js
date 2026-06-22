@@ -3,6 +3,18 @@
 // INPUT VALIDATION - Validates and sanitizes all user inputs
 // ============================================================================
 
+// Strip HTML tags and dangerous attribute patterns from user-supplied text.
+// This is a belt-and-suspenders guard; React already escapes JSX output, but
+// data also flows into emails and AI prompts where raw strings are used.
+const stripHtml = (str) => {
+  if (typeof str !== "string") return str;
+  return str
+    .replace(/<[^>]*>/g, "")          // remove all HTML tags
+    .replace(/javascript\s*:/gi, "")   // remove javascript: URIs
+    .replace(/on\w+\s*=/gi, "")        // remove inline event handlers
+    .trim();
+};
+
 export const validatePaymentInput = (req, res, next) => {
   const { listingId, currency, amount } = req.body;
 
@@ -42,10 +54,16 @@ export const validateListingInput = (req, res, next) => {
   const normalizedBedrooms = normalizeNumber(bedrooms);
   const normalizedBathrooms = normalizeNumber(bathrooms);
 
+  // Sanitize text fields before further validation
+  if (title !== undefined) req.body.title = stripHtml(title);
+  if (description !== undefined) req.body.description = stripHtml(description);
+
+  const sanitizedTitle = req.body.title;
+
   // Title validation
   if (
-    title &&
-    (typeof title !== "string" || title.length < 5 || title.length > 255)
+    sanitizedTitle &&
+    (typeof sanitizedTitle !== "string" || sanitizedTitle.length < 5 || sanitizedTitle.length > 255)
   ) {
     return res.status(400).json({ error: "Title must be 5-255 characters" });
   }
@@ -94,7 +112,10 @@ export const validateMessageInput = (req, res, next) => {
     return res.status(400).json({ error: "Message is required" });
   }
 
-  if (message.length < 1 || message.length > 5000) {
+  req.body.message = stripHtml(message);
+  const sanitizedMessage = req.body.message;
+
+  if (sanitizedMessage.length < 1 || sanitizedMessage.length > 5000) {
     return res.status(400).json({ error: "Message must be 1-5000 characters" });
   }
 

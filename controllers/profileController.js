@@ -1701,6 +1701,84 @@ export const updateProfileAvatar = async (req, res) => {
 };
 
 // =====================================================
+// UPDATE COVER IMAGE
+// PUT /api/profile/cover
+// Saves a cover/banner image to profiles.cover_url
+// =====================================================
+
+export const updateProfileCover = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { unique_id } = req.user;
+    const coverFile = req.file || req.files?.cover?.[0] || null;
+
+    if (!coverFile) {
+      return res.status(400).json({ success: false, message: "Cover image is required." });
+    }
+
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      `SELECT unique_id, verification_status, is_verified, role FROM users WHERE unique_id::text = $1::text LIMIT 1`,
+      [unique_id],
+    );
+
+    if (!userRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    const currentUser = userRes.rows[0];
+
+    if (
+      !isVerifiedStatus(currentUser.verification_status, currentUser.is_verified) &&
+      normalizeRole(currentUser.role) !== "buyer"
+    ) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        code: "VERIFICATION_REQUIRED",
+        message: "You must verify your identity before changing your cover image.",
+      });
+    }
+
+    const uploaded = await uploadToS3(coverFile, `profiles/${unique_id}/cover`, {
+      visibility: "semi-public",
+      cacheControl: "public, max-age=86400",
+    });
+
+    const coverKey = uploaded.key || uploaded.url;
+
+    const profilesHasCover = await columnExists(client, "profiles", "cover_url");
+
+    if (profilesHasCover) {
+      await client.query(
+        `INSERT INTO profiles (unique_id, cover_url, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (unique_id) DO UPDATE SET cover_url = $2, updated_at = NOW()`,
+        [unique_id, coverKey],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "Cover image updated successfully.",
+      cover_url: buildPublicMediaUrl(coverKey),
+      cover_key: coverKey,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("[UpdateProfileCover] Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to update cover image.", details: err.message });
+  } finally {
+    client.release();
+  }
+};
+
+// =====================================================
 // PUBLIC PROFILE
 // Public profile by username or unique_id.
 // Use this for /profile/@username.

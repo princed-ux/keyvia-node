@@ -3,15 +3,17 @@ import {
   register,
   verifySignupOtp,
   resendSignupOtp,
-  socialAuth, 
+  socialAuth,
   setRole,
   login,
+  verifyLoginOtp,
+  resendLoginOtp,
   forgotPassword,
   resetPassword,
   logout,
   refresh,
-  sendPhoneOtp,      // ✅ NEW: SendChamp OTP
-  verifyPhoneOtp,    // ✅ NEW: SendChamp OTP
+  sendPhoneOtp,
+  verifyPhoneOtp,
   finishOnboarding,
   deleteTestUser,
 } from "../controllers/authController.js";
@@ -39,8 +41,14 @@ router.post("/signup/resend", authLimiter, resendSignupOtp);
 /* =========================
    2. AUTHENTICATION (Login & Social)
 ========================= */
-// Standard Email/Password login
-router.post("/login", authLimiter, login); 
+// Standard Email/Password login (step 1 — sends OTP)
+router.post("/login", authLimiter, login);
+
+// Verify login OTP (step 2 — returns tokens + trusted-device token)
+router.post("/login/verify", authLimiter, verifyLoginOtp);
+
+// Resend login OTP (sends a fresh code, resets timer on the client)
+router.post("/login/resend", otpLimiter, resendLoginOtp);
 
 // Unified Social Auth
 router.post("/social", authLimiter, socialAuth);
@@ -87,6 +95,17 @@ router.post("/phone/verify-otp", protect, otpLimiter, verifyPhoneOtp);
 
 
 
-router.post("/dev/delete-user", deleteTestUser);
+// Dev-only test helper. Hard-disabled in production so it can never be used
+// to delete users without authentication on a live deployment.
+router.post(
+  "/dev/delete-user",
+  (req, res, next) => {
+    if (process.env.NODE_ENV === "production") {
+      return res.status(404).json({ message: "Not found" });
+    }
+    next();
+  },
+  deleteTestUser,
+);
 
 export default router;

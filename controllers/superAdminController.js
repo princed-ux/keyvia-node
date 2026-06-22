@@ -1,5 +1,7 @@
 import { pool } from "../db.js";
 import { sendEmailNotification } from "../utils/emailService.js";
+import { invalidateFeatureFlagCache } from "../services/featureFlagService.js";
+import { auditLog } from "../utils/auditLogger.js";
 
 const tableExists = async (tableName) => {
   const result = await pool.query(
@@ -344,6 +346,7 @@ export const deleteUser = async (req, res) => {
   try {
     const result = await pool.query("DELETE FROM users WHERE unique_id = $1 RETURNING *", [id]);
     if (result.rowCount === 0) return res.status(404).json({ message: "User not found" });
+    await auditLog(req, "user_deleted", "user", id, { email: result.rows[0]?.email || null }).catch(() => {});
     res.json({ message: "User deleted successfully" });
   } catch (err) {
     console.error(err);
@@ -363,6 +366,7 @@ export const toggleBanUser = async (req, res) => {
       "UPDATE users SET is_banned = $1, ban_reason = $2, updated_at = NOW() WHERE unique_id = $3",
       [is_banned, is_banned ? (ban_reason || null) : null, id]
     );
+    await auditLog(req, is_banned ? "user_banned" : "user_unbanned", "user", id, { ban_reason: ban_reason || null }).catch(() => {});
     res.json({ message: is_banned ? "User banned successfully." : "User unbanned successfully." });
   } catch (err) {
     console.error(err);
@@ -535,6 +539,7 @@ export const suspensionUser = async (req, res) => {
       risk_score: updateResult.rows[0]?.risk_score ?? 0,
     };
 
+    await auditLog(req, `user_${actionLabel}`, "user", uniqueId, { action, reason: reason || null }).catch(() => {});
     res.json({
       message: `Enforcement action '${actionLabel}' applied successfully.`,
       user: updatedUser,
@@ -779,6 +784,7 @@ export const promoteAdmin = async (req, res) => {
       [identifier],
     );
 
+    await auditLog(req, "admin_promoted", "user", identifier, { email: user.email }).catch(() => {});
     res.json({
       success: true,
       message: `${user.name || user.email} promoted to admin.`,
@@ -826,17 +832,9 @@ export const removeAdmin = async (req, res) => {
       );
     }
 
-    const auditExists = await tableExists("admin_audit_log");
-    if (auditExists) {
-      await pool.query(`
-        INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, details, created_at)
-        VALUES ($1, 'remove_admin', 'user', $2, $3, NOW())
-      `, [
-        req.user?.unique_id,
-        uniqueId,
-        JSON.stringify({ removed_admin: user.name || user.email }),
-      ]);
-    }
+    await auditLog(req, "admin_removed", "user", uniqueId, {
+      removed_admin: user.name || user.email,
+    }).catch(() => {});
 
     res.json({ success: true, message: "Admin privileges removed. User set to pending." });
   } catch (err) {
@@ -920,8 +918,10 @@ export const deleteListing = async (req, res) => {
         [id]
       );
       if (r2.rowCount === 0) return res.status(404).json({ message: "Listing not found" });
+      await auditLog(req, "listing_deleted", "listing", r2.rows[0]?.product_id || id, { title: r2.rows[0]?.title }).catch(() => {});
       return res.json({ message: "Listing deleted", listing: r2.rows[0] });
     }
+    await auditLog(req, "listing_deleted", "listing", result.rows[0]?.product_id || id, { title: result.rows[0]?.title }).catch(() => {});
     res.json({ message: "Listing deleted", listing: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -981,12 +981,14 @@ const ensureFeatureFlagsTable = async () => {
       key VARCHAR(100) UNIQUE NOT NULL,
       label VARCHAR(200) NOT NULL,
       enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      rollout_status VARCHAR(30) NOT NULL DEFAULT 'off',
       description TEXT,
       updated_by UUID REFERENCES users(unique_id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE feature_flags ADD COLUMN IF NOT EXISTS rollout_status VARCHAR(30) NOT NULL DEFAULT 'off'`);
 };
 
 export const getFeatureFlags = async (req, res) => {
@@ -1005,13 +1007,16 @@ export const getFeatureFlags = async (req, res) => {
 export const createFeatureFlag = async (req, res) => {
   try {
     await ensureFeatureFlagsTable();
-    const { key, label, enabled = false, description } = req.body;
+    const { key, label, enabled = false, description, rollout_status = "off" } = req.body;
     if (!key || !label) return res.status(400).json({ message: "key and label are required" });
 
     const result = await pool.query(
-      `INSERT INTO feature_flags (key, label, enabled, description, updated_by) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [key, label, enabled, description || null, req.user?.unique_id]
+      `INSERT INTO feature_flags (key, label, enabled, rollout_status, description, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [key, label, enabled, rollout_status, description || null, req.user?.unique_id]
     );
+    invalidateFeatureFlagCache();
+    await auditLog(req, "feature_flag_created", "feature_flag", key, { key, label, enabled, rollout_status }).catch(() => {});
     res.status(201).json({ flag: result.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ message: "Feature flag key already exists" });
@@ -1023,7 +1028,7 @@ export const createFeatureFlag = async (req, res) => {
 export const updateFeatureFlag = async (req, res) => {
   try {
     const { id } = req.params;
-    const { key, label, enabled, description } = req.body;
+    const { key, label, enabled, description, rollout_status } = req.body;
 
     const sets = [];
     const params = [];
@@ -1031,7 +1036,9 @@ export const updateFeatureFlag = async (req, res) => {
     if (key !== undefined) { sets.push(`key = $${idx++}`); params.push(key); }
     if (label !== undefined) { sets.push(`label = $${idx++}`); params.push(label); }
     if (enabled !== undefined) { sets.push(`enabled = $${idx++}`); params.push(enabled); }
+    if (rollout_status !== undefined) { sets.push(`rollout_status = $${idx++}`); params.push(rollout_status); }
     if (description !== undefined) { sets.push(`description = $${idx++}`); params.push(description); }
+    sets.push(`updated_by = $${idx++}`); params.push(req.user?.unique_id || null);
     sets.push(`updated_at = NOW()`);
     params.push(id);
 
@@ -1040,6 +1047,8 @@ export const updateFeatureFlag = async (req, res) => {
       params
     );
     if (result.rowCount === 0) return res.status(404).json({ message: "Feature flag not found" });
+    invalidateFeatureFlagCache();
+    await auditLog(req, "feature_flag_updated", "feature_flag", result.rows[0]?.key || id, req.body).catch(() => {});
     res.json({ flag: result.rows[0] });
   } catch (err) {
     console.error(err);
@@ -1050,8 +1059,10 @@ export const updateFeatureFlag = async (req, res) => {
 export const deleteFeatureFlag = async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query("DELETE FROM feature_flags WHERE id = $1 RETURNING id", [id]);
+    const result = await pool.query("DELETE FROM feature_flags WHERE id = $1 RETURNING id, key", [id]);
     if (result.rowCount === 0) return res.status(404).json({ message: "Feature flag not found" });
+    invalidateFeatureFlagCache();
+    await auditLog(req, "feature_flag_deleted", "feature_flag", result.rows[0]?.key || id, {}).catch(() => {});
     res.json({ message: "Feature flag deleted" });
   } catch (err) {
     console.error(err);

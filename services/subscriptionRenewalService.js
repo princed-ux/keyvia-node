@@ -70,12 +70,24 @@ const chargePaystackAuthorization = async ({
 // runs through the stored Paystack authorization (provider_subscription_id);
 // Flutterwave/Korapay subscribers are notified to resubscribe near expiry
 // (tracked as a follow-up for tokenized recurring on those gateways).
+// Stable lock ID for pg_advisory_lock — unique to this job.
+const RENEWAL_ADVISORY_LOCK_ID = 6765323736;
+
 export const renewDueSubscriptions = async () => {
   if (isRenewalRunning) {
     console.warn("[Renewal] previous run still in progress — skipping this tick.");
     return { processed: 0, skipped: true };
   }
   isRenewalRunning = true;
+
+  // Acquire a session-level advisory lock so only one instance runs at a time
+  // across horizontally scaled deployments. pg_try_advisory_lock is non-blocking.
+  const lockRes = await pool.query("SELECT pg_try_advisory_lock($1) AS acquired", [RENEWAL_ADVISORY_LOCK_ID]);
+  if (!lockRes.rows[0].acquired) {
+    isRenewalRunning = false;
+    console.warn("[Renewal] another instance holds the advisory lock — skipping this tick.");
+    return { processed: 0, skipped: true };
+  }
 
   let processed = 0;
 
@@ -249,6 +261,7 @@ export const renewDueSubscriptions = async () => {
     console.error("[Renewal] run failed:", err.message);
     return { processed, error: err.message };
   } finally {
+    await pool.query("SELECT pg_advisory_unlock($1)", [RENEWAL_ADVISORY_LOCK_ID]).catch(() => {});
     isRenewalRunning = false;
   }
 };

@@ -4,6 +4,7 @@ import { createNotification } from "./notificationsController.js";
 import { sendVerificationSubmittedEmail } from "../utils/emailService.js";
 import { analyzeVerification } from "../services/aiVerificationService.js";
 import { getAiSettings } from "../services/aiSettingsService.js";
+import settingsService from "../services/settingsService.js";
 
 /**
  * GET user's onboarding status
@@ -177,14 +178,16 @@ export const submitOnboarding = async (req, res) => {
         const user = userResult.rows[0];
         const notifMessage = `New ${user.role} verification request from ${user.full_name} (${user.email})`;
 
-        // Create notification for all super admins
-        await client.query(
-          `INSERT INTO notifications (recipient_id, type, title, message, related_resource_type, related_resource_id, action_url)
-           SELECT unique_id, 'account_approval', 'New Verification Request', $1, 'user', $2, '/admin/approvals'
-           FROM users
-           WHERE is_super_admin = true`,
-          [notifMessage, user.unique_id],
-        );
+        // Create notification for all super admins — B2: gated by setting.
+        if (await settingsService.getBool("notify_admin_verification_submitted")) {
+          await client.query(
+            `INSERT INTO notifications (recipient_id, type, title, message, related_resource_type, related_resource_id, action_url)
+             SELECT unique_id, 'account_approval', 'New Verification Request', $1, 'user', $2, '/admin/approvals'
+             FROM users
+             WHERE is_super_admin = true`,
+            [notifMessage, user.unique_id],
+          );
+        }
 
         await createNotification({
           client,

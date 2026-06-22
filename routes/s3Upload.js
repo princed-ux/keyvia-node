@@ -28,7 +28,7 @@ router.use(authenticateAndAttachUser);
 
 const getUserId = (req) => req.user?.unique_id || null;
 
-const publicResourceTypes = ["listing", "profile"];
+const publicResourceTypes = ["listing", "profile", "message_attachment"];
 const privateResourceTypes = ["document", "license"];
 const validResourceTypes = [...publicResourceTypes, ...privateResourceTypes];
 
@@ -119,6 +119,7 @@ const getResponseFileUrl = (storedFileUrl, privateFile) => {
 const getFolder = (resourceType) => {
   if (resourceType === "listing") return "listings";
   if (resourceType === "profile") return "profiles";
+  if (resourceType === "message_attachment") return "messages";
   if (resourceType === "document") return "private/documents";
   if (resourceType === "license") return "private/licenses";
 

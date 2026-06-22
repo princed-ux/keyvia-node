@@ -8,6 +8,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.1",
     "@aws-sdk/client-geo-places": "^3.1048.0",
     "@aws-sdk/client-ivs": "^3.1031.0",
     "@aws-sdk/client-rekognition": "^3.1030.0",
@@ -17,6 +18,7 @@
     "@aws-sdk/client-textract": "^3.1034.0",
     "@aws-sdk/s3-request-presigner": "^3.1030.0",
     "@cloudflare/kv-asset-handler": "^0.4.1",
+    "@socket.io/redis-adapter": "^8.3.0",
     "@tensorflow-models/blazeface": "^0.1.0",
     "@tensorflow-models/face-landmarks-detection": "^1.0.6",
     "@tensorflow-models/mobilenet": "^2.1.1",

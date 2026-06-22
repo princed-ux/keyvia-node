@@ -1,6 +1,6 @@
 import { pool } from "../db.js";
 import { createNotification } from "./notificationsController.js";
-import { sendEmailNotification } from "../utils/emailService.js";
+import { sendApplicationReceivedEmail, sendApplicationStatusEmail } from "../utils/emailService.js";
 
 const ALLOWED_APPLICATION_TYPES = new Set([
   "rent",
@@ -463,7 +463,13 @@ export const updateApplicationStatus = async (req, res) => {
 
       const applicantEmail = updatedApp.applicant_email || buyer?.email;
       if (applicantEmail) {
-        await sendEmailNotification(applicantEmail, title, message).catch(() => false);
+        await sendApplicationStatusEmail({
+          email: applicantEmail,
+          name: buyer?.name,
+          propertyTitle: previous.listing_title || previous.property || "Property",
+          status,
+          actionUrl: null,
+        }).catch(() => false);
       }
     }
 
@@ -587,7 +593,16 @@ export const createApplication = async (req, res) => {
     });
 
     if (recipient?.email) {
-      await sendEmailNotification(recipient.email, title, notificationMessage).catch(() => false);
+      await sendApplicationReceivedEmail({
+        email: recipient.email,
+        name: recipient.name,
+        applicantName,
+        propertyTitle: listing.title || listing.address || listing.product_id,
+        moveInDate: body.move_in_date || body.stay_start_date || null,
+        actionUrl: getActionUrlForRole(recipient?.role)
+          ? `${process.env.CLIENT_URL || "https://getkeyvia.com"}${getActionUrlForRole(recipient?.role)}`
+          : null,
+      }).catch(() => false);
     }
 
     return res.status(201).json({ ...newApp, status: "pending" });

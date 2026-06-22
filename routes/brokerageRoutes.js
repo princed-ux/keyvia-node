@@ -1,14 +1,17 @@
 import express from "express";
 import { pool } from "../db.js";
-import { authenticateAndAttachUser } from "../middleware/authMiddleware.js";
+import { authenticateAndAttachUser, requireRole } from "../middleware/authMiddleware.js";
 import {
   notifyAgencyAgentJoined,
   notifyListingAssigned,
 } from "../controllers/notificationsController.js";
+import { enforceTeamSeatLimit, enforceListingLimit } from "../services/subscriptionService.js";
+import { requireAnalytics } from "../middleware/planMiddleware.js";
 
 const router = express.Router();
 
 router.use(authenticateAndAttachUser);
+router.use(requireRole("brokerage_owner", "brokerage"));
 
 const getUserId = (req) => req.user?.unique_id || null;
 const normalizeRole = (role) => String(role || "").toLowerCase();
@@ -223,7 +226,7 @@ const requireUser = (req, res) => {
 // ============================================================
 // BROKERAGE DASHBOARD - Stats
 // ============================================================
-router.get("/stats", async (req, res) => {
+router.get("/stats", requireAnalytics("basic"), async (req, res) => {
   try {
     const userId = requireUser(req, res);
     if (!userId) return;
@@ -375,6 +378,19 @@ router.post("/projects", async (req, res) => {
 
     if (!projectName) {
       return res.status(400).json({ error: "Project name is required" });
+    }
+
+    // Enforce listing / project limit based on active subscription plan
+    const limitCheck = await enforceListingLimit({ userId });
+    if (!limitCheck.allowed) {
+      return res.status(403).json({
+        code: "LISTING_LIMIT_REACHED",
+        message: limitCheck.message,
+        current_count: limitCheck.current_count,
+        max_listings: limitCheck.max_listings,
+        plan: limitCheck.plan,
+        upgrade_required: true,
+      });
     }
 
     const { rows } = await pool.query(
@@ -602,8 +618,8 @@ router.get("/listings", async (req, res) => {
         l.project_id,
         l.assigned_agent_id
       FROM listings l
-      WHERE l.uploaded_by_id::text = $1::text
-         OR l.agency_id::text = $1::text
+      WHERE (l.uploaded_by_id::text = $1::text OR l.agency_id::text = $1::text)
+        AND l.status NOT IN ('draft', 'archived')
       ORDER BY COALESCE(l.updated_at, l.created_at) DESC
       LIMIT 200
       `,
@@ -681,12 +697,22 @@ router.get("/listings/pending", async (req, res) => {
         l.state,
         l.country,
         l.photos,
+        l.area_sqft,
+        l.price_per_sqft,
+        l.features,
+        l.amenities,
+        l.furnished,
+        l.parking,
         l.status,
+        l.brokerage_review_status,
+        l.moderation_reason,
+        l.risk_score,
         l.is_active,
         l.created_at,
         l.updated_at,
         u.name AS agent_name,
-        u.unique_id AS agent_id
+        u.unique_id AS agent_id,
+        u.avatar_url AS agent_avatar
       FROM listings l
       LEFT JOIN users u ON u.unique_id::text = l.uploaded_by_id::text
       WHERE (l.agency_id::text = $1::text OR l.uploaded_by_id::text = $1::text)
@@ -1380,6 +1406,20 @@ router.post("/agents/:id/approve", async (req, res) => {
       });
     }
 
+    // ── Seat limit check ────────────────────────────────────────────────────
+    const seatCheck = await enforceTeamSeatLimit({ brokerageId });
+    if (!seatCheck.allowed) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        code: "SEAT_LIMIT_REACHED",
+        message: seatCheck.message,
+        current_count: seatCheck.current_count,
+        max_seats: seatCheck.max_seats,
+        plan: seatCheck.plan,
+      });
+    }
+
     const companyName =
       brokerage.company_name || brokerage.name || "Keyvia Brokerage";
 
@@ -1832,11 +1872,22 @@ router.get("/profile", async (req, res) => {
         u.email,
         u.phone,
         u.role,
-        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
-        p.bio,
+        u.gender,
         u.license_number,
+        u.verification_status,
+        u.is_verified,
+        u.rejection_reason,
+        u.team_code,
+        COALESCE(bp.logo_url, p.avatar_url, u.avatar_url) AS logo_url,
+        COALESCE(p.avatar_url, u.avatar_url) AS avatar_url,
+        COALESCE(p.bio, bp.bio) AS bio,
         bp.company_name,
-        bp.brokerage_address
+        bp.brokerage_address AS address,
+        bp.city,
+        bp.website,
+        bp.phone AS brokerage_phone,
+        bp.social_links,
+        bp.bio AS brokerage_bio
       FROM users u
       LEFT JOIN profiles p ON p.unique_id::uuid = u.unique_id
       LEFT JOIN brokerage_profiles bp ON bp.unique_id = u.unique_id
@@ -1864,7 +1915,7 @@ router.patch("/profile", async (req, res) => {
     const userId = requireUser(req, res);
     if (!userId) return;
 
-    const { name, phone, company_name, license_number, bio, address, city, website } = req.body;
+    const { name, phone, company_name, license_number, bio, address, city, website, social_links } = req.body;
 
     await client.query("BEGIN");
 
@@ -1878,7 +1929,7 @@ router.patch("/profile", async (req, res) => {
         updated_at = NOW()
       WHERE unique_id = $4
       `,
-      [name, phone, license_number, userId]
+      [name || null, phone || null, license_number || null, userId]
     );
 
     await client.query(
@@ -1897,17 +1948,20 @@ router.patch("/profile", async (req, res) => {
 
     await client.query(
       `
-      INSERT INTO brokerage_profiles (unique_id, company_name, brokerage_address, city, website, updated_at)
-      VALUES ($1, $2, $3, $4, $5, NOW())
+      INSERT INTO brokerage_profiles (unique_id, company_name, brokerage_address, city, website, bio, social_links, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
       ON CONFLICT (unique_id)
       DO UPDATE SET
-        company_name = COALESCE(EXCLUDED.company_name, brokerage_profiles.company_name),
+        company_name      = COALESCE(EXCLUDED.company_name, brokerage_profiles.company_name),
         brokerage_address = COALESCE(EXCLUDED.brokerage_address, brokerage_profiles.brokerage_address),
-        city = COALESCE(brokerage_profiles.city, EXCLUDED.city),
-        website = COALESCE(brokerage_profiles.website, EXCLUDED.website),
-        updated_at = NOW()
+        city              = COALESCE(EXCLUDED.city, brokerage_profiles.city),
+        website           = COALESCE(EXCLUDED.website, brokerage_profiles.website),
+        bio               = COALESCE(EXCLUDED.bio, brokerage_profiles.bio),
+        social_links      = COALESCE(EXCLUDED.social_links, brokerage_profiles.social_links),
+        updated_at        = NOW()
       `,
-      [userId, company_name || null, address || null, city || null, website || null]
+      [userId, company_name || null, address || null, city || null, website || null, bio || null,
+       social_links ? JSON.stringify(social_links) : null]
     );
 
     await client.query("COMMIT");
@@ -1959,7 +2013,7 @@ router.get("/applications", async (req, res) => {
 // ============================================================
 // BROKERAGE ANALYTICS
 // ============================================================
-router.get("/analytics", async (req, res) => {
+router.get("/analytics", requireAnalytics("advanced"), async (req, res) => {
   try {
     const userId = requireUser(req, res);
     if (!userId) return;
@@ -2078,6 +2132,450 @@ router.get("/analytics", async (req, res) => {
   } catch (err) {
     console.error("Brokerage Analytics Error:", err);
     return res.status(500).json({ success: false, error: "Failed to load analytics" });
+  }
+});
+
+// ============================================================
+// BROKERAGE SETTINGS — COMPANY PROFILE
+// ============================================================
+router.get("/settings/profile", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rows } = await pool.query(
+      `SELECT bp.company_name, bp.brokerage_address, bp.city, bp.website, bp.phone, bp.bio, bp.social_links
+       FROM brokerage_profiles bp WHERE bp.unique_id = $1 LIMIT 1`,
+      [userId]
+    );
+    return res.json(rows[0] || {});
+  } catch (err) {
+    console.error("Get settings/profile error:", err);
+    return res.status(500).json({ error: "Failed to fetch profile settings" });
+  }
+});
+
+router.patch("/settings/profile", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+
+    const { company_name, address, city, website, phone, bio, social_links } = req.body;
+
+    // Check verification status — identity fields require a verified brokerage
+    const { rows: [bp] } = await pool.query(
+      `SELECT verification_status FROM brokerage_profiles WHERE unique_id = $1 LIMIT 1`,
+      [userId]
+    );
+    const isVerified =
+      bp?.verification_status === "verified" || bp?.verification_status === "approved";
+
+    const identityFieldsSent =
+      company_name !== undefined || bio !== undefined ||
+      website !== undefined || city !== undefined || address !== undefined;
+
+    if (!isVerified && identityFieldsSent) {
+      return res.status(403).json({
+        error: "Complete brokerage verification before updating company identity.",
+        code: "VERIFICATION_REQUIRED",
+      });
+    }
+
+    if (company_name !== undefined && !String(company_name || "").trim()) {
+      return res.status(400).json({ error: "Company name cannot be empty." });
+    }
+
+    // Build UPDATE dynamically — only touch fields the client actually sent,
+    // and allow explicit clearing (empty string clears the field, unlike the old COALESCE approach)
+    const setClauses = [];
+    const values = [userId];
+
+    const addField = (col, val) => {
+      values.push(val);
+      setClauses.push(`${col} = $${values.length}`);
+    };
+
+    if (company_name !== undefined) addField("company_name", company_name || null);
+    if (address !== undefined)      addField("brokerage_address", address || null);
+    if (city !== undefined)         addField("city", city || null);
+    if (website !== undefined)      addField("website", website || null);
+    if (phone !== undefined)        addField("phone", phone || null);
+    if (bio !== undefined)          addField("bio", bio || null);
+    if (social_links !== undefined) addField("social_links", social_links ? JSON.stringify(social_links) : null);
+
+    if (!setClauses.length) {
+      return res.json({ success: true, message: "Nothing to update." });
+    }
+
+    await pool.query(
+      `UPDATE brokerage_profiles
+       SET ${setClauses.join(", ")}, updated_at = NOW()
+       WHERE unique_id = $1`,
+      values
+    );
+
+    return res.json({ success: true, message: "Company profile updated." });
+  } catch (err) {
+    console.error("Patch settings/profile error:", err);
+    return res.status(500).json({ error: "Failed to update profile settings" });
+  }
+});
+
+// ============================================================
+// BROKERAGE SETTINGS — BRANDING
+// ============================================================
+router.get("/settings/branding", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rows } = await pool.query(
+      `SELECT logo_url, cover_image_url, brand_color FROM brokerage_profiles WHERE unique_id = $1 LIMIT 1`,
+      [userId]
+    );
+    return res.json(rows[0] || {});
+  } catch (err) {
+    console.error("Get settings/branding error:", err);
+    return res.status(500).json({ error: "Failed to fetch branding settings" });
+  }
+});
+
+router.patch("/settings/branding", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { logo_url, cover_image_url, brand_color } = req.body;
+    await pool.query(
+      `INSERT INTO brokerage_profiles (unique_id, logo_url, cover_image_url, brand_color, updated_at)
+       VALUES ($1,$2,$3,$4,NOW())
+       ON CONFLICT (unique_id) DO UPDATE SET
+         logo_url        = COALESCE(EXCLUDED.logo_url, brokerage_profiles.logo_url),
+         cover_image_url = COALESCE(EXCLUDED.cover_image_url, brokerage_profiles.cover_image_url),
+         brand_color     = COALESCE(EXCLUDED.brand_color, brokerage_profiles.brand_color),
+         updated_at      = NOW()`,
+      [userId, logo_url||null, cover_image_url||null, brand_color||null]
+    );
+    return res.json({ success: true, message: "Branding settings updated." });
+  } catch (err) {
+    console.error("Patch settings/branding error:", err);
+    return res.status(500).json({ error: "Failed to update branding settings" });
+  }
+});
+
+// ============================================================
+// BROKERAGE SETTINGS — BUSINESS HOURS
+// ============================================================
+router.get("/settings/business-hours", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rows } = await pool.query(
+      `SELECT business_hours FROM brokerage_profiles WHERE unique_id = $1 LIMIT 1`,
+      [userId]
+    );
+    return res.json({ business_hours: rows[0]?.business_hours || {} });
+  } catch (err) {
+    console.error("Get settings/business-hours error:", err);
+    return res.status(500).json({ error: "Failed to fetch business hours" });
+  }
+});
+
+router.patch("/settings/business-hours", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { business_hours } = req.body;
+    if (!business_hours || typeof business_hours !== "object") {
+      return res.status(400).json({ error: "business_hours must be an object" });
+    }
+    await pool.query(
+      `INSERT INTO brokerage_profiles (unique_id, business_hours, updated_at)
+       VALUES ($1,$2,NOW())
+       ON CONFLICT (unique_id) DO UPDATE SET
+         business_hours = EXCLUDED.business_hours,
+         updated_at     = NOW()`,
+      [userId, JSON.stringify(business_hours)]
+    );
+    return res.json({ success: true, message: "Business hours updated." });
+  } catch (err) {
+    console.error("Patch settings/business-hours error:", err);
+    return res.status(500).json({ error: "Failed to update business hours" });
+  }
+});
+
+// ============================================================
+// BROKERAGE SETTINGS — LEAD ROUTING
+// ============================================================
+router.get("/settings/lead-routing", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rows } = await pool.query(
+      `SELECT lead_routing_rules FROM brokerage_profiles WHERE unique_id = $1 LIMIT 1`,
+      [userId]
+    );
+    return res.json({ lead_routing_rules: rows[0]?.lead_routing_rules || {} });
+  } catch (err) {
+    console.error("Get settings/lead-routing error:", err);
+    return res.status(500).json({ error: "Failed to fetch lead routing settings" });
+  }
+});
+
+router.patch("/settings/lead-routing", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { lead_routing_rules } = req.body;
+    if (!lead_routing_rules || typeof lead_routing_rules !== "object") {
+      return res.status(400).json({ error: "lead_routing_rules must be an object" });
+    }
+    await pool.query(
+      `INSERT INTO brokerage_profiles (unique_id, lead_routing_rules, updated_at)
+       VALUES ($1,$2,NOW())
+       ON CONFLICT (unique_id) DO UPDATE SET
+         lead_routing_rules = EXCLUDED.lead_routing_rules,
+         updated_at         = NOW()`,
+      [userId, JSON.stringify(lead_routing_rules)]
+    );
+    return res.json({ success: true, message: "Lead routing rules updated." });
+  } catch (err) {
+    console.error("Patch settings/lead-routing error:", err);
+    return res.status(500).json({ error: "Failed to update lead routing settings" });
+  }
+});
+
+// ============================================================
+// BROKERAGE SETTINGS — ANALYTICS PREFERENCES
+// ============================================================
+router.get("/settings/analytics-prefs", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rows } = await pool.query(
+      `SELECT analytics_preferences FROM brokerage_profiles WHERE unique_id = $1 LIMIT 1`,
+      [userId]
+    );
+    return res.json({ analytics_preferences: rows[0]?.analytics_preferences || {} });
+  } catch (err) {
+    console.error("Get settings/analytics-prefs error:", err);
+    return res.status(500).json({ error: "Failed to fetch analytics preferences" });
+  }
+});
+
+router.patch("/settings/analytics-prefs", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { analytics_preferences } = req.body;
+    if (!analytics_preferences || typeof analytics_preferences !== "object") {
+      return res.status(400).json({ error: "analytics_preferences must be an object" });
+    }
+    await pool.query(
+      `INSERT INTO brokerage_profiles (unique_id, analytics_preferences, updated_at)
+       VALUES ($1,$2,NOW())
+       ON CONFLICT (unique_id) DO UPDATE SET
+         analytics_preferences = EXCLUDED.analytics_preferences,
+         updated_at            = NOW()`,
+      [userId, JSON.stringify(analytics_preferences)]
+    );
+    return res.json({ success: true, message: "Analytics preferences updated." });
+  } catch (err) {
+    console.error("Patch settings/analytics-prefs error:", err);
+    return res.status(500).json({ error: "Failed to update analytics preferences" });
+  }
+});
+
+// ============================================================
+// OFFICE LOCATIONS
+// ============================================================
+router.get("/office-locations", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rows } = await pool.query(
+      `SELECT id, label, address, city, state, country, phone, is_primary, created_at
+       FROM brokerage_office_locations WHERE brokerage_id = $1
+       ORDER BY is_primary DESC, created_at ASC`,
+      [userId]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error("Get office-locations error:", err);
+    return res.status(500).json({ error: "Failed to fetch office locations" });
+  }
+});
+
+router.post("/office-locations", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { label, address, city, state, country, phone, is_primary } = req.body;
+    if (!label) return res.status(400).json({ error: "label is required" });
+
+    // On free plan, limit to 1 office
+    const effective = await import("../utils/effectivePlan.js").then(m => m.getEffectivePlanForUser(userId));
+    const isPaidPlan = effective?.planId && effective.planId !== "free";
+    const { rows: existing } = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM brokerage_office_locations WHERE brokerage_id = $1`,
+      [userId]
+    );
+    if (!isPaidPlan && existing[0].cnt >= 1) {
+      return res.status(403).json({
+        code: "OFFICE_LIMIT_REACHED",
+        upgrade_required: true,
+        message: "Free plan supports 1 office location. Upgrade to add more.",
+      });
+    }
+
+    // If new location is primary, clear other primaries
+    if (is_primary) {
+      await pool.query(
+        `UPDATE brokerage_office_locations SET is_primary = FALSE WHERE brokerage_id = $1`,
+        [userId]
+      );
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO brokerage_office_locations (brokerage_id, label, address, city, state, country, phone, is_primary)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, label, address, city, state, country, phone, is_primary, created_at`,
+      [userId, label, address||null, city||null, state||null, country||"Nigeria", phone||null, is_primary||false]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error("Post office-locations error:", err);
+    return res.status(500).json({ error: "Failed to create office location" });
+  }
+});
+
+router.patch("/office-locations/:id", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { label, address, city, state, country, phone, is_primary } = req.body;
+
+    if (is_primary) {
+      await pool.query(
+        `UPDATE brokerage_office_locations SET is_primary = FALSE WHERE brokerage_id = $1`,
+        [userId]
+      );
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE brokerage_office_locations
+       SET label      = COALESCE($1, label),
+           address    = COALESCE($2, address),
+           city       = COALESCE($3, city),
+           state      = COALESCE($4, state),
+           country    = COALESCE($5, country),
+           phone      = COALESCE($6, phone),
+           is_primary = COALESCE($7, is_primary)
+       WHERE id = $8 AND brokerage_id = $9
+       RETURNING id, label, address, city, state, country, phone, is_primary`,
+      [label||null, address||null, city||null, state||null, country||null, phone||null,
+       is_primary != null ? is_primary : null, req.params.id, userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Office location not found" });
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("Patch office-locations error:", err);
+    return res.status(500).json({ error: "Failed to update office location" });
+  }
+});
+
+router.delete("/office-locations/:id", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rowCount } = await pool.query(
+      `DELETE FROM brokerage_office_locations WHERE id = $1 AND brokerage_id = $2`,
+      [req.params.id, userId]
+    );
+    if (!rowCount) return res.status(404).json({ error: "Office location not found" });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Delete office-locations error:", err);
+    return res.status(500).json({ error: "Failed to delete office location" });
+  }
+});
+
+// ============================================================
+// LICENSES
+// ============================================================
+router.get("/licenses", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rows } = await pool.query(
+      `SELECT id, license_type, license_number, issuing_body, issue_date, expiry_date, is_active, created_at
+       FROM brokerage_licenses WHERE brokerage_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error("Get licenses error:", err);
+    return res.status(500).json({ error: "Failed to fetch licenses" });
+  }
+});
+
+router.post("/licenses", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { license_type, license_number, issuing_body, issue_date, expiry_date } = req.body;
+    if (!license_number) return res.status(400).json({ error: "license_number is required" });
+
+    const { rows } = await pool.query(
+      `INSERT INTO brokerage_licenses (brokerage_id, license_type, license_number, issuing_body, issue_date, expiry_date)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, license_type, license_number, issuing_body, issue_date, expiry_date, is_active, created_at`,
+      [userId, license_type||null, license_number, issuing_body||null, issue_date||null, expiry_date||null]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error("Post licenses error:", err);
+    return res.status(500).json({ error: "Failed to create license" });
+  }
+});
+
+router.patch("/licenses/:id", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { license_type, license_number, issuing_body, issue_date, expiry_date, is_active } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE brokerage_licenses
+       SET license_type   = COALESCE($1, license_type),
+           license_number = COALESCE($2, license_number),
+           issuing_body   = COALESCE($3, issuing_body),
+           issue_date     = COALESCE($4, issue_date),
+           expiry_date    = COALESCE($5, expiry_date),
+           is_active      = COALESCE($6, is_active)
+       WHERE id = $7 AND brokerage_id = $8
+       RETURNING id, license_type, license_number, issuing_body, issue_date, expiry_date, is_active`,
+      [license_type||null, license_number||null, issuing_body||null, issue_date||null,
+       expiry_date||null, is_active != null ? is_active : null, req.params.id, userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: "License not found" });
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("Patch licenses error:", err);
+    return res.status(500).json({ error: "Failed to update license" });
+  }
+});
+
+router.delete("/licenses/:id", async (req, res) => {
+  try {
+    const userId = requireUser(req, res);
+    if (!userId) return;
+    const { rowCount } = await pool.query(
+      `DELETE FROM brokerage_licenses WHERE id = $1 AND brokerage_id = $2`,
+      [req.params.id, userId]
+    );
+    if (!rowCount) return res.status(404).json({ error: "License not found" });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Delete licenses error:", err);
+    return res.status(500).json({ error: "Failed to delete license" });
   }
 });
 

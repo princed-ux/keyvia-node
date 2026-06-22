@@ -24,6 +24,7 @@ import {
   getListingLocationIntelligence,
   scanListingLocationIntelligence,
   getListingMarketHistory,
+  getListingComparables,
 
   createListingDraft,
   updateListingDraft,
@@ -38,6 +39,8 @@ import {
   authenticateToken,
   optionalAuth,
   verifyAdmin,
+  requireRole,
+  requireTeamPermission,
 } from "../middleware/authMiddleware.js";
 
 import { validateListingInput } from "../middleware/inputValidation.js";
@@ -73,7 +76,7 @@ router.get("/public/agent/:unique_id", optionalAuth, getPublicAgentProfile);
    Do NOT use validateListingInput here because drafts are incomplete
 ============================================================ */
 
-router.post("/drafts", authenticateToken, createListingDraft);
+router.post("/drafts", authenticateToken, requireRole("agent", "owner", "brokerage_owner"), createListingDraft);
 
 router.get("/drafts/mine", authenticateToken, getMyListingDrafts);
 
@@ -92,6 +95,8 @@ router.patch(
 router.post(
   "/drafts/:product_id/submit",
   authenticateToken,
+  requireRole("agent", "owner", "brokerage_owner"),
+  requireTeamPermission("can_list"),
   submitListingDraft,
 );
 
@@ -114,10 +119,12 @@ router.post(
    4. CREATE FINAL LISTING
 ============================================================ */
 
-// Create listing after direct S3 upload metadata is ready
+// Create listing — agents, owners, brokerages only; agency agents need can_list permission
 router.post(
   "/",
   authenticateToken,
+  requireRole("agent", "owner", "brokerage_owner"),
+  requireTeamPermission("can_list"),
   validateListingInput,
   createListing,
 );
@@ -226,6 +233,12 @@ router.get(
   "/:product_id/market-history",
   optionalAuth,
   getListingMarketHistory,
+);
+
+router.get(
+  "/:product_id/comparables",
+  optionalAuth,
+  getListingComparables,
 );
 
 router.post(
